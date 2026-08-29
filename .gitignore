@@ -1,2 +1,12 @@
 # 스킬 사용 로그는 머신별 기록이라 커밋하지 않는다 (통계는 /skill-stat 로 로컬에서 조회)
 .claude/skill-usage.jsonl
+
+# 사내 레포
+/cs-system/
+/php_legacy/
+
+# 강의 자료 (강사 저작물)
+/docs/lecture-notes
+
+# macOS
+.DS_Store
