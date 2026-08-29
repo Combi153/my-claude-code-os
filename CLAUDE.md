@@ -1,23 +1,29 @@
 # my-claude-code-os
 
-"나만의 Claude OS 만들기" 4주 강의의 과제 저장소.
-매주 스킬·서브에이전트·훅·오케스트레이터를 만들어 개인 브랜치에 PR을 올리고 리뷰받는다.
+Assignment repository for the 4-week course "나만의 Claude OS 만들기" (Build Your Own Claude OS).
+Each week: build skills, subagents, hooks, and orchestrators, then open a PR from a personal
+branch for review.
 
-## 만들려는 OS
+## The OS being built
 
-레거시 PHP를 신규 스택(Next / Spring)으로 마이그레이션하는 OS.
-실제 사용처는 사내 코드베이스다.
+An OS that migrates legacy PHP to a new stack (Next / Spring).
+It is meant to run against the company codebase.
 
-## 이 저장소는 public 이다
+## This repository is public
 
-강의는 회사와 무관하고 이 저장소는 공개된다. OS는 공개하되 회사 코드는 나가지 않아야 한다.
+The course is unrelated to the company. The OS is meant to be published; company code is not.
 
-- 형제 디렉터리(`../php_legacy`, `../cs-system`)의 코드를 이 저장소 파일에 옮기지 않는다.
-- 사내에서 실사용한 로그·리포트는 커밋하지 않는다.
+`php_legacy/` and `cs-system/` are company repositories checked out inside this directory.
+They are gitignored and must stay that way.
 
-## 작업 규칙
+- Never move content from `php_legacy/` or `cs-system/` into a tracked file of this repository.
+  This covers code as well as internal domains, issue IDs, and people's names.
+- Never commit logs or reports produced by running the OS against company code.
 
-1. 클로드 OS 관련 모든 파일(예. `.claude` 하위 md)은 반드시 프로젝트 안에 만들 것
-2. 스킬(`SKILL.md`)은 영어로 작성할 것.
-   단, 트리거 문구가 담기는 frontmatter `description` 은 한국어를 유지한다
-3. 클로드 OS 만들기 실습 중이기 때문에 대화 과정에서 AI와의 협업을 배울 수 있도록 양질의 설명 제공할 것
+## Working rules
+
+1. Every Claude OS file (e.g. markdown under `.claude/`) must live inside this project.
+2. Write skills (`SKILL.md`) in English. The frontmatter `description` stays Korean —
+   it carries the Korean phrases that trigger the skill.
+3. This is a hands-on course. Explain the reasoning while working, so the collaboration
+   itself is something to learn from.
