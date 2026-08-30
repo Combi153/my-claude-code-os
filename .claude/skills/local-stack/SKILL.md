@@ -21,10 +21,10 @@ moment it is written.
 
 Read `.claude/config/workspace.json`. Nothing environment-specific belongs in this file.
 
-If `upstreamOs.skillsDir` names an existing directory with the skills listed there,
-prefer those for starting the backend — they carry operational detail (VPN
-prerequisites, trust stores, port collisions with sibling services) that is not
-worth duplicating. Fall back to the direct commands below when they are absent.
+If `upstreamOs.skillsDir` names an existing directory and `upstreamOs.startBackend`
+names a skill inside it, prefer that for starting the backend — it carries operational
+detail (VPN prerequisites, trust stores, port collisions with sibling services) that is
+not worth duplicating here. Fall back to the direct commands below when either is empty.
 
 ## 선행 조건
 

@@ -71,7 +71,15 @@
   },
 
   "upstreamOs": {
-    "_comment": "Optional. If a richer OS already exists elsewhere, name the skills to delegate to instead of reimplementing. Empty means this repo runs standalone.",
+    "_comment": [
+      "Optional. If a richer OS already exists elsewhere, name the skills to delegate to",
+      "instead of reimplementing (D-09). Empty means this repo runs standalone.",
+      "Each key has exactly one consumer, so an unread key is a bug, not a spare:",
+      "  skillsDir    - the directory the three below are resolved in",
+      "  startBackend - local-stack, for bringing the backend up",
+      "  runE2e       - legacy-slice, for the Phase 2 baseline and the Phase 6 loop",
+      "  writeE2e     - e2e-baseline-author, for authoring the spec"
+    ],
     "skillsDir": "",
     "startBackend": "",
     "runE2e": "",
