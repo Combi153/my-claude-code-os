@@ -11,15 +11,9 @@ description: |
 
 Turn what the migration learned into something a non-developer can read.
 
-## 왜 이게 마이그레이션의 부산물이어야 하는가
-
-Documentation written as its own project goes stale, because nothing forces it to
-change when the code does. Documentation that falls out of migration is different: it
-is written by reading the code, it is regenerated when a slice is re-audited, and each
-sentence traces to a numbered rule that a test or an audit is watching. That is the
-only kind that stays true.
-
-So this skill never writes from memory or from a conversation. It writes from ledgers.
+This skill never writes from memory or from a conversation. It writes from ledgers.
+That single constraint is what makes the resulting document trustworthy, and the
+`domain-scribe` agent carries the argument for why.
 
 ## 절차
 

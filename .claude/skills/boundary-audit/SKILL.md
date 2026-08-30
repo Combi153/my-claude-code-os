@@ -35,6 +35,15 @@ service that have not been migrated at all.
 
 ### 무엇을 찾는가
 
+Seven search lenses — **not** a second classification scheme. The verdict vocabulary is
+the ledger's `도메인` / `화면` / `경계`, defined in
+`../legacy-slice/references/ledger-format.md`. These are only the shapes domain logic
+takes when it sits in a page or a template, so that grep has something to look for.
+
+Anything found through a lens is `도메인` unless the ledger rubric's judgment question
+says otherwise. Keeping one vocabulary is what lets a finding here become a ledger row
+later, instead of a note in a private dialect that someone has to translate by hand.
+
 Domain logic in a page or template looks like:
 
 - **조건부 가시성** — a conditional deciding whether a row, tab, or section appears at
@@ -60,8 +69,10 @@ What is *not* a finding: CSS class selection, markup structure, label text, date
 1. Read `.claude/config/workspace.json` for the surface roots.
 2. Enumerate entry pages and templates. Grep for the shapes above, then read the hits —
    grep finds candidates, reading decides.
-3. For each finding, record `파일:줄`, the rule in one sentence, a proposed
-   classification, and whether the same rule also appears in the data layer.
+3. For each finding, record `파일:줄`, the rule in one sentence written the way the
+   ledger writes rules (observable behavior, not implementation), a proposed 분류 from
+   the ledger's three values, and whether the same rule also appears in the data layer.
+   A finding recorded this way lifts into a ledger unchanged.
 4. Rank by risk: duplicated rules first (they break migrations), then permission and
    validation (they are security-relevant), then the rest.
 
