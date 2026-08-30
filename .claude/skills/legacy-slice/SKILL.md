@@ -44,6 +44,30 @@ Read it in Phase 0. **This repository is public — never write a path, hostname
 name, or identifier from the company checkouts into a tracked file here.** Slice
 artifacts are written into the backend repository's docs root, not into this one.
 
+### 슬라이스 산출물
+
+`<docs.root>/<docs.slicesDir>/<slice-id>/` 아래에 번호 순으로 쌓인다.
+
+| 파일 | Phase | 쓰는 쪽 |
+|---|---|---|
+| `00-ledger.md` | 1 · 2 · 4 | analyst → 너 → e2e author → implementer |
+| `01-design.md` | 3 | designer |
+| `02-swap.md` | 5 | swap engineer |
+| `03-audit.md` | 7 | auditor |
+| `04-domain-doc.md` | 8 | scribe |
+
+**존재하는 파일의 최대 번호가 끝난 Phase 다.** 이 흐름은 게이트에서 사람을 기다리므로 세션이
+끊기는 게 정상이고, 재개할 때 진행 상태를 물어볼 곳이 이것뿐이다.
+
+### e2e 실행
+
+`upstreamOs.runE2e` 에 명령이 있으면 그것을 쓴다. 비어 있으면 `e2e.root` 에서
+`e2e.surfaces.<surface>` 의 `project` 와 `testDir` 로 Playwright 를 직접 부르고, 표면 base URL
+은 `baseUrlEnv` 로 넘긴다.
+
+어느 쪽이든 **처음 쓴 명령을 기록해 두고 L2 루프 내내 같은 것을 쓴다.** 루프가 5회까지 도는데
+회차마다 명령이 달라지면, 실패가 이관 탓인지 호출 방식 탓인지 구분할 수 없다.
+
 ## 루프 지도
 
 Four loops, each closing on a different invariant. Know which one you are in.
@@ -68,6 +92,9 @@ redesign. Spend generously in L0.
 2. Fix the slice. If the user named one, use it. If not, invoke `slice-scout` — do not
    pick one yourself; the choice depends on risk and dependencies the user knows.
 3. Create the slice directory under `<docs.root>/<docs.slicesDir>/<slice-id>/`.
+   **If it already exists, this is a resume** — read the highest-numbered file present,
+   re-enter at the phase after it, and say so before doing anything. Restarting a slice
+   from Phase 1 throws away a human approval that was already given.
 4. Bring the environment up per the status block, using `local-stack`.
 
 ## Phase 1 — 이해 (L0 루프)
@@ -80,19 +107,34 @@ Then the loop:
 ```
 round = 1
 until (red team returns empty twice in a row) or round > 3:
-    Agent(subagent_type: "php-rule-redteam")  ← ledger + same entry points
+    Agent(subagent_type: "php-rule-redteam")  ← ledger + entry points + this round's lens
     merge findings into the ledger yourself (the red team does not write)
     round += 1
 ```
 
-Merging is yours because the red team must stay independent of the artifact it attacks.
-When merging a classification challenge, apply the rubric in `references/ledger-format.md`
-rather than deferring to either agent — in particular, a rule enforced only on screen
-is `도메인` that has not moved, not `경계`.
+**Pass the round number and its lens.** Each round is a fresh agent with no memory of the
+last one, so without a lens it re-runs the same search and a second empty hand means
+almost nothing more than the first.
 
-**Do not skip the second empty round.** One empty result often means the red team
-looked in the same places the analyst did; the second round is what makes "we found
-nothing" mean something.
+| 라운드 | 렌즈 |
+|---|---|
+| 1 | 실행 경로 — 페이지 스크립트 · 쿼리 구성 · 조용한 기본값 |
+| 2 | 주변부 — 템플릿 · 환경 분기 · 포함된 commons |
+| 3 | 부재 — 없는 트랜잭션 · 없는 검증 · 없는 인가 |
+
+**Do not skip the second empty round.** Two different angles coming back empty is what
+makes "we found nothing" mean something; one angle coming back empty means only that one
+angle was empty.
+
+Merging is yours because the red team must stay independent of the artifact it attacks.
+Two things are yours alone:
+
+- **ID 배정.** The red team proposes IDs; you assign the real ones from the current max.
+  IDs are append-only — never reuse one, even for a rule that arrives late from Phase 7.
+  The spec files and the design already cite these numbers.
+- **분류 판정.** Apply the rubric in `references/ledger-format.md` rather than deferring to
+  either agent — in particular, a rule enforced only on screen is `도메인` that has not
+  moved, not `경계`.
 
 ## Phase 2 — 기준선 (동등성 오라클을 세운다)
 
@@ -116,9 +158,19 @@ Then **stop and get human approval.** Present:
 - the decisions the designer flagged for pushback
 - known-wrong behavior being deliberately reproduced
 
+Include every `잔류합의` the designer *proposed*. The designer may propose leaving a rule
+in PHP; only the reviewer can approve it. Record the approval — who and why — in the
+ledger row itself, because Phase 7 reads that row and passes it only if the approval is
+there.
+
 Do not proceed on silence. This gate exists because everything after it is expensive to
 undo, and because a design reviewed by the person who knows the product catches things
 no amount of code reading will.
+
+**Coming back through Phase 3 means coming back through this gate.** If the audit sends
+you here, the design changed, and a design the reviewer has not seen must not flow into
+implementation. Re-entering Phase 4 alone carries no gate — the approved design is still
+the approved design.
 
 ## Phase 4 — 구현 (L1 루프)
 
@@ -142,12 +194,17 @@ Then `Agent(subagent_type: "php-swap-engineer")`.
 
 ## Phase 6 — 동등성 (L2 루프)
 
-Run the same spec twice, flipping only the toggle:
+Run the same spec twice with the command recorded in 상수 → e2e 실행, flipping only the
+toggle between the two runs:
 
 ```
 toggle = legacy   → run spec → must be green   (baseline still holds)
 toggle = migrated → run spec → must be green   (equivalence)
 ```
+
+Read the toggle back from the running application before each pass, per `local-stack`.
+Writing the env file is not the same as the value reaching PHP, and a pass run against
+the wrong toggle state produces a confident, wrong equivalence result.
 
 Run the legacy pass every time, not just once. A green migrated pass means nothing if
 the baseline drifted underneath it — live data changes, and a spec that started
@@ -178,13 +235,14 @@ which the swap leaves completely untouched and the e2e suite cannot see.
 
 Route each finding and re-enter at that phase:
 
-| 감사 판정 | 되돌아갈 곳 |
-|---|---|
-| 미이관 / 부분이관 | Phase 4 (설계에 있었다면) 또는 Phase 3 (없었다면) |
-| 잘못된 위치 | Phase 4 |
-| 호출부 잔존 / 매핑 잔존 | Phase 5 |
-| 새로 발견된 규칙 | Phase 1 — 원장에 추가하고 아래로 다시 흐른다 |
-| 무방비 | Phase 4 (백엔드 단위 테스트 추가) |
+| 감사 판정 | 되돌아갈 곳 | 게이트 |
+|---|---|---|
+| 미이관 / 부분이관 | Phase 4 (설계에 있었다면) 또는 Phase 3 (없었다면) | Phase 3 이면 게이트 1 다시 |
+| 잘못된 위치 | Phase 4 | — |
+| 호출부 잔존 / 매핑 잔존 | Phase 5 | 게이트 2 다시 (레거시를 또 건드린다) |
+| 새로 발견된 규칙 | Phase 1 — 원장에 새 ID 로 추가하고 아래로 다시 흐른다 | 설계가 바뀌면 게이트 1 |
+| 무방비 | Phase 4 (백엔드 단위 테스트 추가) | — |
+| `이관` 열이 통째로 비어 있음 | Phase 4 — 구현자가 원장을 안 쓴 것이지 코드 결함이 아니다 | — |
 
 A re-entry re-runs the phases below it, including Phase 6. That is the cost of an
 incomplete migration, and it is why L0 deserves the budget.
@@ -211,7 +269,8 @@ orchestrator's call to make.
 
 Check these yourself; agents are not trusted to self-report.
 
-- [ ] 원장의 모든 `도메인` 행에 `이관됨:<심볼>` 또는 사람이 승인한 `잔류합의`가 있다
+- [ ] 원장의 모든 `도메인` 행에 `이관됨:<심볼>` 또는 **승인자와 이유가 적힌** `잔류합의`가 있다
+- [ ] 원장에 중복 ID 가 없고, 번호를 재사용한 행이 없다
 - [ ] `불가` 행마다 백엔드 단위 테스트가 인용돼 있다
 - [ ] 아키텍처 테스트가 이번 슬라이스에서 수정되지 않았다
 - [ ] e2e에 요청 가로채기·직접 fetch·하드코딩 반환이 없다

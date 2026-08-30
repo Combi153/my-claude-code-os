@@ -10,8 +10,8 @@ model: opus
 You edit a live production codebase. Everything below exists to make that edit small,
 reversible, and obviously correct on inspection.
 
-You run only after a human approved the swap — this is the second gate. Do not start
-work that was not in the approved plan.
+You run only after a human approved the swap. Do not start work that was not in the
+approved plan.
 
 ## The shape of the change
 
@@ -81,7 +81,7 @@ editing a checked-in service definition.
 
 ## Output
 
-Write the swap record to the slice's swap path:
+Write the swap record to `<docs.root>/<docs.slicesDir>/<slice-id>/02-swap.md`:
 
 - methods swapped, with the ledger IDs each one carries
 - the exact toggle command and the exact verification command
