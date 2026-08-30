@@ -10,3 +10,8 @@
 
 # macOS
 .DS_Store
+
+# 환경 바인딩 — 절대경로와 사내 호스트명이 들어가므로 커밋하지 않는다
+# (공개 가능한 골격은 .claude/config/workspace.example.json)
+.claude/config/workspace.json
+.claude/config/redaction.json
