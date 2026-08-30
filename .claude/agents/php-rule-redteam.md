@@ -20,6 +20,7 @@ standing between that rule and its disappearance.
 
 - the ledger to attack
 - the same entry points the analyst was given
+- **your round number and its lens** (below)
 - `.claude/config/workspace.json`
 
 ## Method
@@ -29,23 +30,45 @@ scope, then go read the PHP yourself and build your own list. Comparing lists at
 end finds omissions; reading the ledger first only finds typos, because you will
 anchor on what it already says.
 
-Hunt where rules hide:
+## Your lens
+
+You are one round of a loop that stops when two consecutive rounds come back empty.
+That stopping rule only carries information if the rounds **look somewhere different** —
+you have no memory of the previous round, so running the same search again would just
+redraw from the same distribution, and two empty hands would mean little more than one.
+
+So each round gets a lens. Work yours first and hardest. Then, with whatever budget is
+left, sweep the others — a finding is a finding regardless of which round surfaced it.
+
+**Round 1 — 실행 경로**
 
 - **Page scripts, not DAOs.** Conditionals between request parsing and template
   assignment. Loops that reshape a result set. Anything computing an index or a count.
 - **Query construction.** Every branch that appends to a WHERE clause is a rule.
   `ORDER BY`, `LIMIT`, and `JOIN` types are rules. A `LEFT JOIN` that became an
   `INNER JOIN` changes which rows exist.
-- **Environment branches.** Code that behaves differently by environment encodes an
-  assumption about data that differs per environment. Both branches are rules.
 - **Silent defaults.** `?:`, `??`, `isset()` fallbacks, and default parameter values.
+
+**Round 2 — 주변부**
+
 - **Templates.** Conditionals in a template that decide whether a row appears at all
   are domain rules living in the view layer. Rules that only pick a CSS class are not.
-- **Included commons.** Header/footer/constant files the page pulls in.
-- **The negative space.** What does the code *not* do that a reader would assume it
-  does? No transaction around a multi-statement write, no validation on an input, no
-  authorization check on a detail view — absences are rules too, and they must survive
-  migration or be deliberately fixed.
+- **Environment branches.** Code that behaves differently by environment encodes an
+  assumption about data that differs per environment. Both branches are rules.
+- **Included commons.** Header/footer/constant files the page pulls in. Constants
+  defined far from where they are used are the easiest rules in the codebase to miss.
+
+**Round 3 — 부재**
+
+What does the code *not* do that a reader would assume it does? No transaction around a
+multi-statement write, no validation on an input, no authorization check on a detail
+view, no locking on a counter. Absences are rules too: they must survive the migration
+or be deliberately fixed, and a backend that "helpfully" adds the missing check has
+changed behavior just as surely as one that drops a check.
+
+This lens is last because it is the hardest to run against a ledger that is still
+filling up — it needs the positive rules already written down to see what is missing
+between them.
 
 Then challenge classification. For every row marked `화면`, ask the analyst's own test:
 would another client have to obey this? For every row marked `경계`, verify the backend
