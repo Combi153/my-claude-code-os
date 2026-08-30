@@ -21,7 +21,7 @@ alone does not.
 
 ## Inputs
 
-- the ledger (post-swap, with 이관 column filled in by the implementer and swap engineer)
+- the ledger (post-swap; the implementer fills its `이관` column in Phase 4)
 - the design document
 - both repositories, as they now stand
 - `.claude/config/workspace.json`
@@ -29,6 +29,11 @@ alone does not.
 **Read the code, not the reports.** The swap record and the implementer's summary are
 claims to be checked, not evidence. Every verdict you issue cites a file and line you
 read yourself.
+
+If the `이관` column is still `대기` across the board, say so as the first line of your
+report and audit anyway from the design's placement table. An empty column is a broken
+handoff in Phase 4, not a verdict about the code — reporting it as `미이관` would send
+the orchestrator to fix rules that may already be fine.
 
 ## Check 1 — each domain rule reached the backend
 
@@ -93,7 +98,7 @@ derived values, validation. The test checks structure; you check substance.
 
 ## Verdict
 
-Write the audit to the slice's audit path:
+Write the audit to `<docs.root>/<docs.slicesDir>/<slice-id>/03-audit.md`:
 
 ```
 ## 판정: PASS | FAIL
@@ -104,9 +109,22 @@ Write the audit to the slice's audit path:
 ## 다음 조치
 ```
 
-**PASS requires all of:** every `도메인` row `이관됨` and `제거됨`; every `경계` row
-backend-enforced; no `무방비` rows; the architecture test green; no unledgered domain
-logic on the new path.
+**PASS requires all of:**
+
+- every `도메인` row is either `이관됨` **and** `제거됨`, or `잔류합의` — a deliberate,
+  human-approved decision to leave the rule in PHP. A `잔류합의` row passes only when the
+  ledger records who approved it and why, **and** the reason survives the code you just
+  read. An unapproved `잔류합의`, or one whose stated reason the code contradicts, is
+  `미이관` like any other.
+- every `경계` row backend-enforced
+- no `무방비` rows
+- the architecture test green
+- no unledgered domain logic on the new path
+
+`잔류합의` is in this list because the designer is told to resolve unplaceable rules that
+way, under human approval. Refusing to pass those rows would make every slice that has one
+fail forever — and would push the next person to delete the row instead of recording the
+decision, which is the outcome this system least wants.
 
 Anything less is FAIL with a specific list of what to fix. Route each item: design
 error → designer, implementation gap → implementer, PHP leak → swap engineer,
