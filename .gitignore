@@ -15,3 +15,5 @@
 # (공개 가능한 골격은 .claude/config/workspace.example.json)
 .claude/config/workspace.json
 .claude/config/redaction.json
+.claude/.state/
+__pycache__/
