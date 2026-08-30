@@ -62,8 +62,13 @@ def load_redaction(root):
         return None
     compiled = []
     for entry in cfg.get("patterns", []):
+        # Default to case-insensitive: that is what the first patterns were written
+        # against. A pattern whose whole signal is CamelCase must opt out, or `re.I`
+        # turns `[A-Z]\w+Service` into a match for the word "microservice" — and a
+        # guard that blocks ordinary English is a guard someone switches off.
+        flags = 0 if entry.get("ignoreCase") is False else re.I
         try:
-            compiled.append((entry.get("name", "?"), re.compile(entry["regex"], re.I)))
+            compiled.append((entry.get("name", "?"), re.compile(entry["regex"], flags)))
         except (KeyError, re.error):
             continue
     return compiled, set(cfg.get("allowPaths", []))
