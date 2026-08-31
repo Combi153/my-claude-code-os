@@ -29,12 +29,19 @@ the rule is how the audit finds the coverage later.
 You are not done when the code is written. You are done when this is green:
 
 ```
-./gradlew <fixity module>:build <proxy module>:build
+JAVA_HOME=<backend.javaHome> ./gradlew <fixity module>:build <proxy module>:build
 ```
 
 which includes unit tests, the architecture test, and format checks. Run it, read the
 failures, fix, repeat. Budget roughly five rounds; if it is still red, stop and report
 what is blocking rather than thrashing.
+
+**Export `backend.javaHome` from `workspace.json` on every gradle invocation.** The
+machine's default JDK is not necessarily the one the wrapper supports, and when it is not,
+the build dies with a single line naming only the version number — no stack, no mention of
+toolchains. Spend a loop round on that and you will be looking for a defect in your code
+that is not there. If `javaHome` is missing from the config, stop and say so rather than
+falling back to the default.
 
 Write unit tests for the domain rules you implemented, one per ledger ID where the
 rule has a decidable input/output. Name the test after the rule so the audit can find

@@ -26,6 +26,30 @@ names a skill inside it, prefer that for starting the backend — it carries ope
 detail (VPN prerequisites, trust stores, port collisions with sibling services) that is
 not worth duplicating here. Fall back to the direct commands below when either is empty.
 
+## 처음 세팅할 때
+
+An environment that has never run this OS usually fails three times before Phase 0 passes,
+and none of the three failures names itself. Check these before concluding the stack is
+broken — each was hit for real on the first run here.
+
+**컨테이너 이미지가 로컬에 없을 수 있다.** The compose file may reference images that are
+distributed as archives beside it rather than pulled from a registry. A `pull access denied`
+on an image whose name looks local means load the archive, not authenticate.
+
+**형제 체크아웃이 빠져 있을 수 있다.** The legacy tree is several repositories checked out
+side by side, and a data-access class may `require_once` a file that lives in one of the
+*others*. Missing one kills the surface in the constructor, before any query runs — the
+error names a file path, not a missing repository, so it reads like a corrupted checkout.
+Compare what the tree expects against what is present.
+
+**DB 계정이 개발자 PC 를 거부할 수 있다.** Grants are often scoped to office server IPs, so
+the default development account is refused from a laptop even with the network reachable.
+The tree may already carry an env-driven override for *one* connection — a previous project
+needed exactly one. Extend that same mechanism rather than changing the shared default,
+which every other service reads too.
+
+Once these hold, `status.sh` reports the surfaces green and the rest of this file applies.
+
 ## 선행 조건
 
 The containers run locally but the data does not. The legacy runtime and the new
@@ -44,10 +68,35 @@ health endpoints prove only that two processes are listening.
 containers mount the source tree, so no rebuild is needed after a code edit; only a
 change to the *environment* requires recreating the container that serves the surface.
 
-**백엔드** — start the data-layer module first, wait for its health endpoint, then the
-gateway module. The gateway is wired to the data layer by a configured URL; if a port
-was reassigned, that URL moves with it or the gateway comes up healthy and returns
-nothing.
+**백엔드** — three things must be true before the data layer will boot, and each fails in
+a way that does not name itself.
+
+1. **JDK.** Export `backend.javaHome` for every gradle command, building or booting. The
+   machine's default JDK may be newer than the Gradle wrapper accepts, and that failure is
+   a single line containing nothing but a version number — it reads like a corrupted build,
+   not a toolchain mismatch.
+2. **Truststore.** The data layer fetches its DB settings from the config service in
+   `backend.configServer` over TLS with a self-signed certificate, so it needs
+   `backend.truststore` passed as JVM args:
+   `-Djavax.net.ssl.trustStore=<path> -Djavax.net.ssl.trustStorePassword=<password>`.
+   Without it the boot dies on `PKIX path building failed`, which reads like a network
+   problem. The gateway usually does not need this — it does not talk to the config service.
+3. **Network reach.** The config service and the database both resolve on the internal
+   network only. Off it, the boot hangs at config fetch rather than failing.
+
+Then: **data layer first, health check, gateway second.** The gateway finds the data layer
+through `backend.fixityUrl` — a gradle property with an env override. Reassign the data
+layer's port and that value moves with it, or the gateway comes up healthy and returns
+nothing at all.
+
+**Ports collide with a sibling service.** Before starting, check what is listening. If the
+holder belongs to another project, do not kill it — offer to start on a shifted port pair
+instead, and move `fixityUrl` to match. Killing another team's running stack to free a port
+is not a decision this skill gets to make.
+
+The gateway requires Basic auth in **every** profile, local included, using the accounts in
+`backend.basicAuth`. An unauthenticated curl returning 401 is the service working, not
+failing — do not treat it as a boot error.
 
 Verify each with its health endpoint before reporting up. A process that started is not
 a service that works.
@@ -66,7 +115,14 @@ Three operations, and all three matter to the loop:
 | **확인** | Read it back after recreating, before running any test. |
 
 **Environment delivery is not uniform.** Different surfaces are served by different
-containers, and a PHP-FPM pool may strip environment it was not told to pass through.
+containers, and a tree can be reachable through more than one runtime at once — measured
+here, the same pages render under both an FPM stack and an Apache mod_php stack on
+different ports. `$_SERVER` carries the environment under FPM but not under mod_php, so
+probe with `getenv()`, which works in both.
+
+**Serve each surface from the container the config names, not from whichever port
+answers.** A surface rendering fine is not evidence it is running the production runtime;
+here one surface rendered identically under two different PHP major versions.
 So never infer the live value from the file you just wrote — read it back from the
 application. A test run against the wrong toggle state produces a confident, wrong
 equivalence result, which is worse than a failure.

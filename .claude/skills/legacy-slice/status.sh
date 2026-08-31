@@ -30,6 +30,14 @@ while IFS=$'\t' read -r kind a b; do
   case "$kind" in
     LINE)   printf '%s\n' "$a" ;;
     PROBE)  printf '%s = %s\n' "$a" "$(probe "$b")" ;;
+    JAVA)
+      if [ -z "$b" ]; then
+        printf '%s javaHome 미설정 — gradle 이 기본 JDK 로 돌아 실패할 수 있음\n' "$a"
+      elif [ ! -x "$b/bin/java" ]; then
+        printf '%s javaHome 경로에 JDK 없음\n' "$a"
+      else
+        printf '%s%s\n' "$a" "$("$b/bin/java" -version 2>&1 | head -1 | sed 's/.*version //; s/"//g')"
+      fi ;;
     DOCKER)
       if command -v docker >/dev/null 2>&1 && [ -d "$b" ]; then
         up=$(cd "$b" && docker compose ps --services --status running 2>/dev/null | tr '\n' ' ')
@@ -61,6 +69,8 @@ for name in ("proxy", "fixity"):
         probe(f"{head}{name:<7} :{port}", f"http://localhost:{port}/actuator/health")
 if first:
     line("backend  : 모듈 설정 없음")
+# 빌드가 기본 JDK 로 돌면 버전 번호 한 줄만 남기고 죽는다. Phase 0 에서 보이게 한다.
+out.append(f"JAVA\t           gradle JDK  \t{backend.get('javaHome') or ''}")
 
 # ── legacy surfaces — whatever they are named ──────────────────────────────
 surfaces = legacy.get("surfaces") or {}
