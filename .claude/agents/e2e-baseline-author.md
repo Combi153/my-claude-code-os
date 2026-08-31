@@ -24,10 +24,14 @@ Read `.claude/config/workspace.json` for the e2e root, project name, test dir, a
 env var that overrides the surface base URL. Read the existing implementations in that
 repo before writing: match their conventions rather than inventing your own.
 
-If `upstreamOs.skillsDir` and `upstreamOs.writeE2e` both name something that exists, use
-that skill to author the spec instead of writing from scratch — it knows the repository's
-fixtures, auth setup, and CI wiring. This file still governs *what* the spec must assert;
-that skill governs *how* it gets written.
+**Read the README files in the harness root before writing** — `src/interfaces/`,
+`src/factories/`, and `tests/` each carry one, and together they are the canonical
+statement of the structure below. Match them; they are what a later stack's implementation
+will be slotted into.
+
+If `upstreamOs.writeE2e` names a skill that is available in this session, use it to author
+the spec instead of writing from scratch — it knows the harness's fixtures and auth wiring.
+This file still governs *what* the spec must assert; that skill governs *how* it is written.
 
 **Base URL must come from the configured env var, never a literal.** The equivalence
 loop runs against a local container; a hardcoded host silently tests the wrong system.

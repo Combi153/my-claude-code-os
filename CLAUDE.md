@@ -13,11 +13,13 @@ It is meant to run against the company codebase.
 
 The course is unrelated to the company. The OS is meant to be published; company code is not.
 
-`php_legacy/` and `cs-system/` are company repositories checked out inside this directory.
-They are gitignored and must stay that way.
+`php_legacy/`, `cs-system/`, and `cs-e2e/` live inside this directory and are gitignored.
+They must stay that way. The first two are company repositories. `cs-e2e/` is a local
+repository this OS owns — it holds the e2e harness, and it is gitignored because its
+config carries internal hostnames.
 
-- Never move content from `php_legacy/` or `cs-system/` into a tracked file of this repository.
-  This covers code as well as internal domains, issue IDs, and people's names.
+- Never move content from `php_legacy/`, `cs-system/`, or `cs-e2e/` into a tracked file of
+  this repository. This covers code as well as internal domains, issue IDs, and people's names.
 - Never commit logs or reports produced by running the OS against company code.
 
 ## Working rules
@@ -53,6 +55,7 @@ true — it is a byproduct of the work, not a parallel project.
 | `boundary-audit` | 도메인 로직이 화면에 남아있는지 감사 (슬라이스별 / 표면 훑기) |
 | `domain-doc` | 원장 → 기획자·운영자용 도메인 문서 |
 | `local-stack` | 로컬 스택 기동과 마이그레이션 토글 제어 |
+| `e2e-run` | e2e 스위트 실행과 실패 원인 분류 |
 
 The design and the reasoning behind it — decisions, loops, gates, open questions — live in
 `docs/legacy-migration-os.md`. That document is maintained as the design changes; edit it before
@@ -66,6 +69,9 @@ Subagents live in `.claude/agents/`. Models are assigned by role: judgment-heavy
 Skills contain no paths, hostnames, ports, or table names. They read
 `.claude/config/workspace.json`, which is gitignored; `workspace.example.json` is the
 tracked skeleton. This is what lets the OS be public while the migration it drives is not.
+
+Every path in that config points inside this directory, so the OS needs no `--add-dir`
+and reaches nothing outside the checkout it runs in.
 
 Two hooks enforce the boundary:
 
