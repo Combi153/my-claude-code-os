@@ -35,6 +35,17 @@ For each method being swapped:
 
 3. The switch helper reads the environment variable and nothing else. Default is the
    legacy path: an unset or unrecognized value must never route to the new backend.
+
+   **Read it with `getenv()`.** Measured in this environment: under FPM both `getenv()` and
+   `$_SERVER` carry the container environment, but under Apache mod_php `$_SERVER` is empty.
+   The same legacy tree is served by both, so a helper written against `$_SERVER` silently
+   pins whichever surface runs mod_php to the legacy path forever — no error, no failed
+   test, just a toggle that never turns on.
+
+   **Check which container serves each surface** in `workspace.json` before writing any
+   syntax that depends on a PHP version. A legacy tree can be reachable through more than
+   one runtime, and the one a page happens to render under is not necessarily the one
+   production uses.
 4. The backend client is **deliberately dumb** — build the request string, send it,
    read the response, map it to the array shape the original method returned. No code
    generation, no client library, no abstraction layer. This code is scheduled for
