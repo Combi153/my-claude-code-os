@@ -91,6 +91,19 @@ Write to `<docs.root>/<docs.slicesDir>/<slice-id>/01-design.md`. It must contain
 8. **알려진 위험** — behaviors you are deliberately reproducing that are wrong
    (the ledger's 결함 section), and what would break if the caller drifts.
 
+## 표류를 의심한 지점은 원장 행으로 낸다
+
+Wherever you write "this may diverge from legacy and must be verified against the baseline," you
+have identified a rule that is not yet in the ledger. **List those as proposed ledger rows in your
+design document, in the ledger's row format, so the orchestrator can assign IDs and the e2e author
+can turn them into assertions.**
+
+Recording the doubt only in your own document is not enough. The e2e author's input is the ledger;
+your design is not. On the first slice a flagged LIKE-escaping risk stayed out of the ledger, the
+equivalence loop closed 70/70 green on both toggle states, and the audit found that the two paths
+returned different result sets for any keyword containing a backslash. Three documents knew about
+the risk and no oracle could see it.
+
 ## Prohibitions
 
 - **No design element without a ledger ID.** If you want to add something the legacy

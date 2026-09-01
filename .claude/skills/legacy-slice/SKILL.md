@@ -162,6 +162,12 @@ Then **stop and get human approval.** Present:
 - the 규칙 배치표, and specifically any `도메인` row left unplaced
 - the decisions the designer flagged for pushback
 - known-wrong behavior being deliberately reproduced
+- **설계가 표류를 의심한 지점마다 원장 행이 있는지.** A design that says "this may diverge and
+  must be compared against the baseline" has named a rule nobody has written down yet. Add it to
+  the ledger with a new ID before Phase 4, because the e2e author reads the ledger and nothing
+  else — a doubt recorded only in the design document has no path to becoming an assertion, and
+  the equivalence loop will close over it while showing green. This cost the first slice a full
+  L3 re-entry.
 
 Include every `잔류합의` the designer *proposed*. The designer may propose leaving a rule
 in PHP; only the reviewer can approve it. Record the approval — who and why — in the
