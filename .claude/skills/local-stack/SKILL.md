@@ -84,6 +84,21 @@ a way that does not name itself.
 3. **Network reach.** The config service and the database both resolve on the internal
    network only. Off it, the boot hangs at config fetch rather than failing.
 
+   **이미 뜬 서비스가 망을 잃으면 증상이 다르다 — 그리고 슬라이스가 깨진 것처럼 보인다.**
+   A service that booted on the network keeps its fetched config, so it stays healthy while every
+   query times out. Measured signature, and it takes three commands:
+
+   | 확인 | 망 밖일 때 |
+   |---|---|
+   | DB 를 타는 표면 | `000`, 요청 타임아웃까지 대기 (거부가 아니다) |
+   | DB 를 안 타는 표면 | `200` — 컨테이너는 멀쩡하다 |
+   | `configServer` 호스트 DNS | **해석 실패**(빈 응답) |
+
+   The DNS line is the discriminator: a firewall or an unauthorised IP resolves the name and
+   refuses the connection quickly. An unresolvable name means you are off the network. And the
+   legacy surface logs none of this — `display_errors` is off and php-fpm's error log is unset —
+   so silence is the expected output, not evidence of a code defect.
+
 Then: **data layer first, health check, gateway second.** The gateway finds the data layer
 through `backend.fixityUrl` — a gradle property with an env override. Reassign the data
 layer's port and that value moves with it, or the gateway comes up healthy and returns
