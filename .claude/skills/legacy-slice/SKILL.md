@@ -217,6 +217,16 @@ Read the toggle back from the running application before each pass, per `local-s
 Writing the env file is not the same as the value reaching PHP, and a pass run against
 the wrong toggle state produces a confident, wrong equivalence result.
 
+**토글은 공유 가변 상태다 — 그것을 뒤집는 작업을 둘 이상 동시에 돌리지 마라.** On the first
+slice two agents were dispatched in parallel because they edited different repositories; but both
+flipped the toggle to verify, and one of them ran an entire suite against the other's in-flight
+state and got 21 failures that were neither spec defects nor migration defects. Different files is
+not the same as different state. Parallelise the work, serialise the toggle — or hold the toggle
+yourself and let the agents ask for a state rather than setting it.
+
+What caught it was reading the toggle back at the start of the run, not the failures. **Distrust a
+red run and a green run equally until the toggle has been read from the application.**
+
 Run the legacy pass every time, not just once. A green migrated pass means nothing if
 the baseline drifted underneath it — live data changes, and a spec that started
 depending on today's rows will mislead you in both directions.
