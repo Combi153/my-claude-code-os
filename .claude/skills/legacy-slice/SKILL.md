@@ -40,7 +40,7 @@ empty search there is indistinguishable from an empty file.
 
 ## 현재 환경
 
-!`bash "$CLAUDE_PROJECT_DIR/.claude/skills/legacy-slice/status.sh"`
+!`bash "${CLAUDE_PROJECT_DIR:-.}/.claude/skills/legacy-slice/status.sh"`
 
 ## 상수
 
