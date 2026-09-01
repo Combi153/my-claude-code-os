@@ -32,6 +32,35 @@ confident zero. Korean matters because in this codebase the business intent is w
 Korean comments — `// 서비스도움말 상세내용등록` is the sentence that tells you what a
 method is for, and it is invisible to five of the seven rows above.
 
+## LSP 는 다른 축으로 실패한다
+
+An official php-lsp plugin is installed and intelephense is running. It does not have the
+encoding problem — PHP symbol names are ASCII, so file-level queries work on EUC-KR files.
+It has a different one, and it fails in the same silent shape.
+
+Measured 2026-09-02:
+
+| 기능 | 상태 |
+|---|---|
+| `documentSymbol` · hover · 진단 | **동작** — EUC-KR 파일에서도 줄번호까지 정확하다 |
+| `goToDefinition` (같은 파일 안) | 동작 |
+| `findReferences` | **빈손** — 20개 파일이 쓰는 클래스에 0 을 반환했다 |
+| `workspaceSymbol` | **빈손** |
+
+The tree has more than fifty thousand PHP files, so the workspace index is very likely
+incomplete rather than the references being absent. **An unindexed workspace and a symbol
+with no callers return the same thing: zero.** That is the same failure shape as an EUC-KR
+`grep`, arriving through a newer tool.
+
+두 가지는 LSP 로 답할 수 없다는 것도 같이 기억한다.
+
+- **한국어 주석.** Business intent lives in Korean comments, and comments are not symbols.
+  The iconv path in this file stays necessary.
+- **동적 호출.** `$fn()`, `call_user_func`, method names built from strings, and variable
+  `include` are invisible to static analysis. When the answer must be exhaustive — the caller
+  census before a swap — pair the static answer with a runtime observation and treat any
+  disagreement as the interesting part.
+
 ## 규칙
 
 1. **인코딩을 먼저 확인한다.** `file -b --mime-encoding <path>` on every file you open.
@@ -59,6 +88,12 @@ method is for, and it is invisible to five of the seven rows above.
    iconv back onto disk. Convert on the way to your eyes, never on the way to the file.
    A separate hook blocks edits that change encoding; that hook does not cover a careless
    `iconv -o`.
+
+7. **캘리브레이션 전에는 LSP 의 빈손을 근거로 쓰지 않는다.** Before citing `findReferences` or
+   `workspaceSymbol`, prove the index is live: pick a symbol whose answer you already know from
+   `rg` and check that the LSP returns the same count. If it does not match, the index is not
+   covering this subtree — say so and fall back to `rg`, rather than reporting zero callers.
+   Rule 5 applies here unchanged: an absence claim must name the method that produced it.
 
 ## 왜 이게 원장의 문제인가
 
