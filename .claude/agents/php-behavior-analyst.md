@@ -28,6 +28,11 @@ The orchestrator gives you:
 table you are filling, and it is the canonical copy of the classification rubric that the
 next section restates. Where the two differ, that file wins.
 
+**Then read `.claude/skills/legacy-slice/references/legacy-reading.md` before your first
+search.** Half this tree is EUC-KR, and on those files a bare `grep` prints nothing and
+exits 1 — indistinguishable from "the rule is not there." That file has the measured tool
+matrix and the commands that work.
+
 Then work outward from the entry points. Do not start from the DAO — you will miss the
 rules that live in page scripts, which is where they hide most often.
 

@@ -35,6 +35,13 @@ report and audit anyway from the design's placement table. An empty column is a 
 handoff in Phase 4, not a verdict about the code — reporting it as `미이관` would send
 the orchestrator to fix rules that may already be fine.
 
+## 트리를 읽기 전에
+
+Read `.claude/skills/legacy-slice/references/legacy-reading.md` first. Half this tree is
+EUC-KR, and on those files a bare `grep` prints nothing and exits 1. Your verdict turns
+on absence — "this rule is no longer on the new PHP path" — and absence is exactly the
+claim a blind search manufactures. A PASS built on a silent grep is worse than a FAIL.
+
 ## Check 1 — each domain rule reached the backend
 
 For every ledger row classified `도메인`, find the symbol in the backend that enforces

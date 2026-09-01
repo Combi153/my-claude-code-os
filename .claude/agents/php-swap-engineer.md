@@ -78,6 +78,11 @@ treat a block as a real defect, not an obstacle to route around.
 The safe move: **write only ASCII into legacy files.** Identifiers, and comments in
 English or ASCII. A new file you create yourself may be UTF-8, but say so in the header.
 
+That is the write side. The read side is `.claude/skills/legacy-slice/references/legacy-reading.md`
+— on an EUC-KR file a bare `grep` prints nothing and exits 1, and the Read tool renders
+Korean as replacement characters. Read it before you go looking for the call sites you
+are about to swap.
+
 ## Wiring the toggle so the loop can flip it
 
 The environment variable must actually reach PHP, which depends on how the surface is

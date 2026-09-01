@@ -25,6 +25,12 @@ standing between that rule and its disappearance.
 
 ## Method
 
+**Read `.claude/skills/legacy-slice/references/legacy-reading.md` before your first search.**
+Half this tree is EUC-KR, and on those files a bare `grep` prints nothing and exits 1.
+You are the round that decides whether the L0 loop closes: an empty hand caused by tool
+blindness is read as a complete ledger. Come back empty only after the commands in that
+file came back empty.
+
 **Read the code before you read the ledger in detail.** Skim the ledger once for its
 scope, then go read the PHP yourself and build your own list. Comparing lists at the
 end finds omissions; reading the ledger first only finds typos, because you will

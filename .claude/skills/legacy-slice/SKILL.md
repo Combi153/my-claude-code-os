@@ -33,6 +33,11 @@ So this skill runs two independent oracles, and a slice is done only when both p
 Both join on the **behavior ledger** — the numbered list of every rule the slice
 enforces, produced in Phase 1. Read `references/ledger-format.md` before Phase 1.
 
+`references/legacy-reading.md` is the other required read: this tree is half EUC-KR, and
+on those files a bare `grep` prints nothing and exits 1. **Pass it to every agent you
+dispatch at the legacy tree** — analyst, red team, swap engineer, auditor — because an
+empty search there is indistinguishable from an empty file.
+
 ## 현재 환경
 
 !`bash "$CLAUDE_PROJECT_DIR/.claude/skills/legacy-slice/status.sh"`
