@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""phplint - syntax-check a legacy file against the runtime it actually ships on.
+
+    phplint <file>...        lint each file with its own service's PHP version
+    phplint --as <path> -    lint stdin, using <path> to pick the version
+
+Which service runs which PHP version, and the container image that version is
+checked in, come from `legacy.runtimes` in workspace.json. A prefix with no entry
+there is reported as **not checked** — never as passing. The local `php` binary
+is not used at all: it accepts syntax an older runtime rejects, so it proves
+nothing about the runtime the file actually ships on. Files go to the container
+on stdin, so no mount is needed and the file's encoding is irrelevant — PHP
+lexes bytes.
+
+An older runtime rejects the newer grammar (short arrays, traits, finally,
+variadics, ??, return types, match) but it cannot reject functions that merely
+did not exist yet, because a call to an undefined function is a runtime error.
+Those are checked by name below instead.
+
+Containers run with short_open_tag on. Turn that off and a file opening with
+`<?` reads as plain HTML and comes back clean whatever is inside it.
+"""
+import os
+import re
+import subprocess
+import sys
+import time
+import uuid
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _phpenc import require_config, runtime_for_prefix, service_of  # noqa: E402
+
+# 이미지 참조는 workspace.json 의 `legacy.runtimes[<prefix>]` 에 있다. 태그가
+# 움직일 수 있는 이미지는 그쪽에서 다이제스트로 고정하고, 없을 때 어떻게 얻는지도
+# `howto` 로 함께 적어 둔다 — 이미지 부재는 문법 실패가 아니라 "검사하지 못함"
+# 이므로, 그 구분을 사용자에게 넘기려면 얻는 방법이 손에 있어야 한다.
+LINT_EXT = (".php", ".inc", ".tpl", ".phtml")
+
+# 도커에 줄 수 있는 총 시간(초). 호출자가 자기 예산 안에 이 도구를 넣을 수 있어야
+# 한다: `php-encoding-guard.py` 는 훅 35초 안에서 이 도구를 25초로 부르므로, 그
+# 안쪽인 도커가 60초면 **바깥이 먼저 죽고 결과는 "검사 못 함"이 아니라 아무것도
+# 아닌 채로 사라진다.** 그래서 예산은 환경변수로 받는다. 직접 부를 때의 기본값은
+# 그대로 60초다.
+DOCKER_BUDGET_ENV = "PHPLINT_DOCKER_TIMEOUT"
+DOCKER_BUDGET_DEFAULT = 60
+
+
+def docker_budget():
+    try:
+        v = float(os.environ.get(DOCKER_BUDGET_ENV, "") or DOCKER_BUDGET_DEFAULT)
+    except ValueError:
+        return DOCKER_BUDGET_DEFAULT
+    return max(3.0, v)
+
+# Third-party code vendored into the tree. Not ours to fix, so a file list skips
+# it - but `--as` still checks whatever the caller explicitly named.
+VENDORED = ("/vendor/", "/node_modules/", "/external/", "/phpexcel/",
+            "/codeigniter", "/namo", "/adminlte", "/ckeditor/", "/sheetjs/")
+
+# Functions the 5.3 parser accepts happily because a call to an undefined
+# function is a runtime error, not a syntax error. Version each one was added.
+LATER_FUNCTIONS = {
+    "hex2bin": "5.4", "http_response_code": "5.4",
+    "array_column": "5.5", "password_hash": "5.5", "password_verify": "5.5",
+    "boolval": "5.5", "json_last_error_msg": "5.5",
+    "ldap_escape": "5.6",
+    "intdiv": "7.0", "random_int": "7.0", "random_bytes": "7.0",
+    "is_iterable": "7.1", "spl_object_id": "7.2",
+    "array_key_first": "7.3", "array_key_last": "7.3", "is_countable": "7.3",
+    "str_contains": "8.0", "str_starts_with": "8.0", "str_ends_with": "8.0",
+    "fdiv": "8.0", "get_debug_type": "8.0",
+    "array_is_list": "8.1", "enum_exists": "8.1",
+    "json_validate": "8.3",
+}
+
+
+def runtime_for(path):
+    """The PHP version this path ships on, or None when config does not say.
+
+    답은 `legacy.runtimes` 가 준다. 두 런타임에서 모두 로드되는 공용 트리는 설정에서
+    낮은 쪽으로 적어 둔다 — 낮은 버전에서 파싱되는 코드는 높은 버전에서도 파싱되지만
+    그 반대는 성립하지 않기 때문이다. 설정에 없는 접두어는 None 이고, 호출자는 그것을
+    "통과"가 아니라 "검사하지 못함"으로 보고한다.
+    """
+    svc = service_of(path)
+    if not svc:
+        return None
+    rt = runtime_for_prefix(svc[0])
+    return (rt or {}).get("php")
+
+
+def image_for(version):
+    """(image, howto) for a PHP version, or (None, None)."""
+    for rt in (require_config("phplint").get("runtimes") or {}).values():
+        if rt.get("php") == version:
+            return rt.get("image"), rt.get("howto", "")
+    return None, None
+
+
+def parse_check(data, version):
+    """Run php -l in the container. Returns (ok, message).
+
+    Retried once: the 5.3 image is amd64 and segfaults under emulation now and
+    then, which would otherwise surface as "could not check". **The retry is
+    deadline-aware**: a segfault fails in under a second and leaves the budget
+    almost intact, while a hang consumes it — and retrying after a hang is how
+    a 60-second budget became 120 seconds inside a caller that allowed 25.
+    """
+    budget = docker_budget()
+    t0 = time.time()
+    ok, msg = _parse_once(data, version, budget)
+    left = budget - (time.time() - t0)
+    if ok is None and left > 2:
+        ok, msg = _parse_once(data, version, left)
+    return ok, msg
+
+
+def _parse_once(data, version, budget=None):
+    image, howto = image_for(version)
+    if not image:
+        return None, (f"PHP {version} 을 검사할 이미지가 workspace.json 의 "
+                      "legacy.runtimes 에 없다")
+    # Name the container so a timeout can still reach it. `subprocess.run`'s
+    # timeout kills the docker *client*, not the container it started, and
+    # `--rm` only fires when the container itself stops - so an emulated 5.3
+    # run that hangs on stdin leaks a running container for every call. Four of
+    # them were found alive six hours after the fact.
+    name = f"phplint-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    try:
+        p = subprocess.run(
+            ["docker", "run", "--rm", "-i", "--name", name,
+             "--platform", "linux/amd64",
+             "--entrypoint", "php", image,
+             # both deployed php.ini files set this On, and 496 files in the
+             # tree open with `<?`. Without it the 8.3 image reads such a file
+             # as plain HTML and reports it clean whatever is inside.
+             "-d", "short_open_tag=1", "-l"],
+            input=data, capture_output=True,
+            timeout=budget if budget is not None else docker_budget())
+    except FileNotFoundError:
+        return None, "docker not found - cannot check syntax"
+    except subprocess.TimeoutExpired:
+        # `stop`, not `rm -f`: the container was started with --rm, so stopping
+        # it is enough to have it removed, and it leaves a force-delete out of
+        # a tool that runs unattended.
+        # `stop` 자체의 상한은 짧게 둔다. 이 정리까지 포함해서 호출자의 예산
+        # 안에 들어와야 하고, `-t 0` 은 데몬에 한 번 묻는 일이다.
+        try:
+            subprocess.run(["docker", "stop", "-t", "0", name],
+                           capture_output=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass          # 정리가 실패해도 답은 "검사 못 함" 하나다
+        return None, (f"docker timed out running {image} "
+                      f"({int(budget if budget is not None else docker_budget())}초)")
+    out = (p.stdout + p.stderr).decode("utf-8", "replace")
+    if "Unable to find image" in out or "no such image" in out.lower():
+        return None, f"PHP {version} image is missing - {howto}"
+    if p.returncode == 0:
+        return True, ""
+    lines = [ln.strip() for ln in out.splitlines()
+             if "parse error" in ln.lower() or "fatal error" in ln.lower()]
+    if not lines:
+        # docker failed for its own reasons. Do not report that as bad syntax -
+        # a gate that blocks on an unclear result is worse than no gate.
+        return None, f"{image} exited {p.returncode} without a parse error: " \
+                     f"{out.strip()[:200]}"
+    return False, "\n".join(lines)
+
+
+def function_check(data, version):
+    """Names that parse fine but do not exist on the target runtime."""
+    if version != "5.3":
+        return []
+    text = data.decode("utf-8", "replace")
+    found = []
+    for name, since in sorted(LATER_FUNCTIONS.items()):
+        # a call, not a substring ($boolvalue), not a method ($o->boolval()),
+        # not a polyfill definition (function array_column(...))
+        if re.search(r"(?<![\w$>])(?<!function )" + name + r"\s*\(", text, re.I):
+            found.append(f"{name}() needs PHP {since}")
+    return found
+
+
+def lint(data, path, version):
+    ok, msg = parse_check(data, version)
+    if ok is None:
+        print(f"phplint: {msg}", file=sys.stderr)
+        return 2
+    problems = [] if ok else [msg]
+    problems += function_check(data, version)
+    if not problems:
+        print(f"phplint: {path} OK on PHP {version}", file=sys.stderr)
+        return 0
+    print(f"phplint: {path} FAILS on PHP {version} "
+          f"(the runtime this file ships on)", file=sys.stderr)
+    for p in problems:
+        print(f"  {p}", file=sys.stderr)
+    return 1
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+
+    if argv[0] == "--as":
+        if len(argv) < 2:
+            print("phplint: --as needs a path", file=sys.stderr)
+            return 2
+        path = argv[1]
+        version = runtime_for(path)
+        if not version:
+            print(f"phplint: {path} is outside our services - not checked",
+                  file=sys.stderr)
+            return 0
+        return lint(sys.stdin.buffer.read(), path, version)
+
+    worst = 0
+    unchecked = 0
+    for path in argv:
+        if not path.lower().endswith(LINT_EXT):
+            print(f"phplint: {path} is not PHP - skipped", file=sys.stderr)
+            continue
+        low = "/" + os.path.abspath(path).lower().lstrip("/")
+        if any(v in low for v in VENDORED):
+            print(f"phplint: {path} is a vendored bundle - skipped",
+                  file=sys.stderr)
+            continue
+        if not os.path.isfile(path):
+            print(f"phplint: not a file: {path}", file=sys.stderr)
+            worst = max(worst, 2)
+            continue
+        version = runtime_for(path)
+        if not version:
+            print(f"phplint: {path} is outside our services - not checked",
+                  file=sys.stderr)
+            unchecked += 1
+            continue
+        with open(path, "rb") as fh:
+            worst = max(worst, lint(fh.read(), path, version))
+    # 검사하지 못한 것을 0 으로 돌려주지 않는다. 0 은 호출자에게 "이 파일은 운영
+    # 런타임에서 파스된다"로 읽히고, 그것이 이 도구가 막으려는 실패 그 자체다.
+    # 막지는 않는다 - 3 은 실패가 아니라 "답하지 못했다"는 뜻이고, 호출자가
+    # 통과와 구분할 수 있으면 그것으로 족하다.
+    if worst == 0 and unchecked:
+        return 3
+    return worst
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

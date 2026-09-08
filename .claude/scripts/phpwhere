@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""phpwhere - 이름이 어디서 정의되는지 인덱스에서 즉시 답한다.
+
+    phpwhere <이름>                             클래스·함수·상수·전역변수
+    phpwhere '$<전역변수>'
+    phpwhere --tpl <파일.tpl.php>               템플릿 변수와 그걸 넣는 쪽
+    phpwhere --entry <파일.php>                 이 페이지가 끌어오는 것 요약
+    phpwhere --entry <파일.php> --full          include 트리 전체
+    phpwhere --conflicts [classes|functions|constants|globals]
+
+grep 과 다른 점. grep 은 '못 찾았다'와 '없다'를 구분하지 못한다. `$X =` 로 찾으면
+0건인데 실제 정의는 `$X[상수] = 값` 인 경우가 그렇다. 여기서는 정의 형태를 만들 때
+정규화해 두었으므로 0건이면 정말 없는 것이고, 여러 곳에 있으면 그 사실을 말한다.
+
+공유와 지역을 가른다. 실측하면 컬럼 0 대입의 대부분이 엔트리포인트의 페이지 지역
+변수다. 그걸 공유 전역 정의와 같이 늘어놓으면 답이 잡음에 묻힌다. 그래서 남에게
+include 되는 파일에서 정의된 것만 먼저 보이고, 나머지는 줄 수로만 접는다.
+
+출력을 짧게 유지하는 것이 이 도구의 목적이다. 답 하나가 파일 몇 개를 읽는 것보다
+비싸면 쓸 이유가 없다. 실측으로 정의 조회는 10~100배 싸고, include 전개도는 트리를
+다 펼치면 오히려 3배 비싸서 기본을 요약으로 두었다.
+"""
+import json
+import os
+import re
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _phpenc import (PHPLIB, config, current_service,  # noqa: E402
+                     require_config, state_dir, tree_root)
+
+RE_LIT = re.compile(r"""['"]([^'"]*)['"]""")
+KINDS = [("classes", "클래스"), ("functions", "함수"),
+         ("constants", "상수"), ("globals", "전역변수")]
+MAX_FILES = 10          # 한 이름당 보여줄 파일 수 상한
+MAX_ROWS = 5            # 한 파일당 보여줄 줄 수 상한
+
+
+def index_dir(root=None):
+    """프로젝트의 gitignore 된 상태 디렉터리. phpindex 가 쓰는 곳과 같다."""
+    d = state_dir("index")
+    if not d:
+        sys.exit("phpwhere: 프로젝트의 .claude/.state/ 를 찾지 못했다")
+    return d
+
+
+def short_name(prefix):
+    return (config().get("services") or {}).get(prefix, prefix.split("/")[-1])
+
+
+def load(root):
+    d = index_dir(root)
+    cur = current_service()
+    names = [short_name(PHPLIB)]
+    if cur and cur[0] != PHPLIB:
+        names.insert(0, short_name(cur[0]))
+    label = " + ".join(names)
+    merged = {k: {} for k, _ in KINDS}
+    merged.update(templates={}, includes={}, flags={},
+                  files=set(), included=set())
+    metas = []
+    for n in names:
+        p = os.path.join(d, n + ".json")
+        if not os.path.isfile(p):
+            sys.exit(f"phpwhere: {n}.json 없음. 먼저 →  phpindex --all")
+        part = json.load(open(p, encoding="utf-8"))
+        metas.append(part["meta"])
+        for k, _ in KINDS:
+            for name, hits in part.get(k, {}).items():
+                merged[k].setdefault(name, []).extend(hits)
+        for name, e in part.get("templates", {}).items():
+            tgt = merged["templates"].setdefault(
+                name, {"rendered_by": [], "keys": []})
+            tgt["rendered_by"] += e.get("rendered_by", [])
+            tgt["keys"] = sorted(set(tgt["keys"]) | set(e.get("keys", [])))
+            if "free_vars" in e:
+                tgt["free_vars"] = e["free_vars"]
+                tgt["path"] = e.get("path", "")
+        merged["includes"].update(part.get("includes", {}))
+        merged["flags"].update(part.get("flags", {}))
+        merged["files"] |= set(part.get("files", []))
+        merged["included"] |= set(part.get("included", []))
+    return merged, label, metas
+
+
+def rows_of(hits):
+    """[path] 또는 [path, line, text] 를 (path, line, text) 로 통일."""
+    return [(h, None, None) if isinstance(h, str) else tuple(h) for h in hits]
+
+
+def resolve(idx, expr, frm):
+    lits = [t for t in RE_LIT.findall(expr)
+            if t.lower().endswith((".php", ".inc"))]
+    if not lits:
+        return None
+    tail = "/" + lits[-1].strip().lstrip("./")
+    hit = [f for f in idx["files"] if f.endswith(tail)]
+    if len(hit) == 1:
+        return hit[0]
+    if len(hit) > 1:
+        same = [f for f in hit if f.split("/")[:2] == frm.split("/")[:2]]
+        if len(same) == 1:
+            return same[0]
+    return None
+
+
+# ----------------------------------------------------------------- 이름 조회
+def tpl_hint(idx, bare):
+    free = sorted(n for n, e in idx["templates"].items()
+                  if bare in e.get("free_vars", []))
+    keys = sorted(n for n, e in idx["templates"].items()
+                  if bare in e.get("keys", []))
+    if not (free or keys):
+        return False
+    print("  → 템플릿 변수이기도 하다 (extract() 로 주입되어 정의문이 없다)")
+    if free:
+        print(f"     쓰는 템플릿 {len(free)}개: " + ", ".join(free[:4]))
+    if keys:
+        print(f"     set() 하는 쪽 있는 템플릿 {len(keys)}개: "
+              + ", ".join(keys[:4]))
+    print(f"     자세히 →  phpwhere --tpl {(free or keys)[0]}")
+    return True
+
+
+def print_hits(idx, name, kor, hits):
+    rows = rows_of(hits)
+    files = sorted({r[0] for r in rows})
+    shared = [f for f in files if f in idx["included"]]
+    local = [f for f in files if f not in idx["included"]]
+    print(f"\n{name}  [{kor}]  정의 {len(rows)}곳 / 파일 {len(files)}개")
+    if len(shared) > 1:
+        print("  ⚠ 공유 파일 여러 곳에 정의됨 — 어느 것이 로드되는지는 "
+              "그 페이지의 include 순서에 달림")
+    for path in shared[:MAX_FILES]:
+        sub = [r for r in rows if r[0] == path]
+        print(f"  {path}")
+        for r in sub[:MAX_ROWS]:
+            if r[1] is not None:
+                print(f"      {r[1]:>5}: {r[2]}")
+        if len(sub) > MAX_ROWS:
+            print(f"      {'':>5}  … 같은 파일에 {len(sub)-MAX_ROWS}줄 더")
+    if len(shared) > MAX_FILES:
+        print(f"  … 공유 파일 {len(shared)-MAX_FILES}개 더")
+    if local:
+        # 엔트리포인트의 컬럼0 대입은 그 페이지 안에서만 사는 변수다.
+        print(f"  (그 밖에 페이지 지역 대입 {len(local)}개 파일 — "
+              "각 페이지의 자기 변수라 출처가 아니다)")
+        if not shared:
+            print("      " + ", ".join(local[:4])
+                  + (f" 외 {len(local)-4}개" if len(local) > 4 else ""))
+
+
+def show_name(idx, query):
+    q = query.strip()
+    bare = q.lstrip("$")
+    hit = False
+    for key, kor in KINDS:
+        cands = ["$" + bare] if key == "globals" else [bare]
+        for c in cands:
+            if c not in idx[key]:
+                continue
+            print_hits(idx, c, kor, idx[key][c])
+            hit = True
+            break
+    if hit:
+        tpl_hint(idx, bare)
+        return 0
+    print(f"\n'{q}' 정의 없음.")
+    if tpl_hint(idx, bare):
+        return 0
+    near = sorted({n for k, _ in KINDS for n in idx[k]
+                   if bare.lower() in n.lstrip("$").lower()})[:8]
+    print("  비슷한 이름: " + ", ".join(near) if near
+          else "  이 범위에 없다는 뜻이다. phpgrep --all 로 넓혀 확인하라.")
+    return 1
+
+
+# ----------------------------------------------------------------- 템플릿
+def show_tpl(idx, name):
+    base = os.path.basename(name)
+    e = idx["templates"].get(base)
+    if not e:
+        near = [n for n in idx["templates"] if base.lower() in n.lower()][:6]
+        print(f"\n'{base}' 템플릿 없음."
+              + ("  비슷한 이름: " + ", ".join(near) if near else ""))
+        return 1
+    print(f"\n{base}")
+    if e.get("path"):
+        print(f"  경로        {e['path']}")
+    rb = sorted(set(e.get("rendered_by", [])))
+    print(f"  렌더하는 곳  {len(rb)}개" + ("" if rb else "  ⚠ 못 찾음"))
+    for p in rb[:6]:
+        print(f"      {p}")
+    if len(rb) > 6:
+        print(f"      … {len(rb)-6}개 더")
+    free, keys = e.get("free_vars", []), e.get("keys", [])
+    if free:
+        print(f"  정의 없이 쓰는 변수 {len(free)}개")
+        print("      " + ", ".join("$" + v for v in free[:20])
+              + (f" 외 {len(free)-20}개" if len(free) > 20 else ""))
+    if keys:
+        matched = sorted(set(free) & set(keys))
+        missing = sorted(set(free) - set(keys))
+        print(f"  렌더 측 set 키 {len(keys)}개 · 그중 이 템플릿이 쓰는 것 "
+              f"{len(matched)}개")
+        if missing:
+            print(f"  ⚠ set 에서 못 찾은 변수 {len(missing)}개 — 상위 스코프나 "
+                  "다른 경로에서 온다")
+            print("      " + ", ".join("$" + v for v in missing[:12])
+                  + (f" 외 {len(missing)-12}개" if len(missing) > 12 else ""))
+    return 0
+
+
+# ----------------------------------------------------------------- 진입점
+def chain(idx, root):
+    """도달 가능한 파일과 미해결 표현식. (경유 경로도 함께)"""
+    seen = {root: []}
+    order = [root]
+    unresolved = []
+    queue = [(root, [])]
+    while queue:
+        path, via = queue.pop(0)
+        for _kw, expr in idx["includes"].get(path, []):
+            tgt = resolve(idx, expr, path)
+            if tgt is None:
+                unresolved.append((path, expr))
+            elif tgt not in seen:
+                seen[tgt] = via + [path]
+                order.append(tgt)
+                queue.append((tgt, via + [path]))
+    return order, seen, unresolved
+
+
+def show_entry(idx, start, full=False):
+    cands = [f for f in idx["files"] if f.endswith("/" + start.lstrip("/"))]
+    if not cands:
+        cands = [f for f in idx["files"] if f.endswith(start.lstrip("/"))]
+    if not cands:
+        print(f"\n'{start}' 파일을 인덱스에서 못 찾음")
+        return 1
+    root = sorted(cands, key=len)[0]
+    order, seen, unresolved = chain(idx, root)
+    print(f"\n{root}")
+
+    if full:
+        def rec(path, pad, depth):
+            if depth > 8:
+                return
+            for _kw, expr in idx["includes"].get(path, []):
+                tgt = resolve(idx, expr, path)
+                if tgt and seen.get(tgt) == [] and tgt != root:
+                    pass
+                if tgt:
+                    fl = idx["flags"].get(tgt, {})
+                    mark = (" [출력]" if fl.get("out") else "") + \
+                           (" [요청중단]" if fl.get("halt") else "")
+                    print(f"{pad}├─ {tgt}{mark}")
+                    if seen.get(tgt) is not None and tgt not in rec.done:
+                        rec.done.add(tgt)
+                        rec(tgt, pad + "│  ", depth + 1)
+                else:
+                    print(f"{pad}├─ ? {expr[:64]}")
+        rec.done = {root}
+        rec(root, "", 1)
+        return 0
+
+    direct = idx["includes"].get(root, [])
+    print(f"  직접 include {len(direct)}개")
+    for _kw, expr in direct[:8]:
+        tgt = resolve(idx, expr, root)
+        if tgt:
+            fl = idx["flags"].get(tgt, {})
+            mark = ("  [출력]" if fl.get("out") else "") + \
+                   ("  [요청중단]" if fl.get("halt") else "")
+            print(f"      {tgt}{mark}")
+        else:
+            print(f"      ? {expr[:60]}  (동적)")
+    print(f"  사슬 전체 {len(order)}개 파일"
+          + (f" · 미해결 {len(unresolved)}개" if unresolved else ""))
+
+    gates = [f for f in order if idx["flags"].get(f, {}).get("halt")]
+    if gates:
+        # 인증 게이트와 장애 안내가 같은 모양이라 판정하지 않고 대상만 보인다.
+        print(f"  ⚠ 요청을 중단시킬 수 있는 include {len(gates)}개 "
+              "(리다이렉트 후 exit)")
+        for g in gates[:4]:
+            via = seen.get(g) or []
+            trail = " ← ".join(reversed([v.split("/")[-1] for v in via[1:]]))
+            print(f"      {g}" + (f"   경유 {trail}" if trail else ""))
+            print(f"          → {idx['flags'][g]['halt']}")
+    else:
+        print("  요청을 중단시키는 include 없음")
+
+    outs = [f for f in order
+            if idx["flags"].get(f, {}).get("out") and f != root]
+    if outs:
+        print(f"  include 만으로 출력하는 파일 {len(outs)}개")
+        print("      " + ", ".join(o.split("/")[-1] for o in outs[:6])
+              + (f" 외 {len(outs)-6}개" if len(outs) > 6 else ""))
+    print("  전체 트리 →  --full")
+    return 0
+
+
+# ----------------------------------------------------------------- 충돌
+def show_conflicts(idx, only=None):
+    for key, kor in KINDS:
+        if only and key != only:
+            continue
+        rows = []
+        for name, hits in idx[key].items():
+            files = {r[0] for r in rows_of(hits)}
+            shared = files & idx["included"]
+            if len(shared) > 1:
+                rows.append((len(shared), name, sorted(shared)))
+        rows.sort(reverse=True)
+        cap = 20 if only else 6
+        print(f"\n[{kor}] 공유 파일 여러 곳에 정의된 이름 {len(rows)}개")
+        for n, name, files in rows[:cap]:
+            print(f"  {name}  ({n}곳)")
+            for f in files[:3]:
+                print(f"      {f}")
+            if len(files) > 3:
+                print(f"      … {len(files)-3}개 더")
+        if len(rows) > cap:
+            print(f"  … {len(rows)-cap}개 더"
+                  + ("" if only else f"  (전부 보려면 --conflicts {key})"))
+    return 0
+
+
+def main():
+    require_config("phpwhere")
+    root = tree_root()
+    if not root:
+        sys.exit("phpwhere: legacy.root 아래에 legacy.treeMarker 가 없다")
+    args = sys.argv[1:]
+    if not args:
+        sys.exit("사용법: phpwhere <이름> | --tpl <파일> | --entry <파일> [--full]"
+                 " | --conflicts [종류]")
+    idx, label, metas = load(root)
+    print(f"# 범위: {label} · 인덱스 {min(m['built'] for m in metas)}")
+    if args[0] == "--conflicts":
+        kinds = {k for k, _ in KINDS}
+        return show_conflicts(idx, args[1] if len(args) > 1
+                              and args[1] in kinds else None)
+    if args[0] == "--tpl":
+        return show_tpl(idx, args[1])
+    if args[0] == "--entry":
+        return show_entry(idx, args[1], full="--full" in args)
+    return show_name(idx, args[0])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
