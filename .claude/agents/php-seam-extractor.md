@@ -51,7 +51,7 @@ So: one seam function per page, each calling the same eventual backend through i
 Write the plan to the given path and **stop**. A human reads it at G1 before you touch a live file. The plan carries, per page:
 
 1. **줄 범위 분류표** — `| 구간 | 줄 | 종류 | 근거 |`, 종류 is one of include / 가드 / 파싱 / **이동 대상** / 바인딩 / 템플릿. Every line of the file falls in exactly one row. A line you cannot classify is a blocker, not an omission.
-2. **서비스 함수 시그니처** — 입력: each request parameter with its type, default and the accessor that reads it; each session value; each constant, **with the file that defines it and whether this page includes that file**. 출력: the complete list of template variables the page binds, in binding order.
+2. **서비스 함수의 자리와 시그니처** — the absolute path of the file you will create, derived from `legacy.seam.servicesDir` under that surface's docroot, plus the class and method name in the shape `legacy.seam.serviceCallPattern` describes. **Do not invent a location or a naming convention** — the tree already has both, and `seam-shape` says which keys answer. 입력: each request parameter with its type, default and the accessor that reads it; each session value; each constant, **with the file that defines it and whether this page includes that file**. 출력: the complete list of template variables the page binds, in binding order.
 3. **막는 구간과 처리 방침** — one row per blocker with the decision. The types measured in this tree:
 
    | 유형 | 처리 |
