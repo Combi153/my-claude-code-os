@@ -8,19 +8,134 @@
 
   "legacy": {
     "root": "<abs path to the legacy PHP checkout>",
+    "treeRoot": "<abs path to the source tree root that the paths in `ours` are relative to>",
     "sourceRoot": "<abs path to the migrated service's source root>",
+    "_ours": [
+      "Directories this team owns, relative to treeRoot, each mapped to a short name.",
+      "Two hooks read it: the encoding guard warns before an edit outside these, and the",
+      "tooling hook groups its usage log by the name. Everything else in the tree belongs",
+      "to another team - read it freely, never edit it. Keeping it here rather than in the",
+      "hooks is what lets the hooks be tracked: a path from the legacy tree is company",
+      "information just as much as the code inside it."
+    ],
+    "ours": {
+      "<service-dir>": "<short name>",
+      "<shared-library-dir>": "<short name>"
+    },
+    "_tooling": [
+      "What the legacy-reading tools in .claude/scripts/ need in order to scope a search,",
+      "pick a PHP runtime, and build a definition index. These lived as constants inside",
+      "the scripts, which is the reason the scripts had to sit in the gitignored checkout;",
+      "moving them here is what lets the scripts be tracked. Same trade the two hooks made.",
+      "",
+      "  treeMarker     - path, relative to `root`, that identifies the source tree. A tool",
+      "                   walks up from its own location looking for it, so it can be called",
+      "                   from anywhere. Also how `treeRoot` is checked for a typo.",
+      "  services       - every tree a search can be scoped to, relative to treeRoot, each",
+      "                   mapped to a short name. Wider than `ours`: it includes trees another",
+      "                   team owns, which are read freely and never edited.",
+      "  sharedLibrary  - which of those every service loads. Searched alongside whichever",
+      "                   service the caller is standing in, because a service reaches exactly",
+      "                   two trees: itself and this one.",
+      "  primaryService - the service being migrated. The answer when the caller stands outside",
+      "                   any service, and the default target when an index is built.",
+      "  runtimes       - PHP version per service prefix, and the container image that version",
+      "                   is checked in. The local php binary proves nothing about a runtime it",
+      "                   does not match, so the linter shells out to these instead. A prefix",
+      "                   with no entry is reported as not checked, never as passing.",
+      "  vendorGlobs    - trees inside the checkout holding third-party code, relative to",
+      "                   treeRoot. Never the answer to a search, so they are folded out.",
+      "                   Generic names (vendor, node_modules, bower_components) stay in the",
+      "                   script: those carry no company information."
+    ],
+    "treeMarker": "<path under root that identifies the source tree>",
+    "services": {
+      "<service-dir>": "<short name>",
+      "<shared-library-dir>": "<short name>",
+      "<another-team-dir>": "<short name>"
+    },
+    "sharedLibrary": "<shared-library-dir>",
+    "primaryService": "<service-dir>",
+    "runtimes": {
+      "<service-dir>": {
+        "php": "<x.y>",
+        "image": "<image ref, pinned by digest where the tag can move>",
+        "howto": "<command that obtains the image>"
+      },
+      "<shared-library-dir>": {
+        "php": "<x.y>",
+        "_comment": "A tree loaded by two runtimes is checked on the lower one: code that parses there parses on the higher, and not the reverse.",
+        "image": "<image ref>",
+        "howto": "<command that obtains the image>"
+      }
+    },
+    "vendorGlobs": [
+      "<relative glob of a vendored tree that generic names do not cover>"
+    ],
+
+    "_v2": [
+      "The five sections below are what the v2 tools read. None of them is in _phpenc's",
+      "required-key list on purpose: the six legacy-reading tools must keep working in a",
+      "checkout that has not filled these in. Each new tool requires its own keys instead,",
+      "and stops with the key name when one is missing.",
+      "",
+      "  tooling.phpBinary  - php used for tokenising. `phpseam` runs it with",
+      "                       short_open_tag=1 and refuses to answer if that did not take:",
+      "                       a tree where 496 files open with `<?` is read as plain HTML",
+      "                       otherwise, and comes back with zero violations.",
+      "  seam.*             - what the allowed page shape is, expressed as patterns rather",
+      "                       than as names, so this file stays free of company identifiers.",
+      "  snapshot.*         - how a captured page is normalised before comparison, and what",
+      "                       an error page looks like.",
+      "  dualRun.*          - where the PHP experiment helper appends its JSONL, what env",
+      "                       var carries that path into the container, and which page can",
+      "                       be read back to learn the toggle's current mode.",
+      "  switch.values.dual - the third mode. It must equal MigrationExperiment.php's",
+      "                       VALUE_DUAL, and `migrated` its VALUE_MIGRATED; selftest.py",
+      "                       compares the two files."
+    ],
+    "tooling": { "phpBinary": "php" },
+    "seam": {
+      "servicesDir": "<relative dir under a surface docroot where seam service files live>",
+      "serviceCallPattern": "<regex matching the seam service call, e.g. a class::method form>",
+      "templateIncludePattern": "<regex matching template include paths>",
+      "templateRenderPattern": "<optional regex: template *object* calls (construct/set/fetch). Omit only if this tree renders templates by include alone - without it those statements are reported as violations>",
+      "guardIdioms": [
+        "<regex: auth check idiom>",
+        "<regex: redirect-header idiom>",
+        "<regex: redirect-script idiom that ends in an early exit>"
+      ],
+      "allowedCalls": ["isset", "trim", "intval", "extract", "<input helper methods>"],
+      "pinsFile": "pins.json"
+    },
+    "snapshot": {
+      "normalize": [ {"pattern": "<bytes regex, e.g. a per-request token>", "replace": "<TOKEN>"} ],
+      "errorMarker": "<regex that appears on an error page>",
+      "timeoutSeconds": 20
+    },
+    "dualRun": {
+      "logPath": "<abs path of the JSONL the PHP helper appends to (must be mounted into the container)>",
+      "logEnvVar": "MIGRATION_EXPERIMENT_LOG",
+      "readbackPath": "/<relative path of a page that prints the current toggle mode - one token, nothing else>",
+      "ignoreFile": "ignore.json"
+    },
+
     "surfaces": {
       "<surface-a>": {
         "docroot": "<abs path>",
         "localBaseUrl": "http://<local vhost>",
         "container": "<docker service that serves this surface>",
-        "daoPaths": ["<relative glob of the data-access layer>"]
+        "daoPaths": ["<relative glob of the data-access layer>"],
+        "loggedOutMarker": "<regex matching the body of an unauthenticated response - this surface answers 200, so a status code proves nothing>",
+        "charset": "<charset to decode a diff with; the first of this, utf-8 and cp949 that succeeds wins>"
       },
       "<surface-b>": {
         "docroot": "<abs path>",
         "localBaseUrl": "http://<local vhost>",
         "container": "<docker service that serves this surface>",
-        "daoPaths": ["<relative glob>"]
+        "daoPaths": ["<relative glob>"],
+        "loggedOutMarker": "<regex>",
+        "charset": "<charset>"
       }
     },
     "docker": {
@@ -29,7 +144,7 @@
     },
     "switch": {
       "envVarPattern": "<PREFIX>_BACKEND_{SLICE}",
-      "values": { "legacy": "php", "migrated": "spring" },
+      "values": { "legacy": "php", "dual": "dual", "migrated": "spring" },
       "helperPath": "<path where the MigrationSwitch helper lives>"
     }
   },
@@ -43,11 +158,23 @@
       "gradlew exports this."
     ],
     "javaHome": "<abs path to the JDK home the build requires>",
-    "proxy": { "module": ":apps:<proxy module>", "port": 0, "packageBase": "<base package>" },
-    "fixity": { "module": ":apps:<fixity module>", "port": 0, "packageBase": "<base package>" },
+    "_modules": [
+      "proxy is the BFF: it exposes the client-facing surface and holds no domain logic.",
+      "fixity is the domain service: models, invariants, policies, use cases, persistence."
+    ],
+    "proxy": { "module": ":apps:<BFF module>", "port": 0, "packageBase": "<base package>" },
+    "fixity": { "module": ":apps:<domain service module>", "port": 0, "packageBase": "<base package>" },
     "contract": { "module": ":libs:<contract module>", "packageBase": "<base package>" },
     "graphqlSchemaDir": "<relative path to the .graphqls dir>",
-    "architectureTest": "<relative path to the Konsist architecture test>",
+    "_architecture": [
+      "How the repo enforces its layer layout as an executable rule, not a document.",
+      "architectureRules is what the designer and implementer read to learn the constraint;",
+      "point it at the module or test that states the rules, whose own tests say what each",
+      "rule means. architectureCheck is how anyone runs it standalone. The build must also",
+      "run it, or the constraint is advice rather than a gate."
+    ],
+    "architectureRules": "<relative path to the module or test holding the layer rules>",
+    "architectureCheck": "<command that runs those rules alone>",
     "basicAuth": {
       "_comment": "Which account each surface authenticates as. Credentials are read at runtime from the backend config, never stored here.",
       "<surface-a>": "<account name>",
@@ -55,7 +182,7 @@
     },
 
     "_startup": [
-      "What the data layer needs before it can boot. It fetches its DB settings from a",
+      "What the domain service needs before it can boot. It fetches its DB settings from a",
       "remote config service over TLS, so a missing truststore looks like a build failure",
       "rather than a missing prerequisite. The password here is the JKS default, not a",
       "secret; real credentials come from the config service at runtime."
@@ -63,7 +190,7 @@
     "truststore": { "path": "<abs path to the JKS truststore>", "password": "<jks password>" },
     "configServer": "<config service host:port>",
     "fixityUrl": {
-      "_comment": "How the gateway is told where the data layer is. Reassigning the data layer port means moving this too, or the gateway boots healthy and returns nothing.",
+      "_comment": "How the BFF is told where the domain service is. Reassigning the domain service port means moving this too, or the BFF boots healthy and returns nothing.",
       "property": "<gradle property key>",
       "env": "<env var that overrides it>"
     }
@@ -71,6 +198,15 @@
 
   "e2e": {
     "root": "<abs path to the playwright-e2e repo>",
+    "_storageState": [
+      "Playwright storageState JSON per surface. `htmlsnap` reads the cookies out of it",
+      "rather than logging in: issuing a session is a solved problem in that repo, and a",
+      "capture tool that logs in is a capture tool that can silently capture a login page."
+    ],
+    "storageState": {
+      "<surface-a>": "<abs path to that surface's storageState json>",
+      "<surface-b>": "<abs path>"
+    },
     "surfaces": {
       "<surface-a>": {
         "project": "<playwright project name>",
@@ -99,7 +235,7 @@
       "  skillsDir    - the directory the three below are resolved in",
       "  startBackend - local-stack, for bringing the backend up",
       "  runE2e       - legacy-slice, for the Phase 2 baseline and the Phase 6 loop",
-      "  writeE2e     - e2e-baseline-author, for authoring the spec"
+      "  writeE2e     - equivalence-corpus-author, for authoring the spec"
     ],
     "skillsDir": "",
     "startBackend": "",
