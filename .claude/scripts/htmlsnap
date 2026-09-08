@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+"""htmlsnap - HTML 골든 마스터: 페이지 응답을 바이트로 잡아 두고, 편집 뒤 다시 잡아 비교한다.
+
+    htmlsnap capture --corpus corpus.json --out <dir> [옵션]
+    htmlsnap compare <dirA> <dirB> [--report out.md] [--context 3]
+    htmlsnap corpus validate corpus.json
+    htmlsnap --help
+
+  capture 옵션
+    --corpus <file>      캡처할 URL 목록 (필수)
+    --out <dir>          캡처를 쓸 디렉터리 (필수). 없으면 만든다
+    --session <file>     Playwright storageState JSON. 없으면 e2e.storageState.<surface>
+    --cookie-host <host> 쿠키 도메인을 이 호스트 기준으로 고른다 (기본: base URL 의 호스트)
+    --toggle-expect <m>  legacy|dual|migrated. 캡처 전에 되읽기 페이지로 현재 모드를 확인한다
+    --timeout <초>       요청 하나의 상한 (기본 legacy.snapshot.timeoutSeconds, 없으면 20)
+    --config <file>      workspace.json 위치 (기본: 프로젝트의 .claude/config/workspace.json)
+
+  compare 옵션
+    --report <out.md>    마크다운 표로 결과를 쓴다
+    --context N          unified diff 의 문맥 줄 수 (기본 3)
+    --max-diff-lines N   different 하나당 보여줄 diff 줄 수 상한 (기본 40)
+    --config <file>      charset 을 읽는다
+
+**왜 바이트인가.** 이 표면은 `default_charset` 이 비어 있어 응답 헤더가 charset 을 말해
+주지 않고, 한 표면 안에 CP949 페이지와 UTF-8 페이지가 섞여 있다. 캡처가 디코딩을 하면
+그 시점에 인코딩을 하나로 정하게 되고, 그러면 도구가 스스로 만든 차이와 코드가 만든
+차이를 구분할 수 없다. 저장도 비교도 바이트로 한다. 디코딩은 사람이 diff 를 읽는
+마지막 순간에만, `legacy.surfaces.<surface>.charset` 으로 한다.
+
+**왜 상태 코드로 로그인 실패를 판정하지 않는가.** 이 표면의 지배적인 인증 실패 형태는
+302 가 아니라 **200 + `<script>confirm(...); location.href=...</script>`** 이다. 상태
+코드만 보는 캡처 도구는 로그인 안내 스크립트를 골든 마스터로 굳히고, 그 뒤의 모든
+비교가 초록으로 통과한다. 그래서 본문을 `loggedOutMarker` 로 보고, 매치하면 그 캡처를
+**invalid** 로 표시하며, `compare` 는 어느 쪽에든 invalid 가 있으면 **exit 2** 를 낸다.
+로그아웃 페이지는 절대 기준선이 되지 않는다.
+
+**세션을 새로 발급하지 않는다.** 세션 발급에는 https 왕복과 2FA 대기가 얽혀 있고 그것을
+이미 다른 저장소가 풀어 두었다. 여기서는 그 결과물(Playwright storageState JSON)의 쿠키를
+Cookie 헤더로 옮겨 쓰기만 한다. 쿠키의 `secure` 속성은 일부러 무시한다 — 세션은 https 로
+받고 캡처는 http 로 도는 것이 이 환경의 전제이기 때문이다.
+
+종료 코드: 0 깨끗 · 1 검사 실패(invalid 캡처·차이·누락) · 2 도구가 답할 수 없음
+(설정 없음·토글 되읽기 불일치·표면에 못 닿음·invalid 기준선). 2 는 항상 stderr 에 이유를 쓴다.
+"""
+import datetime
+import difflib
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+sys.dont_write_bytecode = True
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+CONFIG_REL = os.path.join(".claude", "config", "workspace.json")
+TOOL = "htmlsnap"
+MODES = ("legacy", "dual", "migrated")
+UA = "htmlsnap/1 (+golden-master capture)"
+ID_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def die(msg, code=2):
+    """답할 수 없는 상태. 좁은 답을 조용히 내는 대신 이유를 남기고 멈춘다."""
+    sys.stderr.write(f"{TOOL}: {msg}\n")
+    sys.exit(code)
+
+
+def note(msg):
+    sys.stderr.write(f"{TOOL}: {msg}\n")
+
+
+# --------------------------------------------------------------- 설정
+
+def config_path(explicit):
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+    try:
+        from _phpenc import project_dir  # 기존 도구와 같은 방식으로 프로젝트를 찾는다
+        root = project_dir()
+    except Exception:
+        root = None
+    if not root:
+        d = HERE
+        while d and not os.path.isfile(os.path.join(d, CONFIG_REL)):
+            parent = os.path.dirname(d)
+            d = None if parent == d else parent
+        root = d
+    if not root:
+        die(f"{CONFIG_REL} 을 찾지 못했다. --config 로 위치를 주거나, 이 도구를 "
+            "프로젝트의 .claude/scripts/ 안에 두어라.")
+    return os.path.join(root, CONFIG_REL)
+
+
+def load_config(explicit):
+    path = config_path(explicit)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh), path
+    except (OSError, ValueError) as exc:
+        die(f"{path} 를 읽을 수 없다: {exc}")
+
+
+def need(cfg, dotted, path, why):
+    cur = cfg
+    for part in dotted.split("."):
+        if not isinstance(cur, dict) or part not in cur or cur[part] in ("", None):
+            die(f"{path} 에 {dotted} 가 없다. {why}")
+        cur = cur[part]
+    return cur
+
+
+def opt(cfg, dotted, default=None):
+    cur = cfg
+    for part in dotted.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return default
+        cur = cur[part]
+    return default if cur in ("", None) else cur
+
+
+# --------------------------------------------------------------- 코퍼스
+
+def read_corpus(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError) as exc:
+        die(f"코퍼스를 읽을 수 없다 ({path}): {exc}")
+
+
+def corpus_problems(doc, cfg=None):
+    """스키마 문제 목록. 빈 목록이면 깨끗하다."""
+    bad = []
+    if not isinstance(doc, dict):
+        return ["최상위가 객체가 아니다"]
+    surface = doc.get("surface")
+    if not surface or not isinstance(surface, str):
+        bad.append("surface 가 없다 (문자열, legacy.surfaces 의 키)")
+    elif cfg is not None:
+        known = list((opt(cfg, "legacy.surfaces", {}) or {}).keys())
+        if surface not in known:
+            bad.append(f"surface {surface!r} 가 legacy.surfaces 에 없다 (있는 것: "
+                       + (", ".join(known) if known else "없음") + ")")
+    entries = doc.get("entries")
+    if not isinstance(entries, list) or not entries:
+        bad.append("entries 가 비었다 (배열, 최소 1개)")
+        return bad
+    seen = set()
+    for i, e in enumerate(entries):
+        tag = f"entries[{i}]"
+        if not isinstance(e, dict):
+            bad.append(f"{tag}: 객체가 아니다")
+            continue
+        eid = e.get("id")
+        if not eid or not isinstance(eid, str) or not ID_RE.fullmatch(eid):
+            bad.append(f"{tag}: id 가 없거나 파일 이름으로 쓸 수 없다 ([A-Za-z0-9._-]+)")
+        elif eid in seen:
+            bad.append(f"{tag}: id {eid!r} 가 중복이다")
+        else:
+            seen.add(eid)
+        p = e.get("path")
+        if not p or not isinstance(p, str) or not p.startswith("/"):
+            bad.append(f"{tag}: path 가 없거나 '/' 로 시작하지 않는다")
+        m = (e.get("method") or "GET").upper()
+        if m not in ("GET", "POST"):
+            bad.append(f"{tag}: method 는 GET 또는 POST 여야 한다 (받은 값 {m!r})")
+        params = e.get("params", {})
+        if not isinstance(params, dict) or any(
+                not isinstance(k, str) for k in params):
+            bad.append(f"{tag}: params 는 문자열 키의 객체여야 한다")
+        mode = e.get("mode") or "full"
+        if mode not in ("full", "structure"):
+            bad.append(f"{tag}: mode 는 full 또는 structure 여야 한다 (받은 값 {mode!r})")
+        rules = e.get("rules", [])
+        if not isinstance(rules, list) or any(not isinstance(r, str) for r in rules):
+            bad.append(f"{tag}: rules 는 원장 행 ID 문자열의 배열이어야 한다")
+    return bad
+
+
+# --------------------------------------------------------------- 바이트 처리
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def normalize(data, rules):
+    """설정의 (정규식 → 치환) 목록을 바이트에 그대로 적용한다."""
+    for i, r in enumerate(rules or []):
+        if not isinstance(r, dict) or "pattern" not in r:
+            die(f"legacy.snapshot.normalize[{i}] 에 pattern 이 없다")
+        try:
+            rx = re.compile(r["pattern"].encode("utf-8"), re.S)
+        except (re.error, AttributeError, UnicodeError) as exc:
+            die(f"legacy.snapshot.normalize[{i}] 의 pattern 이 정규식이 아니다: {exc}")
+        data = rx.sub(str(r.get("replace", "")).encode("utf-8"), data)
+    return data
+
+
+_TAG = re.compile(rb"<(/?)([A-Za-z][\w:.-]*)((?:[^<>\"']|\"[^\"]*\"|'[^']*')*)/?>")
+_ATTR = re.compile(rb"([A-Za-z_:][-\w:.]*)\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s\"'=<>`]+)")
+_WORD = re.compile(rb"[A-Za-z_:][-\w:.]*")
+_KEEP_ATTRS = (b"id", b"class")
+
+
+def skeleton(data):
+    """태그 이름·속성 이름·id·class 만 남긴 골격. 데이터가 변하는 목록 페이지용.
+
+    텍스트와 대부분의 속성값을 지운다. 남는 것은 화면의 **모양**이므로, 목록의 내용이
+    매일 바뀌는 페이지에서도 '구조가 그대로인가'는 물을 수 있다. 이 모드는 느슨한
+    오라클이라는 것을 알고 쓰는 것이다 — 값이 바뀌는 규칙은 이 모드로 관찰되지 않는다.
+    """
+    d = re.sub(rb"<!--.*?-->", b"", data, flags=re.S)
+    d = re.sub(rb"(?is)<script\b[^>]*>.*?</script\s*>", b"<script></script>", d)
+    d = re.sub(rb"(?is)<style\b[^>]*>.*?</style\s*>", b"<style></style>", d)
+    out = []
+    for m in _TAG.finditer(d):
+        close, name, attrs = m.group(1), m.group(2).lower(), m.group(3) or b""
+        keep = []
+        for am in _ATTR.finditer(attrs):
+            an = am.group(1).lower()
+            av = am.group(2).strip(b"\"'")
+            keep.append(an + b"=" + av if an in _KEEP_ATTRS else an)
+        rest = _ATTR.sub(b" ", attrs)
+        for wm in _WORD.finditer(rest):          # 값 없는 속성 (disabled, checked)
+            keep.append(wm.group(0).lower())
+        tail = (b" " + b" ".join(sorted(set(keep)))) if keep else b""
+        out.append(b"<" + close + name + tail + b">")
+    return b"\n".join(out) + b"\n"
+
+
+# --------------------------------------------------------------- 쿠키
+
+def read_storage_state(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError) as exc:
+        die(f"세션 파일을 읽을 수 없다 ({path}): {exc}")
+    if not isinstance(doc, dict) or not isinstance(doc.get("cookies"), list):
+        die(f"세션 파일이 Playwright storageState 형식이 아니다 ({path}): "
+            "최상위에 cookies 배열이 있어야 한다")
+    return doc
+
+
+def pick_cookies(storage, host):
+    """호스트에 해당하는 쿠키만 고른다. (선택된 것, 도메인이 안 맞아 버린 수)"""
+    host = (host or "").lower()
+    sel, skipped = [], 0
+    for c in storage.get("cookies") or []:
+        dom = str(c.get("domain") or "").lstrip(".").lower()
+        if dom and not (host == dom or host.endswith("." + dom)):
+            skipped += 1
+            continue
+        sel.append((str(c.get("name") or ""), str(c.get("value") or ""),
+                    str(c.get("path") or "/")))
+    return sel, skipped
+
+
+def cookie_header(sel, path):
+    use = [(n, v) for n, v, p in sel if path.startswith(p or "/")]
+    return "; ".join(f"{n}={v}" for n, v in use if n)
+
+
+# --------------------------------------------------------------- HTTP
+
+def fetch(url, method, body, cookie, timeout):
+    """(status, headers, body_bytes, elapsed_ms, error). 예외를 밖으로 내지 않는다."""
+    data = body.encode("utf-8") if body else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("User-Agent", UA)
+    req.add_header("Accept", "text/html,application/xhtml+xml,*/*")
+    if cookie:
+        req.add_header("Cookie", cookie)
+    if data is not None:
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return (resp.status, dict(resp.headers.items()), resp.read(),
+                    int((time.time() - t0) * 1000), None)
+    except urllib.error.HTTPError as exc:                     # 4xx·5xx 도 본문을 본다
+        try:
+            payload = exc.read()
+        except OSError:
+            payload = b""
+        return (exc.code, dict(exc.headers.items() if exc.headers else {}),
+                payload, int((time.time() - t0) * 1000), None)
+    except Exception as exc:                                  # 전송 실패
+        return (None, {}, b"", int((time.time() - t0) * 1000), str(exc) or type(exc).__name__)
+
+
+def is_timeout(err):
+    e = (err or "").lower()
+    return "timed out" in e or "timeout" in e
+
+
+# --------------------------------------------------------------- capture
+
+def readback_mode(base, cfg, cfg_file, timeout, cookie_sel, switch_values):
+    """되읽기 페이지가 말하는 현재 모드. 못 읽거나 모호하면 멈춘다."""
+    rel = need(cfg, "legacy.dualRun.readbackPath", cfg_file,
+               "--toggle-expect 는 애플리케이션이 실제로 무엇을 보고 있는지 되읽어야 "
+               "성립한다. 현재 모드를 출력하는 페이지의 경로를 넣어라.")
+    url = base.rstrip("/") + "/" + str(rel).lstrip("/")
+    parsed = urllib.parse.urlsplit(url)
+    status, _, body, ms, err = fetch(
+        url, "GET", None, cookie_header(cookie_sel, parsed.path or "/"), timeout)
+    if err:
+        die(f"토글 되읽기 실패 ({url}): {err}. 스택이 떠 있는지 먼저 확인해라.")
+    if status != 200:
+        die(f"토글 되읽기가 {status} 를 냈다 ({url}). 되읽기 경로가 맞는지 확인해라.")
+    def scan(pairs):
+        # 경계에서 '.' 를 빼면 안 된다. 되읽기 페이지에는 `index.php` 같은 링크가 있고,
+        # legacy 의 값이 'php' 라면 그 링크가 '토글은 legacy 다' 로 읽힌다.
+        hit = set()
+        for mode, token in pairs:
+            if not token:
+                continue
+            rx = (rb"(?<![A-Za-z0-9_.-])" + re.escape(token.encode("utf-8"))
+                  + rb"(?![A-Za-z0-9_.-])")
+            if re.search(rx, body, re.I):
+                hit.add(mode)
+        return hit
+
+    found = scan([(m, str(switch_values.get(m) or "")) for m in MODES])
+    if not found:
+        found = scan([(m, m) for m in MODES])
+    if not found:
+        die(f"되읽기 페이지 본문에서 모드를 읽지 못했다 ({url}, {len(body)}바이트). "
+            "그 페이지가 현재 값을 그대로 출력하는지 확인해라.")
+    if len(found) > 1:
+        die(f"되읽기 페이지가 여러 모드를 동시에 말한다: {sorted(found)}. "
+            "값 하나만 출력하게 고쳐라 — 모호한 것을 하나로 골라 적지 않는다.")
+    return found.pop()
+
+
+def cmd_capture(argv):
+    o = parse_opts(argv, want={"--corpus", "--out", "--session", "--cookie-host",
+                               "--toggle-expect", "--timeout", "--config"})
+    if not o.get("--corpus") or not o.get("--out"):
+        die("capture 에는 --corpus 와 --out 이 모두 필요하다. --help 참고")
+    cfg, cfg_file = load_config(o.get("--config"))
+    doc = read_corpus(o["--corpus"])
+    bad = corpus_problems(doc, cfg)
+    if bad:
+        for b in bad:
+            note(f"코퍼스: {b}")
+        die("코퍼스가 스키마를 어긴다. `htmlsnap corpus validate` 로 확인해라.")
+
+    surface = doc["surface"]
+    need(cfg, f"legacy.surfaces.{surface}", cfg_file,
+         "코퍼스가 가리키는 표면이 설정에 있어야 한다.")
+    base = need(cfg, f"legacy.surfaces.{surface}.localBaseUrl", cfg_file,
+                "캡처는 로컬 표면의 base URL 없이는 아무 곳도 두드릴 수 없다.")
+    logged_out = need(
+        cfg, f"legacy.surfaces.{surface}.loggedOutMarker", cfg_file,
+        "이 표면의 인증 실패는 302 가 아니라 200 + 스크립트라, 이 정규식이 없으면 "
+        "로그인 안내 페이지가 골든 마스터로 굳는다. 이 도구가 막으려는 실패가 정확히 "
+        "그것이므로 없이 진행하지 않는다.")
+    try:
+        logged_out_rx = re.compile(logged_out.encode("utf-8"), re.S | re.I)
+    except (re.error, UnicodeError) as exc:
+        die(f"loggedOutMarker 가 정규식이 아니다: {exc}")
+    err_marker = opt(cfg, "legacy.snapshot.errorMarker")
+    err_rx = re.compile(err_marker.encode("utf-8"), re.S | re.I) if err_marker else None
+    if opt(cfg, "legacy.snapshot") is None:
+        die(f"{cfg_file} 에 legacy.snapshot 이 없다. normalize·errorMarker·"
+            "timeoutSeconds 를 담는 절이고, 없이 캡처하면 세션 토큰 같은 매 요청마다 "
+            "바뀌는 값이 전부 차이로 잡힌다.")
+    norm_rules = opt(cfg, "legacy.snapshot.normalize", []) or []
+    if not norm_rules:
+        note("legacy.snapshot.normalize 가 비었다 — 정규화 없이 캡처한다. "
+             "매 요청 바뀌는 토큰이 있으면 모든 비교가 different 로 나온다.")
+    timeout = float(o.get("--timeout") or opt(cfg, "legacy.snapshot.timeoutSeconds", 20))
+
+    # 세션. 없으면 쿠키 없이 진행하되, 그 사실을 크게 말한다.
+    sess_path = o.get("--session") or opt(cfg, f"e2e.storageState.{surface}")
+    cookie_sel, host = [], urllib.parse.urlsplit(base).hostname or ""
+    cookie_host = o.get("--cookie-host") or host
+    if sess_path:
+        storage = read_storage_state(os.path.expanduser(sess_path))
+        cookie_sel, skipped = pick_cookies(storage, cookie_host)
+        note(f"세션 {sess_path}: 쿠키 {len(cookie_sel)}개 사용, {skipped}개는 "
+             f"도메인이 {cookie_host} 와 맞지 않아 뺐다")
+        if not cookie_sel:
+            note("쿠키가 하나도 맞지 않았다. --cookie-host 로 도메인을 맞춰라. "
+                 "이대로 두면 인증이 필요한 페이지는 logged_out 으로 잡힌다.")
+    else:
+        note(f"세션 파일이 없다 (--session 도 e2e.storageState.{surface} 도 없음). "
+             "쿠키 없이 캡처한다 — 공개 페이지만 유효하다.")
+
+    expect = o.get("--toggle-expect")
+    readback = None
+    if expect:
+        if expect not in MODES:
+            die(f"--toggle-expect 는 {'|'.join(MODES)} 중 하나여야 한다 (받은 값 {expect!r})")
+        values = opt(cfg, "legacy.switch.values", {}) or {}
+        readback = readback_mode(base, cfg, cfg_file, timeout, cookie_sel, values)
+        if readback != expect:
+            die(f"애플리케이션이 보고 있는 모드는 {readback!r} 인데 {expect!r} 를 "
+                "기대했다. 토글이 PHP 에 도달하지 않았다. 되읽기 없이 캡처하면 "
+                "엉뚱한 모드의 골든 마스터가 남는다.")
+        note(f"토글 되읽기: {readback} (기대와 같다)")
+
+    out = os.path.abspath(os.path.expanduser(o["--out"]))
+    os.makedirs(out, exist_ok=True)
+    entries, n = [], len(doc["entries"])
+    for i, e in enumerate(doc["entries"], 1):
+        eid = e["id"]
+        method = (e.get("method") or "GET").upper()
+        params = e.get("params") or {}
+        mode = e.get("mode") or "full"
+        qs = urllib.parse.urlencode({k: str(v) for k, v in params.items()})
+        path = e["path"]
+        url = base.rstrip("/") + path + (("?" + qs) if qs and method == "GET" else "")
+        body = qs if method == "POST" else None
+        cookie = cookie_header(cookie_sel, urllib.parse.urlsplit(url).path or "/")
+        status, headers, raw, ms, err = fetch(url, method, body, cookie, timeout)
+
+        flags = []
+        if err:
+            flags.append("timeout" if is_timeout(err) else "unreachable")
+        else:
+            if status is not None and status >= 500:
+                flags.append("error_page")
+            elif err_rx and err_rx.search(raw):
+                flags.append("error_page")
+            if logged_out_rx.search(raw):
+                flags.append("logged_out")
+            if not raw:
+                flags.append("empty")
+        norm = normalize(raw, norm_rules) if raw else b""
+        if mode == "structure" and norm:
+            norm = skeleton(norm)
+        with open(os.path.join(out, f"{eid}.raw.html"), "wb") as fh:
+            fh.write(raw)
+        with open(os.path.join(out, f"{eid}.norm.html"), "wb") as fh:
+            fh.write(norm)
+        meta = {"id": eid, "url": url, "path": path, "method": method,
+                "params": params, "mode": mode, "rules": e.get("rules") or [],
+                "note": e.get("note", ""), "status": status,
+                "content_type": headers.get("Content-Type", ""),
+                "bytes": len(raw), "elapsed_ms": ms, "flags": flags,
+                "valid": not flags, "error": err,
+                "sha256_raw": sha(raw), "sha256_norm": sha(norm),
+                "captured_at": datetime.datetime.now().astimezone().isoformat()}
+        with open(os.path.join(out, f"{eid}.json"), "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        entries.append(meta)
+        note(f"[{i}/{n}] {eid:<28} {method} {path} "
+             f"{status if status is not None else '---'} "
+             f"{len(raw) / 1024:6.1f}KB {ms:5d}ms {mode:<9} "
+             + ("ok" if not flags else "INVALID: " + ",".join(flags)
+                + (f" ({err})" if err else "")))
+
+    manifest = {"tool": TOOL, "schema": 1, "surface": surface, "base_url": base,
+                "corpus": os.path.abspath(o["--corpus"]),
+                "toggle_expect": expect, "toggle_readback": readback,
+                "cookies_sent": len(cookie_sel),
+                "captured_at": datetime.datetime.now().astimezone().isoformat(),
+                "entries": entries}
+    with open(os.path.join(out, "manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, ensure_ascii=False, indent=2, sort_keys=True)
+
+    invalid = [m for m in entries if not m["valid"]]
+    dead = [m for m in entries if m["error"]]
+    print(f"{TOOL} capture: {len(entries)}개 · 유효 {len(entries) - len(invalid)} · "
+          f"invalid {len(invalid)} → {out}")
+    for m in invalid:
+        print(f"  invalid  {m['id']:<28} {','.join(m['flags'])}")
+    if dead and len(dead) == len(entries):
+        die(f"모든 요청이 실패했다 ({dead[0]['error']}). 표면이 떠 있는지 확인해라 — "
+            "이것은 검사 실패가 아니라 도구가 답할 수 없는 상태다.")
+    return 1 if invalid else 0
+
+
+# --------------------------------------------------------------- compare
+
+def load_capture_dir(d):
+    d = os.path.abspath(os.path.expanduser(d))
+    if not os.path.isdir(d):
+        die(f"캡처 디렉터리가 없다: {d}")
+    man = os.path.join(d, "manifest.json")
+    metas = {}
+    if os.path.isfile(man):
+        try:
+            with open(man, encoding="utf-8") as fh:
+                for m in json.load(fh).get("entries") or []:
+                    metas[m["id"]] = m
+        except (OSError, ValueError, KeyError) as exc:
+            die(f"{man} 을 읽을 수 없다: {exc}")
+    else:
+        for name in sorted(os.listdir(d)):
+            if not name.endswith(".json") or name == "manifest.json":
+                continue
+            try:
+                with open(os.path.join(d, name), encoding="utf-8") as fh:
+                    m = json.load(fh)
+                metas[m["id"]] = m
+            except (OSError, ValueError, KeyError):
+                continue
+    if not metas:
+        die(f"{d} 에 캡처가 없다 (manifest.json 도 <id>.json 도 읽지 못했다)")
+    return d, metas
+
+
+def decode(data, charset):
+    for enc in (charset, "utf-8", "cp949"):
+        if not enc:
+            continue
+        try:
+            return data.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("latin-1")
+
+
+def cmd_compare(argv):
+    pos = []
+    o = parse_opts(argv, want={"--report", "--context", "--max-diff-lines", "--config"},
+                   positional=pos)
+    if len(pos) != 2:
+        die("compare 에는 캡처 디렉터리 두 개가 필요하다: htmlsnap compare <A> <B>")
+    cfg, cfg_file = load_config(o.get("--config"))
+    dir_a, a = load_capture_dir(pos[0])
+    dir_b, b = load_capture_dir(pos[1])
+    ctx = int(o.get("--context") or 3)
+    cap = int(o.get("--max-diff-lines") or 40)
+
+    surface = None
+    for src in (os.path.join(dir_a, "manifest.json"), os.path.join(dir_b, "manifest.json")):
+        if os.path.isfile(src):
+            try:
+                with open(src, encoding="utf-8") as fh:
+                    surface = json.load(fh).get("surface") or surface
+            except (OSError, ValueError):
+                pass
+    charset = opt(cfg, f"legacy.surfaces.{surface}.charset", "cp949") if surface else "cp949"
+
+    rows, diffs = [], {}
+    for eid in sorted(set(a) | set(b)):
+        ma, mb = a.get(eid), b.get(eid)
+        if ma is None or mb is None:
+            rows.append((eid, "missing", f"{'B' if ma else 'A'} 에만 있다"))
+            continue
+        bad = [f"A:{f}" for f in ma.get("flags") or []] + \
+              [f"B:{f}" for f in mb.get("flags") or []]
+        if bad:
+            rows.append((eid, "invalid", ",".join(bad)))
+            continue
+        if ma.get("sha256_norm") == mb.get("sha256_norm"):
+            rows.append((eid, "identical", ma.get("mode", "full")))
+            continue
+        try:
+            with open(os.path.join(dir_a, f"{eid}.norm.html"), "rb") as fh:
+                ta = decode(fh.read(), charset).splitlines()
+            with open(os.path.join(dir_b, f"{eid}.norm.html"), "rb") as fh:
+                tb = decode(fh.read(), charset).splitlines()
+        except OSError as exc:
+            rows.append((eid, "invalid", f"정규화본을 읽을 수 없다: {exc}"))
+            continue
+        lines = list(difflib.unified_diff(ta, tb, f"A/{eid}", f"B/{eid}", n=ctx,
+                                          lineterm=""))
+        diffs[eid] = lines[:cap] + ([f"... (+{len(lines) - cap}줄)"] if len(lines) > cap else [])
+        rows.append((eid, "different", f"{len(lines)}줄 diff · {ma.get('mode','full')}"))
+
+    counts = {k: sum(1 for _, s, _ in rows if s == k)
+              for k in ("identical", "different", "missing", "invalid")}
+    print(f"{TOOL} compare: A={dir_a}")
+    print(f"{'':17}B={dir_b}")
+    for eid, state, detail in rows:
+        print(f"  {state:<10} {eid:<30} {detail}")
+    print(f"  ── identical {counts['identical']} · different {counts['different']}"
+          f" · missing {counts['missing']} · invalid {counts['invalid']}")
+    for eid in sorted(diffs):
+        print(f"\n--- diff: {eid}")
+        for line in diffs[eid]:
+            print("  " + line)
+
+    if o.get("--report"):
+        write_report(o["--report"], dir_a, dir_b, rows, counts, diffs)
+        note(f"보고서: {o['--report']}")
+    if counts["invalid"]:
+        die(f"invalid 캡처가 {counts['invalid']}개 있다. 로그아웃·오류·타임아웃 캡처는 "
+            "기준선이 될 수 없으므로 비교 결과를 내지 않는다. 원인을 고치고 다시 캡처해라.")
+    return 1 if (counts["different"] or counts["missing"]) else 0
+
+
+def write_report(path, dir_a, dir_b, rows, counts, diffs):
+    out = ["# htmlsnap compare", "",
+           f"- A: `{dir_a}`", f"- B: `{dir_b}`",
+           f"- identical {counts['identical']} · different {counts['different']}"
+           f" · missing {counts['missing']} · invalid {counts['invalid']}", "",
+           "| id | 결과 | 비고 |", "|---|---|---|"]
+    for eid, state, detail in rows:
+        out.append(f"| `{eid}` | {state} | {detail} |")
+    for eid in sorted(diffs):
+        out += ["", f"## diff — `{eid}`", "", "```diff"] + diffs[eid] + ["```"]
+    try:
+        with open(os.path.expanduser(path), "w", encoding="utf-8") as fh:
+            fh.write("\n".join(out) + "\n")
+    except OSError as exc:
+        die(f"보고서를 쓸 수 없다 ({path}): {exc}")
+
+
+# --------------------------------------------------------------- corpus
+
+def cmd_corpus(argv):
+    if not argv or argv[0] != "validate":
+        die("사용법: htmlsnap corpus validate <corpus.json>")
+    pos = []
+    o = parse_opts(argv[1:], want={"--config"}, positional=pos)
+    if len(pos) != 1:
+        die("사용법: htmlsnap corpus validate <corpus.json>")
+    doc = read_corpus(pos[0])
+    cfg, cfg_file, cfg_err = None, None, None
+    try:
+        cfg, cfg_file = load_config(o.get("--config"))
+    except SystemExit as exc:
+        cfg_err = "설정을 읽지 못해 surface 이름을 대조하지 못했다"
+        if not isinstance(exc.code, int):
+            cfg_err += f" ({exc.code})"
+    bad = corpus_problems(doc, cfg)
+    for b in bad:
+        print(f"  문제  {b}")
+    n = len(doc.get("entries") or []) if isinstance(doc, dict) else 0
+    print(f"{TOOL} corpus validate: 항목 {n}개 · 문제 {len(bad)}개"
+          + ("" if cfg is not None else "  [surface 대조 못 함]"))
+    if cfg is None:
+        die(cfg_err or "설정을 읽지 못했다")
+    return 1 if bad else 0
+
+
+# --------------------------------------------------------------- 진입
+
+def parse_opts(argv, want, positional=None):
+    """`--key value` 만 받는다. 모르는 옵션은 조용히 무시하지 않고 멈춘다."""
+    o, i = {}, 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith("--"):
+            if a not in want:
+                die(f"모르는 옵션 {a}. --help 로 쓸 수 있는 옵션을 봐라.")
+            if i + 1 >= len(argv):
+                die(f"{a} 에 값이 없다")
+            o[a] = argv[i + 1]
+            i += 2
+            continue
+        if positional is None:
+            die(f"위치 인자를 받지 않는다: {a!r}")
+        positional.append(a)
+        i += 1
+    return o
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "capture":
+        return cmd_capture(rest)
+    if cmd == "compare":
+        return cmd_compare(rest)
+    if cmd == "corpus":
+        return cmd_corpus(rest)
+    die(f"모르는 명령 {cmd!r}. capture | compare | corpus validate 중 하나다.")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
