@@ -91,9 +91,13 @@ flowchart LR
 
 | 시도 | 형식 | 결과 | 측정일 |
 |---|---|---|---|
-| 1 | `SUBAGENT_OUTPUT = "json"` | 미측정 | — |
-| 2 | `SUBAGENT_OUTPUT = "stdout"` | 미측정 | — |
-| 3 | `TASK_FALLBACK = True` | 미측정 | — |
+| 1 | `SUBAGENT_OUTPUT = "json"` | **확인** — 아래 실측 | 2026-09-09 |
+| 2 | `SUBAGENT_OUTPUT = "stdout"` | 시도하지 않음 (1 이 통과했다) | — |
+| 3 | `TASK_FALLBACK = True` | 시도하지 않음 (1 이 통과했다) | — |
+
+**실측 (2026-09-09).** 에이전트 두 종을 같은 질문으로 띄워 보고받았다. `php-behavior-analyst` 는 기대한 세 토큰을, `domain-scribe` 는 기대한 두 토큰을 그대로 보고했고, `ctxstats --probe` 의 대조가 여섯 행 전부 `확인` 을 냈다. 두 에이전트 모두 "블록이 프롬프트 본문이 아니라 `SubagentStart hook additional context` 라는 별도 시스템 메시지로 도착했다"고 답했다.
+
+**주입되었다는 것보다 중요한 것은 서로 다른 집합이 갔다는 사실이다.** `domain-scribe` 는 `legacy-tree` 를 받지 않았다. 전역 주입이었다면 두 에이전트가 같은 것을 받았을 것이므로, 이 차이가 라우팅이 실제로 동작한다는 증거다. 한 에이전트만 물었다면 이 축은 확인되지 않는다.
 
 **"미측정"을 "동작함"으로 바꿔 적지 않는다.** 주입 로그에 줄이 남는 것은 이 훅이 stdout 에 무엇을 썼는지를 증명할 뿐, 그것이 모델의 컨텍스트에 닿았는지는 증명하지 않는다. 스킬·경로 트리거(`PreToolUse` 의 `additionalContext`)는 문서화된 경로라 같은 의심이 없다.
 
