@@ -180,6 +180,10 @@ def corpus_problems(doc, cfg=None):
         rules = e.get("rules", [])
         if not isinstance(rules, list) or any(not isinstance(r, str) for r in rules):
             bad.append(f"{tag}: rules 는 원장 행 ID 문자열의 배열이어야 한다")
+        hdrs = e.get("headers", {})
+        if not isinstance(hdrs, dict) or any(
+                not isinstance(k, str) or not isinstance(v, (str, int)) for k, v in hdrs.items()):
+            bad.append(f"{tag}: headers 는 문자열 키와 문자열 값의 객체여야 한다")
     return bad
 
 
@@ -269,8 +273,15 @@ def cookie_header(sel, path):
 
 # --------------------------------------------------------------- HTTP
 
-def fetch(url, method, body, cookie, timeout):
-    """(status, headers, body_bytes, elapsed_ms, error). 예외를 밖으로 내지 않는다."""
+def fetch(url, method, body, cookie, timeout, extra_headers=None):
+    """(status, headers, body_bytes, elapsed_ms, error). 예외를 밖으로 내지 않는다.
+
+    `extra_headers` 는 코퍼스 항목이 선언한 요청 헤더이고 기본 헤더를 덮어쓴다.
+    이것이 없으면 한 가지 User-Agent 로만 찍게 되는데, 이 트리처럼 기기에 따라
+    경로가 갈리는 표면에서는 **가드의 한쪽 경로가 영원히 관찰되지 않는다.**
+    관찰되지 않은 분기는 "차이 없음" 과 구별되지 않으므로, 그 상태로 초록이 되는
+    비교는 아무것도 증명하지 않는다.
+    """
     data = body.encode("utf-8") if body else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("User-Agent", UA)
@@ -279,6 +290,8 @@ def fetch(url, method, body, cookie, timeout):
         req.add_header("Cookie", cookie)
     if data is not None:
         req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    for k, v in (extra_headers or {}).items():
+        req.add_header(str(k), str(v))       # urllib 는 같은 이름을 덮어쓴다
     t0 = time.time()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -421,7 +434,9 @@ def cmd_capture(argv):
         url = base.rstrip("/") + path + (("?" + qs) if qs and method == "GET" else "")
         body = qs if method == "POST" else None
         cookie = cookie_header(cookie_sel, urllib.parse.urlsplit(url).path or "/")
-        status, headers, raw, ms, err = fetch(url, method, body, cookie, timeout)
+        req_headers = e.get("headers") or {}
+        status, headers, raw, ms, err = fetch(
+            url, method, body, cookie, timeout, req_headers)
 
         flags = []
         if err:
@@ -444,6 +459,7 @@ def cmd_capture(argv):
             fh.write(norm)
         meta = {"id": eid, "url": url, "path": path, "method": method,
                 "params": params, "mode": mode, "rules": e.get("rules") or [],
+                "headers": req_headers,
                 "note": e.get("note", ""), "status": status,
                 "content_type": headers.get("Content-Type", ""),
                 "bytes": len(raw), "elapsed_ms": ms, "flags": flags,
