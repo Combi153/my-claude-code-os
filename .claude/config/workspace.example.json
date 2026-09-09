@@ -100,6 +100,7 @@
       "serviceCallPattern": "<regex matching the seam service call, e.g. a class::method form>",
       "templateIncludePattern": "<regex matching template include paths>",
       "templateRenderPattern": "<optional regex: template *object* calls (construct/set/fetch). Omit only if this tree renders templates by include alone - without it those statements are reported as violations>",
+      "viewVarPattern": "<optional regex matching the names of view-wiring variables an included header or template reads. Those assignments carry no rule for the seam to take, so extraction never removes them; without this key \"zero violations\" is unreachable on a tree that has them. Match by NAME, never by statement shape - a literal assignment to a view variable and one to a domain parameter are the same tokens>",
       "guardIdioms": [
         "<regex: auth check idiom>",
         "<regex: redirect-header idiom>",

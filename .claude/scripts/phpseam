@@ -407,6 +407,22 @@ def is_bind(lhs, rhs, seam_var):
                and t.text.decode("ascii", "replace") == seam_var for t in rhs)
 
 
+def is_view_bind(lhs, view_re):
+    """이음새와 무관한 화면 배선 대입. **좌변 변수 이름으로만** 판정한다.
+
+    우변 모양으로 받지 않는 이유가 이 함수의 전부다. `$navSelected = 'notice'` 와
+    `$aParam['limit'] = 10` 은 토큰으로 구별되지 않는데, 앞의 것은 include 된 헤더가
+    읽는 화면 상수라 이음새가 가져갈 것이 없고 뒤의 것은 이음새로 가야 할 도메인
+    값이다. 리터럴 대입을 모양으로 허용하면 뒤의 것이 조용히 통과하고, 그것이 바로
+    이 린터가 잡으려고 있는 위반이다. 그래서 넓히는 것은 모양이 아니라 이름이고,
+    이름은 설정에 명시된 것만 받는다.
+    """
+    if view_re is None or not lhs or lhs[0].name != "T_VARIABLE":
+        return False
+    name = base_var(lhs)
+    return bool(name and view_re.search(name))
+
+
 def classify(raw_file, stmts, cfg, where):
     guards = compile_many(need(cfg, "seam.guardIdioms", where), "seam.guardIdioms")
     seam_re = compile_one(need(cfg, "seam.serviceCallPattern", where),
@@ -421,6 +437,14 @@ def classify(raw_file, stmts, cfg, where):
     render_pat = opt(cfg, "seam.templateRenderPattern", None)
     render_re = (compile_one(render_pat, "seam.templateRenderPattern")
                  if render_pat else None)
+    # 선택 키. 화면 배선 변수의 이름들이다 — include 된 헤더나 템플릿이 읽는
+    # 값이라 이음새가 가져갈 것이 없고, 그래서 추출을 해도 페이지에서 사라지지
+    # 않는다. 받지 않으면 "위반 0" 이 도달 불가능한 종료 조건이 되고, 그러면
+    # 사람이 "원래 있던 것 9건"을 손으로 세는 더 약한 조건으로 물러나게 된다.
+    # 없으면 이 판정 자체가 없다 — 좁아지는 쪽이 기본값이다.
+    view_pat = opt(cfg, "seam.viewVarPattern", None)
+    view_re = (compile_one(view_pat, "seam.viewVarPattern")
+               if view_pat else None)
     allowed = {str(c).lower() for c in need(cfg, "seam.allowedCalls", where)}
 
     rows, seam_var, prev_kind = [], None, None
@@ -480,6 +504,8 @@ def classify(raw_file, stmts, cfg, where):
                 if parts and is_parse(lhs, rhs, allowed):
                     kind = "parse"
                 elif parts and is_bind(lhs, rhs, seam_var):
+                    kind = "bind"
+                elif parts and is_view_bind(lhs, view_re):
                     kind = "bind"
                 elif len(s) >= 2 and s[0].name == "T_STRING" \
                         and s[0].text == b"extract" and seam_var \
