@@ -37,7 +37,7 @@ HOOK = ARGS[0] if ARGS else os.path.join(PROJECT, ".claude", "hooks",
 if not os.path.isfile(HOOK):
     sys.exit(f"훅을 찾지 못했다: {HOOK}")
 
-results = []
+results, skipped = [], []
 
 
 def check(name, ok, detail="", secs=None):
@@ -46,6 +46,16 @@ def check(name, ok, detail="", secs=None):
     t = f" {secs * 1000:6.1f}ms" if secs is not None else ""
     print(f"{len(results):>2} {name:<44} {mark}{t}"
           + (f"  {detail}" if detail and not ok else ""))
+
+
+def skip(name, why):
+    """답할 수 없는 케이스. **집계에 넣지 않고** 이유를 찍는다.
+
+    `results` 에 넣으면 `selftest.py` 가 읽는 `N/M` 이 어긋나 실패로 도착하고,
+    그러면 "재지 못했다"가 "빨간불"과 같은 모양이 된다. 둘은 다른 사실이다.
+    """
+    skipped.append(name)
+    print(f"{'':2} {name:<44} 건너뜀  {why}")
 
 
 # ------------------------------------------------------------------ 가짜 환경
@@ -291,8 +301,39 @@ check("JSON 이 아닌 입력에도 exit 0", raw.returncode == 0,
       f"rc={raw.returncode}", time.time() - t0)
 
 reset()
-p, s = run(sub("php-behavior-analyst"))
-check("한 번 호출이 60ms 안에 끝난다 (ms 단위 주장)", s < 0.06, f"{s*1000:.0f}ms", s)
+# 이 케이스는 **바닥을 함께 잰다.** 주장은 "이 훅이 자기 일에 45ms 를 넘게 쓰지 않는다"이고,
+# 파이썬 인터프리터가 뜨는 시간은 훅의 일이 아니므로 **빼고 잰다.** 예전에는 기동 시간을
+# 포함한 전체를 60ms 로 단정했는데, `selftest.py` 가 케이스 모듈 여섯을 겹쳐 돌리는 동안
+# 그것이 간헐적으로 67ms 를 찍으며 빨간불이 됐다 — 훅은 그대로인데 부하가 달랐을 뿐이다.
+#
+# **간헐적으로 깨지는 검사는 없는 검사보다 나쁘다.** 실패를 무시하도록 가르치기 때문이고,
+# 그러면 진짜 회귀가 왔을 때도 같은 빨간불로 도착한다. 임계값을 올려서 조용하게 만드는
+# 것(측정을 약화시키는 쪽)이 아니라, **재는 대상을 훅 자신의 몫으로 좁혔다.**
+#
+# 부하가 너무 커서 바닥조차 흔들리면 답할 수 없다고 말하고 건너뛴다. 세 번 중 최소값으로
+# 재는 것은 두 쪽 다 같다.
+def _best(argv, payload=None):
+    out = []
+    for _ in range(3):
+        t0 = time.time()
+        subprocess.run(argv, input=payload, capture_output=True, text=True,
+                       env={**os.environ, "CLAUDE_PROJECT_DIR": PROJ})
+        out.append(time.time() - t0)
+    return min(out)
+
+
+floor = _best([sys.executable, "-c", "pass"])
+best = _best([sys.executable, HOOK], json.dumps(sub("php-behavior-analyst")))
+own = best - floor
+if floor >= 0.05:
+    skip("훅 자기 몫이 45ms 안이다",
+         f"빈 인터프리터 기동만 {floor*1000:.0f}ms 다 — 이 부하에서는 바닥을 빼도 "
+         f"남는 값을 믿을 수 없다 (전체 {best*1000:.0f}ms)")
+else:
+    check("훅 자기 몫이 45ms 안이다 (기동 바닥을 뺀 값 · 3회 중 최소)",
+          own < 0.045,
+          f"자기 몫 {own*1000:.0f}ms = 전체 {best*1000:.0f}ms − 바닥 {floor*1000:.0f}ms",
+          best)
 
 reset()
 t0 = time.time()
@@ -511,5 +552,7 @@ check("실제 경계 파일이 유일하게 가장 높은 우선순위를 갖는
 shutil.rmtree(BASE, ignore_errors=True)
 print("-" * 84)
 passed = sum(results)
+if skipped:
+    print(f"건너뜀 {len(skipped)}개 — " + ", ".join(skipped))
 print(f"{passed}/{len(results)} 통과")
 sys.exit(0 if passed == len(results) else 1)

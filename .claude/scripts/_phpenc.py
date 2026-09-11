@@ -303,3 +303,62 @@ def state_dir(*parts):
     d = os.path.join(root, ".claude", ".state", *parts)
     os.makedirs(d, exist_ok=True)
     return d
+
+
+# ------------------------------------------------- 설정 전체 (v2·v3 도구들)
+
+def workspace(explicit=None):
+    """(문서, 경로, 문제). `legacy` 절만 주는 `config()` 의 전체 문서 판이다.
+
+    `legacy` 밖의 절(`backend`·`e2e`·`docs`)을 읽는 도구가 v2 에서 셋, v3 에서
+    하나 더 생겼고 **넷이 각자 같은 20줄을 다시 썼다** — 프로젝트를 위로 찾아
+    올라가고, 파일을 열고, 못 읽은 이유를 문자열로 만드는 코드다. 여기 한 번
+    두는 이유는 줄 수가 아니라 판정이다: 넷이 각자 "설정을 못 찾았다"를 다르게
+    정의하면, 그중 하나는 언젠가 그것을 빈 설정으로 취급한다.
+
+    문제는 던지지 않고 돌려준다 — 종료 코드가 도구마다 다르기 때문이다
+    (`htmlsnap` 2, `slicecheck` 3). 판정은 호출자가 한다.
+    """
+    if explicit:
+        path = os.path.abspath(os.path.expanduser(explicit))
+    else:
+        root = project_dir()
+        if not root:
+            return {}, None, (
+                f"{CONFIG_REL} 을 찾지 못했다. --config 로 위치를 주거나, 이 "
+                "도구를 프로젝트의 .claude/scripts/ 안에서 불러라.")
+        path = os.path.join(root, CONFIG_REL)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError) as exc:
+        return {}, path, f"{path} 를 읽을 수 없다: {exc}"
+    if not isinstance(doc, dict):
+        return {}, path, f"{path} 의 최상위가 객체가 아니다"
+    return doc, path, None
+
+
+PLACEHOLDER = ("<", ">")
+
+
+def dotted(cfg, key, default=None):
+    """`a.b.c` 로 설정값 하나. 빈 문자열과 None 은 없는 것으로 본다."""
+    cur = cfg
+    for part in key.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return default
+        cur = cur[part]
+    return default if cur in ("", None) else cur
+
+
+def is_placeholder(value):
+    """`workspace.example.json` 의 자리표시자 그대로인가.
+
+    골격을 복사해 두고 채우지 않은 키는 **없는 키보다 위험하다.** 없으면 도구가
+    멈추지만, `"<abs path>"` 는 값이 있는 것처럼 통과해서 그 뒤의 모든 판정을
+    엉뚱한 곳에 대고 내린다.
+    """
+    if not isinstance(value, str):
+        return False
+    v = value.strip()
+    return v.startswith(PLACEHOLDER[0]) and v.endswith(PLACEHOLDER[1])

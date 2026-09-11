@@ -44,7 +44,8 @@ json.dump({"legacy": {"root": CHECKOUT, "treeRoot": TREE, "treeMarker": MARKER,
 
 S = os.path.join(PROJ, ".claude", "scripts")
 for name in ("phpv", "phpgrep", "phpwhere", "phped", "phplint", "phpindex",
-             "phpstats", "phpseam", "htmlsnap", "dualrun-report", "ctxstats"):
+             "phpstats", "phpseam", "htmlsnap", "dualrun-report", "ctxstats",
+             "ctxevolve"):
     open(os.path.join(S, name), "w").write("#!/usr/bin/env python3\n")
 SRC = os.path.join(TREE, SVC, "page.php")
 open(SRC, "w").write("<?php echo 1;")

@@ -14,6 +14,7 @@
 읽힌다. 시간이 보이면 그 오독을 막을 수 있다. `--quick` 은 트리 전체를 훑는 검사를
 빼는 것이고, 그 경우 무엇을 빼먹었는지 마지막에 말한다.
 """
+import ast
 import json
 import os
 import re
@@ -21,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 QUICK = "--quick" in sys.argv
@@ -104,6 +106,108 @@ print(f"# 대상 트리 확인: {os.path.isdir(TREE)}"
       f" · 서비스 {len(LG.get('services') or {})}개"
       f" · 런타임 {len(LG.get('runtimes') or {})}개"
       + ("  [--quick]" if QUICK else ""))
+
+# ------------------------------------------- 3~8. 케이스 모듈을 먼저 띄운다
+# 각 모듈은 스스로 합성 픽스처를 만들고 마지막 줄에 `N/M 통과` 를 찍는다. 아래에서는
+# 그 숫자만 읽는다. 모듈을 통째로 이 파일에 옮기지 않는 이유는 하나다 — 이 파일이
+# 커지면 아무도 끝까지 돌리지 않고, 돌지 않는 검사는 없는 검사다.
+#
+# **여섯을 여기서 다 띄우고, 제자리(3~8 절)에서 거둔다.** 하나씩 기다리면 벽시계가
+# 여섯의 합이 되는데, 그 합의 대부분은 프로세스가 뜨기를 기다리는 시간이다. 여섯은
+# 서로를 모른다 — 각자 `tempfile.mkdtemp` 아래에 픽스처를 만들고, 자기
+# `CLAUDE_PROJECT_DIR` 만 보고, 컨테이너를 건드리지 않고(`slicecheck` 케이스는
+# 가짜 `docker` 를 자기 PATH 에 놓는다), 이 저장소는 읽기만 한다. 그래서 겹쳐도
+# 서로의 판정을 바꿀 수 없다.
+#
+# 출력은 **띄운 순서 그대로** 찍는다. 끝난 순서로 찍으면 같은 저장소가 실행마다
+# 다른 로그를 내고, 그러면 두 실행을 비교할 수 없다.
+CASE_MODULES = [
+    # (절, 머리글, 검사 이름의 앞부분, 건너뜀 이름, 파일, 인자, 제한시간)
+    (3, "계측 훅 — 가짜 트리로", "계측", "계측 훅 케이스", "selftest_hook.py",
+     [PROJECT + "/.claude/hooks/php-tooling-hook.py"], 300),
+    (4, "phpseam — 페이지 모양·본문 해시·호출자", None, None,
+     "selftest_phpseam.py", [os.path.join(HERE, "phpseam")], 300),
+    (5, "htmlsnap — 캡처와 비교", None, None, "selftest_htmlsnap.py", [], 300),
+    (6, "dualrun-report — 이중 실행 로그", None, None, "selftest_dualrun.py",
+     [], 300),
+    (7, "컨텍스트 주입 — 가짜 프로젝트로", None, None, "selftest_context.py",
+     [PROJECT + "/.claude/hooks/context-inject.py"], 300),
+    (8, "slicecheck — 단계·토글·회차·게이지", None, None,
+     "selftest_slicecheck.py", [], 420),
+]
+
+
+def launch_cases(filename, args, timeout):
+    """모듈을 띄우고 손잡이를 돌려준다. 파일이 없으면 None.
+
+    **기다리는 일은 모듈마다 자기 스레드가 한다.** 거두는 자리에서 순서대로
+    `communicate` 를 부르면, 늦게 거두는 모듈은 자기가 든 시간이 아니라 앞의
+    모듈을 기다린 시간까지 함께 찍는다 — 0.8초짜리가 5.4초로 보인다. 이 파일이
+    초를 찍는 이유가 "어느 도구가 느린가"를 보이는 것이므로, 그 숫자가 거두는
+    순서에 따라 달라지면 찍는 의미가 없어진다.
+    """
+    mod = os.path.join(HERE, filename)
+    if not os.path.isfile(mod):
+        return None
+    h = {"t0": time.time(), "out": "", "err": "", "secs": None, "over": False,
+         "proc": subprocess.Popen([sys.executable, mod, *args],
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE,
+                                  text=True, cwd=PROJECT, env=ENV)}
+
+    def wait():
+        try:
+            h["out"], h["err"] = h["proc"].communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            h["proc"].kill()
+            h["out"], h["err"] = h["proc"].communicate()
+            h["over"] = True
+        h["secs"] = time.time() - h["t0"]
+
+    h["thread"] = threading.Thread(target=wait, daemon=True)
+    h["thread"].start()
+    return h
+
+
+def collect_cases(no, title, label, skipname, filename, timeout, handle):
+    """띄워 둔 모듈을 거두고 `N/M 통과` 를 대조한다."""
+    print(f"\n### {no}. {title}")
+    if handle is None:
+        skip(skipname or title, f"{filename} 이 없다")
+        return
+    handle["thread"].join()
+    out = handle["out"] or ""
+    if handle["over"]:
+        out += f"\n{filename} 이 {timeout}초 안에 끝나지 않았다"
+    tail = [l for l in out.strip().splitlines() if "통과" in l]
+    last = tail[-1] if tail else out.strip()[-120:]
+    n = last.split("/")[0].strip() if "/" in last else "?"
+    total = last.split("/")[1].split()[0] if "/" in last else "?"
+    # `N/M` 줄을 못 찾은 것은 통과가 아니다. 못 찾으면 n·total 이 둘 다 "?" 가
+    # 되는데, 그것을 세지 않고 `n == total` 만 보면 **모듈이 죽거나 제한시간을
+    # 넘긴 실행이 초록으로 찍힌다** — 케이스를 하나도 돌리지 않은 것이 가장 빠른
+    # 실행이므로, 그 구멍은 하필 속도를 재는 동안 가장 벌어지기 쉽다.
+    ok = "/" in last and n == total and not handle["over"]
+    # 모듈이 안에서 건너뛴 케이스는 그 모듈의 `N/M` 에서 **빠진다.** 그러면 부모는
+    # `43/43 통과` 를 보고 초록으로 찍고, 바깥에서는 어제 44 였던 케이스가 오늘 43 인
+    # 이유를 알 수 없다 — 사례가 사라진 것처럼 보인다. 건너뛴 것은 통과가 아니므로
+    # 그 줄을 부모의 요약까지 올린다.
+    inner_skips = [l.strip() for l in out.splitlines()
+                   if l.strip().startswith("건너뜀 ") and "—" in l]
+    detail = last.strip()
+    if inner_skips:
+        detail += "  · " + inner_skips[-1]
+    check(f"{label or title} 케이스 {total} 개", ok, detail, secs=handle["secs"])
+    if inner_skips:
+        print(f"{'':2} {'':<44} ↳ {inner_skips[-1]} (모듈 안에서 건너뜀 — 통과 아님)")
+    if not ok:
+        print(out)
+        print((handle["err"] or "")[-1500:], file=sys.stderr)
+
+
+handles = [launch_cases(m[4], m[5], m[6]) for m in CASE_MODULES]
+print(f"# 케이스 모듈 {sum(h is not None for h in handles)}개를 먼저 띄웠다"
+      " — 3~8 절의 초는 겹쳐서 잰 값이라 합이 벽시계가 아니다")
 
 # ---------------------------------------------------------------- 1. 도구
 print("\n### 1. 도구 여덟 개 — 환경변수 없이, 프로젝트 루트에서")
@@ -275,56 +379,17 @@ if utf8:
           "" if "찾지 못했습니다" in _o else f"exit={p.returncode} 출력={_o[:120]!r}",
           secs=time.time() - t0)
 
-# --------------------------------------------------------- 3. 계측 훅
-print("\n### 3. 계측 훅 — 가짜 트리로")
-cases = os.path.join(HERE, "selftest_hook.py")
-if os.path.isfile(cases):
-    p, s = run([sys.executable, cases,
-                PROJECT + "/.claude/hooks/php-tooling-hook.py"], timeout=300)
-    tail = [l for l in p.stdout.strip().splitlines() if "통과" in l]
-    last = tail[-1] if tail else p.stdout.strip()[-120:]
-    n = last.split("/")[0].strip() if "/" in last else "?"
-    total = last.split("/")[1].split()[0] if "/" in last else "?"
-    check(f"계측 케이스 {total} 개", n == total, last.strip(), secs=s)
-    if n != total:
-        print(p.stdout)
-else:
-    skip("계측 훅 케이스", "selftest_hook.py 가 없다")
+# ------------------------------------------- 3~8. 띄워 둔 케이스 모듈을 거둔다
+for (no, title, label, skipname, filename, _args, timeout), h in zip(
+        CASE_MODULES, handles):
+    collect_cases(no, title, label, skipname, filename, timeout, h)
 
-# --------------------------------------------------- 4~7. 도구별 케이스 모듈
-# 각 모듈은 스스로 합성 픽스처를 만들고 마지막 줄에 `N/M 통과` 를 찍는다. 여기서는
-# 그 숫자만 읽는다. 모듈을 통째로 이 파일에 옮기지 않는 이유는 하나다 — 이 파일이
-# 커지면 아무도 끝까지 돌리지 않고, 돌지 않는 검사는 없는 검사다.
-def cases_module(no, title, filename, args=(), timeout=300):
-    print(f"\n### {no}. {title}")
-    mod = os.path.join(HERE, filename)
-    if not os.path.isfile(mod):
-        skip(title, f"{filename} 이 없다")
-        return
-    p, s = run([sys.executable, mod, *args], timeout=timeout)
-    tail = [l for l in p.stdout.strip().splitlines() if "통과" in l]
-    last = tail[-1] if tail else p.stdout.strip()[-120:]
-    n = last.split("/")[0].strip() if "/" in last else "?"
-    total = last.split("/")[1].split()[0] if "/" in last else "?"
-    check(f"{title} 케이스 {total} 개", n == total, last.strip(), secs=s)
-    if n != total:
-        print(p.stdout)
-        print(p.stderr[-1500:], file=sys.stderr)
-
-
-cases_module(4, "phpseam — 페이지 모양·본문 해시·호출자",
-             "selftest_phpseam.py", [os.path.join(HERE, "phpseam")])
-cases_module(5, "htmlsnap — 캡처와 비교", "selftest_htmlsnap.py")
-cases_module(6, "dualrun-report — 이중 실행 로그", "selftest_dualrun.py")
-cases_module(7, "컨텍스트 주입 — 가짜 프로젝트로", "selftest_context.py",
-             [PROJECT + "/.claude/hooks/context-inject.py"])
-
-# ------------------------------------------------------- 8. 교차 검사
+# ------------------------------------------------------- 9. 교차 검사
 # **한 사실이 두 파일에 적혀 있으면 언젠가 갈린다.** 갈라진 것을 사람이 알아채는
 # 경로가 없으면 그 어긋남은 조용히 산다 — v1 에서 감사 어휘 하나가 라우팅표에
 # 없어서, 그 판정이 돌아올 때마다 갈 곳 없이 사라졌다. 여기서는 정본을 정하고
 # 사본을 대조한다. 실패는 "둘 중 하나가 틀렸다"가 아니라 "둘이 갈렸다"이다.
-print("\n### 8. 교차 검사 — 같은 사실이 두 곳에 적힌 자리")
+print("\n### 9. 교차 검사 — 같은 사실이 두 곳에 적힌 자리")
 
 AGENTS = os.path.join(PROJECT, ".claude", "agents")
 SKILLS = os.path.join(PROJECT, ".claude", "skills")
@@ -368,14 +433,24 @@ def table_first_col(text, header_needle):
 
 
 # (a) 감사 판정 어휘 — 정본은 감사자 파일 하나 -----------------------------
+# v3 에서 라우팅표가 SKILL.md 를 떠나 references/routing.md 로 갔다. 표가 이사할 때
+# 이 검사가 조용히 빈손이 되면(둘 다 `[]` 이므로 "같다"로 통과할 수도 있다) 어휘가
+# 갈라진 뒤에도 아무도 모른다. 그래서 양쪽이 **비어 있지 않은지**도 함께 본다.
 auditor = read(AGENTS, "domain-boundary-auditor.md")
 skill = read(SLICE, "SKILL.md")
+routing = read(SLICE, "references", "routing.md")
 canon = table_first_col(auditor, "## 판정 어휘")
-routed = table_first_col(skill, "| 감사 판정 |")
+routed = table_first_col(routing, "| 판정 |")
 check("감사 판정 어휘가 라우팅표와 같다",
       bool(canon) and bool(routed) and canon == routed,
       f"감사자 {canon} vs 라우팅표 {routed}" if canon != routed
       else f"{len(canon)}개")
+
+# 표를 옮겼으면 오케스트레이터가 그 자리를 가리키고 있어야 한다. 가리키지 않으면
+# 판정이 돌아와도 라우팅할 곳을 모른다.
+check("오케스트레이터가 라우팅 정본을 가리킨다",
+      "references/routing.md" in skill,
+      "legacy-slice/SKILL.md 에 references/routing.md 언급이 없다")
 
 # (b) 산출물 — 정본은 artifacts.json --------------------------------------
 try:
@@ -386,22 +461,23 @@ except (OSError, ValueError) as exc:
     art, art_err = {}, str(exc)
 else:
     art_err = ""
-tbl = dict()
-for line in skill.splitlines():
-    m = re.match(r"^\| `(\d\d-[\w.-]+)` \| (\d) \| `([\w-]+)` \|$", line.strip())
-    if m:
-        tbl[m.group(1)] = {"phase": int(m.group(2)), "writer": m.group(3)}
-check("산출물 표가 artifacts.json 과 같다",
-      bool(art) and tbl == art,
-      art_err or (f"JSON {sorted(art)} vs SKILL.md {sorted(tbl)}"
-                  if set(art) != set(tbl)
-                  else "행 내용이 다르다: "
-                       + str([k for k in art if art[k] != tbl.get(k)]))
-      if tbl != art else f"{len(art)}개")
+# v3 의 스킬은 산출물을 표가 아니라 산문으로 적는다. 형식을 따라가는 대신
+# **이름의 집합**을 맞춘다 — 형식이 또 바뀌어도 이 검사는 산다. 잡으려는 것은 둘이다:
+# JSON 에 없는 산출물을 스킬이 말하는 것(유령), 그리고 JSON 에 있는데 스킬이 한 번도
+# 말하지 않는 것(아무도 쓰지 않을 산출물).
+named = set(re.findall(r"`(\d\d-[\w.-]+)`", skill))
+check("산출물 이름이 artifacts.json 과 같다",
+      bool(art) and named == set(art),
+      art_err or (f"JSON {sorted(art)} vs SKILL.md {sorted(named)}"
+                  if named != set(art) else f"{len(art)}개"))
 
 # (c) 실험 헬퍼 상수 ↔ 설정 키 ---------------------------------------------
 tpl = read(PROJECT, ".claude", "templates", "MigrationExperiment.php")
-consts = [c for c in ("VALUE_DUAL", "VALUE_MIGRATED", "LOG_ENV")
+# 헬퍼 상수 다섯. 뒤의 둘은 `slicecheck` 의 계측 봉투이고, 그 둘이 갈리면 봉투는
+# 켜지지 않으면서 단계는 "불일치 없음"과 같은 모양으로 끝난다.
+HELPER_CONSTS = ("VALUE_DUAL", "VALUE_MIGRATED", "LOG_ENV", "NOISE_ENV",
+                 "POISON_ENV")
+consts = [c for c in HELPER_CONSTS
           if re.search(r"\bconst\s+" + c + r"\s*=", tpl)]
 try:
     with open(os.path.join(PROJECT, ".claude", "config",
@@ -415,12 +491,20 @@ want_keys = [("legacy.switch.values.dual",
              ("legacy.switch.values.migrated",
               "migrated" in ((exl.get("switch") or {}).get("values") or {})),
              ("legacy.dualRun.logEnvVar",
-              "logEnvVar" in (exl.get("dualRun") or {}))]
+              "logEnvVar" in (exl.get("dualRun") or {})),
+             ("legacy.dualRun.noiseEnvVar",
+              "noiseEnvVar" in (exl.get("dualRun") or {})),
+             ("legacy.dualRun.poisonEnvVar",
+              "poisonEnvVar" in (exl.get("dualRun") or {})),
+             ("legacy.dualRun.coveragePath",
+              "coveragePath" in (exl.get("dualRun") or {}))]
 missing = [k for k, ok in want_keys if not ok]
-check("실험 헬퍼의 세 상수와 example 의 세 키가 둘 다 있다",
-      len(consts) == 3 and not missing,
-      f"상수 {consts} · 없는 키 {missing}"
-      if len(consts) != 3 or missing else "")
+check(f"실험 헬퍼의 상수 {len(HELPER_CONSTS)}개와 example 의 키 {len(want_keys)}개가 "
+      "둘 다 있다",
+      len(consts) == len(HELPER_CONSTS) and not missing,
+      f"없는 상수 {[c for c in HELPER_CONSTS if c not in consts]} · "
+      f"없는 키 {missing}"
+      if len(consts) != len(HELPER_CONSTS) or missing else "")
 
 # 실제 설정이 그 절을 채웠다면 값까지 대조한다. 안 채웠으면 건너뛴다 —
 # 값이 없는 것은 어긋남이 아니라 아직 쓰지 않은 것이다.
@@ -435,13 +519,23 @@ rv = (real.get("switch") or {}).get("values") or {}
 rlog = (real.get("dualRun") or {}).get("logEnvVar")
 if rv.get("dual") and rv.get("migrated") and rlog:
     lit = {c: (re.search(r"\bconst\s+" + c + r"\s*=\s*'([^']*)'", tpl)
-               or [None, None])[1] for c in ("VALUE_DUAL", "VALUE_MIGRATED",
-                                             "LOG_ENV")}
+               or [None, None])[1] for c in HELPER_CONSTS}
     same = (rv["dual"] == lit["VALUE_DUAL"]
             and rv["migrated"] == lit["VALUE_MIGRATED"]
             and rlog == lit["LOG_ENV"])
     check("실제 설정의 토글 값이 헬퍼 상수와 같다", same,
           "" if same else f"설정 {rv}/{rlog} vs 템플릿 {lit}")
+    # 계측 봉투는 아직 안 채운 체크아웃이 있을 수 있다. 채웠으면 대조하고, 안
+    # 채웠으면 건너뛴다 — 값이 없는 것은 어긋남이 아니다.
+    for key, const in (("noiseEnvVar", "NOISE_ENV"),
+                       ("poisonEnvVar", "POISON_ENV")):
+        got = (real.get("dualRun") or {}).get(key)
+        if not got:
+            skip(f"실제 설정의 {key} 대조", f"workspace.json 에 {key} 가 아직 없다")
+        else:
+            check(f"실제 설정의 {key} 가 헬퍼의 {const} 와 같다",
+                  got == lit[const], "" if got == lit[const]
+                  else f"설정 {got} vs 템플릿 {lit[const]}")
 else:
     skip("실제 설정의 토글 값 대조", "workspace.json 에 dualRun·dual 값이 아직 없다")
 
@@ -498,6 +592,58 @@ for rel in tracked.splitlines():
                 hits.append(f"{rel}:{i}: {name}")
 check("v1 의 옛 이름이 추적 파일에 없다", not hits,
       "; ".join(hits[:4]) + (f" (외 {len(hits) - 4}건)" if len(hits) > 4 else ""))
+
+# (f) 도구 이름 목록 셋이 갈리지 않았는가 --------------------------------
+# `phpstats` 가 스스로 "훅의 `OUR_TOOLS` 와 같은 목록이어야 한다"고 적어 두었는데
+# 아무도 대지 않았고, 그래서 이미 갈려 있었다 — 한쪽에만 있는 이름은 훅이 기록
+# 하지만 리포트가 전용 호출로 세지 않아 사용률이 낮은 쪽으로 기운다. 목록을 여기
+# 리터럴로 적으면 **넷째 사본**이 되므로, 세 파일에서 뽑아 서로 댄다. 뽑지 못한
+# 것은 통과가 아니다.
+def _str_seq(node):
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        names = {e.value for e in node.elts
+                 if isinstance(e, ast.Constant) and isinstance(e.value, str)}
+        return names or None
+    return None
+
+
+def tool_names(rel, want):
+    """`want` 라는 이름의 대입, 없으면 `for want in (...)` 의 반복 대상."""
+    try:
+        tree = ast.parse(read(PROJECT, rel))
+    except (SyntaxError, ValueError):
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name) and t.id == want:
+                    return _str_seq(node.value)
+        if isinstance(node, ast.For) and isinstance(node.target, ast.Name) \
+                and node.target.id == want:
+            seq = _str_seq(node.iter)
+            if seq and "phpv" in seq:
+                return seq
+    return None
+
+
+LISTS = [(".claude/scripts/phpstats", "OURS"),
+         (".claude/hooks/php-tooling-hook.py", "OUR_TOOLS"),
+         (".claude/scripts/selftest_hook.py", "name")]
+got = [(rel, tool_names(rel, want)) for rel, want in LISTS]
+missing = [rel for rel, names in got if not names]
+if missing:
+    check("도구 이름 목록 셋이 일치", False,
+          "목록을 뽑지 못했다: " + ", ".join(os.path.basename(m) for m in missing))
+else:
+    base = got[0][1]
+    diffs = []
+    for rel, names in got[1:]:
+        only_a, only_b = base - names, names - base
+        if only_a or only_b:
+            diffs.append(f"{os.path.basename(got[0][0])}↔{os.path.basename(rel)}: "
+                         + " ".join(sorted(f"-{n}" for n in only_a)
+                                    + sorted(f"+{n}" for n in only_b)))
+    check(f"도구 이름 목록 셋이 일치 ({len(base)}개)", not diffs, " · ".join(diffs))
 
 # ------------------------------------------------------------------ 정리
 shutil.rmtree(SCRATCH, ignore_errors=True)

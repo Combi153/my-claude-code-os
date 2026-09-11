@@ -6,6 +6,8 @@
     phpseam pin <file.php> <function|Class::method> [--pins <pins.json>]
     phpseam check [--pins <pins.json>]                핀 걸린 본문이 그대로인가
     phpseam callers <symbol> [--allow-file <f>]... [--scope <dir>]
+    phpseam fields [--schema <dir>] --adapter <file>... [--ledger <ledger>]
+                                                      어댑터가 그 필드를 묻는가
 
     공통: [--config <workspace.json>]  [-h | --help]
 
@@ -45,6 +47,7 @@ import time
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _phpenc import CONFIG_REL, config, config_problem, detect  # noqa: E402
+from _phpenc import read_text  # noqa: E402
 from _phpenc import project_dir  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -890,6 +893,581 @@ def cmd_callers(symbol, cfg, where, allow_files, scope, proj, cfg_path=None):
     return 1
 
 
+# ------------------------------------------------------------------- fields
+# 이 검사가 막는 실패는 하나다 — 백엔드에 규칙이 있고, 스키마에 필드가 있고, 단위
+# 테스트가 그 필드를 고정하고, 원장이 `이관됨` 이라고 적혀 있는데, **어댑터가 그
+# 필드를 아예 요청하지 않아서 아무도 읽지 않는** 상태. 구조 린트는 페이지 모양을
+# 보고, 본문 해시는 불변을 보고, 호출자 전수는 이음새 밖 호출을 보는데, 어느 것도
+# "어댑터가 백엔드의 어느 필드를 요청하는가"를 보지 않는다. 두 번째 슬라이스가
+# 정확히 그 사각에서 감사 FAIL 했고, 감사자가 찾아낸 것은 두 파일 목록의 차집합
+# 이었다 — 곧 계산이다. 계산을 사람에게 맡기면 발견이 Phase 7 까지 미뤄진다.
+#
+# 범위 판정은 두 갈래다. `요청했으나 스키마에 없음` 은 범위와 무관하게 위반이다 —
+# 그 요청은 서버에서 실패하거나 빈 값으로 돌아온다. `노출되었으나 요청 안 됨` 은
+# 다르다. 스키마는 영역 단위이고 어댑터는 페이지 하나이므로, 다른 페이지가 쓰는
+# 필드가 노출되어 있는 것은 정상이다. 그래서 이쪽은 **어댑터가 실제로 선택해 들어간
+# 타입**(루트 타입 제외 — 스키마의 `Query` 에는 모든 슬라이스의 진입점이 있다)의
+# 필드만 보고, 원장이 있으면 그보다 좁게 `이관됨` 행이 인용한 필드만 위반으로
+# 올린다. 거짓 위반을 많이 내는 검사는 꺼지고, 꺼진 검사는 없는 검사보다 나쁘다.
+# 좁힌 만큼은 숨기지 않고 `판정 보류` 로 세어 출력한다.
+
+SCHEMA_EXT = (".graphqls", ".graphql", ".gql", ".sdl")
+BUILTIN_SCALARS = {"Int", "Float", "String", "Boolean", "ID"}
+DEF_HEAD = re.compile(
+    r"(?m)^[ \t]*(?:extend[ \t]+)?"
+    r"(schema|type|interface|input|enum|union|scalar)\b[ \t]*([A-Za-z_]\w*)?")
+HEREDOC = re.compile(
+    r"<<<[ \t]*(['\"]?)([A-Za-z_]\w*)\1[ \t]*\r?\n(.*?)\r?\n[ \t]*\2\b",
+    re.S | re.M)
+GQL_HEAD = re.compile(
+    r"^\s*(?:(query|mutation|subscription)\b[ \t]*([A-Za-z_]\w*)?"
+    r"[ \t]*(?:\([^)]*\))?[ \t]*)?\{", re.S)
+SEL_TOKEN = re.compile(r"\.\.\.|[{}:,]|[A-Za-z_]\w*|\S")
+SEL_CLEAN = re.compile(r"^[\sA-Za-z_0-9{},:$%]*$")
+CITE = re.compile(r"[A-Za-z_]\w*")
+MD_RULE = re.compile(r"^\s*\|[\s:|-]+\|\s*$")
+
+
+def _match_brace(s, i):
+    """s[i] 가 `{` 일 때 짝이 되는 `}` 의 위치. 없으면 -1."""
+    depth = 0
+    while i < len(s):
+        if s[i] == "{":
+            depth += 1
+        elif s[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _drop_spans(s, opener, closer):
+    """짝이 맞는 구간을 통째로 지운다. 인자 괄호를 필드로 오인하지 않으려면 필요하다."""
+    out, depth = [], 0
+    for ch in s:
+        if ch == opener:
+            depth += 1
+        elif ch == closer and depth:
+            depth -= 1
+        elif not depth:
+            out.append(ch)
+    return "".join(out)
+
+
+def _strip_sdl(text):
+    """설명 문자열과 `#` 주석을 지운다. 주석 안의 필드를 세면 없는 필드가 생긴다."""
+    text = re.sub(r'"""(?:.|\n)*?"""', " ", text)
+    text = re.sub(r'"(?:\\.|[^"\n])*"', " ", text)
+    return re.sub(r"(?m)#.*$", "", text)
+
+
+def _sdl_fields(body):
+    """`{...}` 본문에서 (필드 이름 → 감싼 것을 벗긴 타입 이름)."""
+    out = {}
+    for line in _drop_spans(body, "(", ")").splitlines():
+        line = line.split("@")[0].split("=")[0]
+        m = re.match(r"\s*([A-Za-z_]\w*)\s*:\s*([\[\]!\s\w]+)", line)
+        if m:
+            parts = re.sub(r"[\[\]!]", " ", m.group(2)).split()
+            if parts:
+                out[m.group(1)] = parts[0]
+    return out
+
+
+class Schema:
+    def __init__(self):
+        self.fields = {}        # 타입 → {필드: 타입}
+        self.kinds = {}         # 타입 → object|interface|input|enum|union|scalar
+        self.roots = {"query": "Query", "mutation": "Mutation",
+                      "subscription": "Subscription"}
+        self.files = []
+
+    def kind_of(self, name):
+        if name in self.kinds:
+            return self.kinds[name]
+        return "scalar" if name in BUILTIN_SCALARS else "unknown"
+
+
+def parse_schema_dir(d):
+    """(Schema, None) 또는 (None, 못 찾은 이유). 이유가 있으면 그것은 exit 3 이다."""
+    if not os.path.isdir(d):
+        return None, (f"스키마 디렉터리가 없다: {d} — 이것은 '어긋남 없음'이 "
+                      "아니라 검사 못 함이다.")
+    files = []
+    for root, _dirs, names in os.walk(d):
+        for n in sorted(names):
+            if n.lower().endswith(SCHEMA_EXT):
+                files.append(os.path.join(root, n))
+    if not files:
+        return None, (f"{d} 에 스키마 파일이 없다 ({' '.join(SCHEMA_EXT)}). "
+                      "타입 0개는 위반 0건과 같은 답이 될 수 없다.")
+    sc = Schema()
+    sc.files = sorted(files)
+    for path in sc.files:
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read()
+        except OSError as exc:
+            return None, f"{path} 를 읽을 수 없다: {exc}"
+        text = _strip_sdl(raw.decode("utf-8", "replace"))
+        for m in DEF_HEAD.finditer(text):
+            kw, name = m.group(1), m.group(2)
+            nxt = DEF_HEAD.search(text, m.end())
+            b = text.find("{", m.end())
+            body = None
+            if b != -1 and (nxt is None or b < nxt.start()):
+                e = _match_brace(text, b)
+                if e == -1:
+                    return None, (f"{path} 의 {kw} {name or ''} 본문에서 닫는 "
+                                  "괄호를 찾지 못했다 — 파싱 실패다.")
+                body = text[b + 1:e]
+            if kw == "schema":
+                for k, v in re.findall(
+                        r"(query|mutation|subscription)\s*:\s*([A-Za-z_]\w*)",
+                        body or ""):
+                    sc.roots[k] = v
+                continue
+            if not name:
+                continue
+            if kw in ("type", "interface", "input"):
+                sc.kinds.setdefault(
+                    name, {"type": "object"}.get(kw, kw))
+                sc.fields.setdefault(name, {}).update(_sdl_fields(body or ""))
+            else:
+                sc.kinds.setdefault(name, kw)
+    if not sc.fields:
+        return None, (f"{d} 의 스키마 파일 {len(sc.files)}개에서 타입을 하나도 "
+                      "뽑지 못했다 — 파싱 실패이지 '필드 없음'이 아니다.")
+    return sc, None
+
+
+# ---------------------------------------------------------- adapter queries
+
+def _line_of(text, pos):
+    return text.count("\n", 0, pos) + 1
+
+
+def _mask(text, a, b):
+    """[a,b) 를 줄 수를 보존하며 지운다. 히어독 본문을 문자열로 두 번 읽지 않으려면 필요하다."""
+    span = "".join("\n" if c == "\n" else " " for c in text[a:b])
+    return text[:a] + span + text[b:]
+
+
+def _php_strings(text):
+    """(시작, 끝, 본문, 인용부호) 목록. 주석 안의 문자열은 세지 않는다."""
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in "'\"":
+            j, buf = i + 1, []
+            while j < n:
+                if text[j] == "\\" and j + 1 < n:
+                    buf.append(text[j + 1])
+                    j += 2
+                    continue
+                if text[j] == c:
+                    break
+                buf.append(text[j])
+                j += 1
+            if j >= n:
+                break
+            out.append((i, j + 1, "".join(buf), c))
+            i = j + 1
+            continue
+        if c == "#" or (c == "/" and text[i + 1:i + 2] == "/"):
+            nl = text.find("\n", i)
+            i = n if nl == -1 else nl + 1
+            continue
+        if c == "/" and text[i + 1:i + 2] == "*":
+            end = text.find("*/", i)
+            i = n if end == -1 else end + 2
+            continue
+        i += 1
+    return out
+
+
+def adapter_candidates(path):
+    """(후보 목록, 인코딩). 후보는 (줄, 본문, 모양). 디코딩은 `_phpenc` 가 한다 —
+    이 트리는 파일마다 CP949 와 UTF-8 이 섞여 있고, utf-8 로 고정해 읽으면 한글이
+    든 어댑터에서 질의가 조용히 사라진다."""
+    text, enc = read_text(path)
+    cands = []
+    for m in HEREDOC.finditer(text):
+        cands.append((_line_of(text, m.start()), m.group(3),
+                      "nowdoc" if m.group(1) == "'" else "heredoc"))
+    for m in list(HEREDOC.finditer(text))[::-1]:
+        text = _mask(text, m.start(), m.end())
+
+    strs = _php_strings(text)
+    i = 0
+    while i < len(strs):
+        start, _end, body, _quote = strs[i]
+        parts = [body]
+        j = i
+        while j + 1 < len(strs):
+            gap = text[strs[j][1]:strs[j + 1][0]]
+            if "." not in gap or ";" in gap:
+                break
+            if re.search(r"[$(]", gap):
+                # 문자열 사이에 변수나 호출이 끼어 있다. 필드 집합이 정적이지
+                # 않다는 신호를 남겨 파서가 잡게 한다 — 조용히 이어붙이면 없는
+                # 필드 목록이 만들어진다.
+                parts.append(" $dyn ")
+            j += 1
+            parts.append(strs[j][2])
+        cands.append((_line_of(text, start), "".join(parts), "string"))
+        i = j + 1
+    return cands, enc
+
+
+def looks_gql(body):
+    m = GQL_HEAD.match(body)
+    if not m:
+        return False
+    if m.group(1):
+        return True     # `query`·`mutation` 이라고 적혀 있으면 답할 의무가 있다
+    # 키워드가 없으면 중첩 선택이 있고 **선택 집합처럼 깨끗할** 때만 질의로 본다.
+    # 중첩 `{` 를 가진 JSON 문자열까지 질의로 보면 `다루지 못하는 모양`이 쏟아지고,
+    # exit 3 이 흔해지면 아무도 그 코드를 믿지 않는다. 보간 표시(`$`·`%`)는 남겨
+    # 둔다 — 그것은 파서가 이유를 붙여 보고해야 하는 모양이다.
+    sel = re.sub(r"@\w+", " ", _drop_spans(body[m.end() - 1:], "(", ")"))
+    return body.count("{") >= 2 and SEL_CLEAN.match(sel) is not None
+
+
+def parse_gql(body):
+    """(연산, 트리) 또는 (None, 다루지 못하는 이유). 노드는 {'name','children'}."""
+    m = GQL_HEAD.match(body)
+    if not m:
+        return None, "질의 머리를 알아볼 수 없다"
+    op = m.group(1) or "query"
+    sel = _drop_spans(body[m.end() - 1:], "(", ")")
+    sel = re.sub(r"@\w+", " ", sel)
+    if "$" in sel or "%" in sel:
+        return None, ("선택 필드 자리에 변수 보간이나 치환자가 있다 — 필드 집합이 "
+                      "정적으로 정해지지 않는다")
+    root, last, depth = [], None, 0
+    stack = [root]
+    for tok in (t.group(0) for t in SEL_TOKEN.finditer(sel)):
+        if tok == "...":
+            return None, "프래그먼트(`...`)를 쓴 질의는 다루지 않는다"
+        if tok == "{":
+            depth += 1
+            if depth == 1:
+                continue
+            if last is None:
+                return None, "선택 집합이 필드에 붙어 있지 않다"
+            stack.append(last["children"])
+            last = None
+            continue
+        if tok == "}":
+            depth -= 1
+            if depth < 0:
+                return None, "닫는 괄호가 더 많다"
+            if depth >= 1:
+                stack.pop()
+            last = None
+            continue
+        if tok == ",":
+            continue
+        if tok == ":":
+            # 별칭이다. 앞서 만든 노드는 별칭 이름이므로 버리고 다음 이름을 받는다.
+            if last is None or not stack[-1]:
+                return None, "별칭 뒤에 필드 이름이 없다"
+            stack[-1].pop()
+            last = None
+            continue
+        if re.fullmatch(r"[A-Za-z_]\w*", tok):
+            if depth == 0:
+                        return None, f"선택 집합 밖에 이름이 있다: {tok}"
+            node = {"name": tok, "children": []}
+            stack[-1].append(node)
+            last = node
+            continue
+        return None, f"다루지 못하는 토큰 {tok!r}"
+    if depth != 0:
+        return None, "괄호가 닫히지 않았다"
+    if not root:
+        return None, "선택 필드가 하나도 없다"
+    return op, root
+
+
+# ------------------------------------------------------------------- ledger
+
+def _md_ledger(text):
+    """Markdown 표 원장 → (ID, 이관, 비고) 목록. 표를 못 찾으면 None."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if not line.lstrip().startswith("|"):
+            continue
+        head = [c.strip().strip("`") for c in line.strip().strip("|").split("|")]
+        state_ix = next((k for k, h in enumerate(head)
+                         if h.startswith("이관")), None)
+        if "ID" not in head or state_ix is None:
+            continue
+        if i + 1 >= len(lines) or not MD_RULE.match(lines[i + 1]):
+            continue
+        id_ix = head.index("ID")
+        note_ix = next((k for k, h in enumerate(head)
+                        if h.startswith("비고")), None)
+        rows = []
+        for body in lines[i + 2:]:
+            if not body.lstrip().startswith("|"):
+                break
+            cells = [c.strip() for c in body.strip().strip("|").split("|")]
+            if len(cells) <= max(id_ix, state_ix):
+                continue
+            note = (cells[note_ix]
+                    if note_ix is not None and note_ix < len(cells) else "")
+            rows.append((cells[id_ix].strip("`"), cells[state_ix], note))
+        if rows:
+            return rows
+    return None
+
+
+def read_ledger(path):
+    """(행 목록, 형식). 행은 (id, 이관 상태, 비고). 못 읽으면 exit 3 으로 멈춘다."""
+    if not os.path.isfile(path):
+        die(f"원장 {path} 가 없다 — 인용 필드를 확인하지 못했다.", 3)
+    text, _enc = read_text(path)
+    first = next((l for l in text.splitlines() if l.strip()), "")
+    if first.lstrip().startswith("{"):
+        rows = []
+        for i, line in enumerate(text.splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                doc = json.loads(line)
+            except ValueError as exc:
+                die(f"{path}:{i} 를 JSONL 한 줄로 읽지 못했다: {exc}", 3)
+            if not isinstance(doc, dict):
+                die(f"{path}:{i} 이 객체가 아니다 — 원장 한 줄은 규칙 하나다.", 3)
+            rows.append((str(doc.get("id") or f"{i}줄"),
+                         str(doc.get("state") or ""),
+                         str(doc.get("note") or "")))
+        if not rows:
+            die(f"{path} 에서 원장 행을 하나도 읽지 못했다.", 3)
+        return rows, "jsonl"
+    rows = _md_ledger(text)
+    if rows is None:
+        die(f"{path} 에서 원장을 알아보지 못했다 — JSONL 도 아니고 `ID`·`이관` 열을 "
+            "가진 Markdown 표도 없다. 인용 필드 0건과 구별할 수 없으므로 멈춘다.", 3)
+    return rows, "markdown"
+
+
+def cited_names(state, note, pool):
+    """`이관됨` 행이 인용한 이름 중 **스키마의 필드 이름인 것만**.
+
+    원장의 `이관됨:<심볼>` 은 백엔드 심볼이고 `비고` 는 산문이다. 그 안의 모든
+    식별자를 위반 후보로 삼으면 거짓 위반이 쏟아진다. 스키마 필드 이름과 교차한
+    것만 남기면, 남은 것은 전부 "스키마가 노출하는 필드를 원장이 인용했다"이다.
+    """
+    out = set()
+    tail = state.split(":", 1)[1] if ":" in state else ""
+    for blob in (tail, note):
+        for name in CITE.findall(blob or ""):
+            if name in pool:
+                out.add(name)
+    return out
+
+
+# ------------------------------------------------------------ fields 명령
+
+def backend_schema_dir(cfg_path, proj, where):
+    """`backend.graphqlSchemaDir` 의 소비처. 없으면 어느 키가 없는지 말하고 멈춘다."""
+    path = cfg_path or (os.path.join(proj, CONFIG_REL) if proj else None)
+    if not path or not os.path.isfile(path):
+        die("--schema 도 없고 설정 파일도 찾지 못했다. "
+            "`backend.graphqlSchemaDir` 을 읽을 수 없다.")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError) as exc:
+        die(f"{path} 를 읽을 수 없다: {exc}")
+    be = raw.get("backend") or {}
+    rel, root = be.get("graphqlSchemaDir"), be.get("root")
+    if not rel:
+        die(f"{where} 에 backend.graphqlSchemaDir 이 없고 --schema 도 없다. "
+            "workspace.example.json 의 backend 절을 보고 채워라 — 이 값 없이 내는 "
+            "답은 좁은 답이라 위반 0건과 구별되지 않는다.")
+    if os.path.isabs(os.path.expanduser(rel)):
+        return os.path.expanduser(rel)
+    if not root:
+        die(f"{where} 의 backend.graphqlSchemaDir 이 상대경로인데 backend.root 가 "
+            "없다. 스키마 디렉터리를 절대경로로 되돌릴 수 없다.")
+    return os.path.join(os.path.abspath(os.path.expanduser(root)), rel)
+
+
+def cmd_fields(schema_dir, adapters, ledger, where, cfg_path, proj):
+    if not adapters:
+        die("사용법: phpseam fields [--schema <dir>] --adapter <파일…> "
+            "[--ledger <원장>]")
+    for a in adapters:
+        if not os.path.isfile(a):
+            die(f"--adapter {a} 가 파일이 아니다")
+    schema_dir = (os.path.abspath(os.path.expanduser(schema_dir)) if schema_dir
+                  else backend_schema_dir(cfg_path, proj, where))
+    sc, why = parse_schema_dir(schema_dir)
+    if sc is None:
+        die(why, 3)
+
+    docs, unsupported, nofind = [], [], []
+    for path in adapters:
+        cands, enc = adapter_candidates(path)
+        gql = [c for c in cands if looks_gql(c[1])]
+        if not gql:
+            nofind.append((path, enc, len(cands)))
+            continue
+        for line, body, shape in gql:
+            op, tree = parse_gql(body)
+            if op is None:
+                unsupported.append((path, line, shape, tree))
+            else:
+                docs.append((path, line, shape, enc, op, tree))
+
+    requested, missing, unknown_t = {}, [], []
+
+    def walk(nodes, tname, path, line):
+        for nd in nodes:
+            name = nd["name"]
+            if name.startswith("__"):           # __typename 따위 메타 필드
+                continue
+            fields = sc.fields.get(tname) or {}
+            if name not in fields:
+                missing.append((f"{tname}.{name}", path, line,
+                                "어댑터가 요청하는데 스키마에 없다"))
+                continue
+            requested.setdefault(tname, set()).add(name)
+            child = fields[name]
+            kind = sc.kind_of(child)
+            if nd["children"]:
+                if kind in ("object", "interface"):
+                    walk(nd["children"], child, path, line)
+                elif kind == "union":
+                    unsupported.append((path, line, "union",
+                                        f"{tname}.{name} 은 union 이라 인라인 "
+                                        "프래그먼트가 필요하다 — 다루지 않는다"))
+                else:
+                    missing.append((f"{tname}.{name}", path, line,
+                                    f"하위 선택이 있는데 {child} 은 잎이다"))
+            else:
+                if kind in ("object", "interface"):
+                    missing.append((f"{tname}.{name}", path, line,
+                                    f"객체 타입 {child} 인데 하위 선택이 없다"))
+                elif kind == "unknown":
+                    unknown_t.append(f"{tname}.{name}: {child}")
+
+    roots_used = set()
+    for path, line, shape, enc, op, tree in docs:
+        rootname = sc.roots.get(op) or op.capitalize()
+        if rootname not in sc.fields:
+            die(f"스키마에 {op} 루트 타입 {rootname} 이 없다 — "
+                f"{path}:{line} 의 질의를 스키마에 붙일 수 없다.", 3)
+        roots_used.add(rootname)
+        walk(tree, rootname, path, line)
+
+    # 어댑터가 선택해 들어간 타입 (루트 제외). `노출되었으나 요청 안 됨` 의 범위다.
+    sel_types = {t for t in requested if t not in roots_used}
+    # 그 타입들에서 객체 필드를 따라간 닫힘. 원장 인용의 후보 이름 풀이다 —
+    # 어댑터가 부모를 요청하지 않아 하위 타입에 아예 들어가지 못한 경우도 잡는다.
+    pool_types, seen = set(), set()
+    stack = list(sel_types)
+    while stack:
+        t = stack.pop()
+        if t in seen or t in roots_used:
+            continue
+        seen.add(t)
+        if t not in sc.fields:
+            continue
+        pool_types.add(t)
+        for ft in sc.fields[t].values():
+            if sc.kind_of(ft) in ("object", "interface"):
+                stack.append(ft)
+    pool = {}
+    for t in sorted(pool_types):
+        for f in sc.fields.get(t, {}):
+            pool.setdefault(f, []).append(t)
+    req_all = {f for s in requested.values() for f in s}
+
+    rows, lfmt = ([], None)
+    if ledger:
+        rows, lfmt = read_ledger(ledger)
+    migrated = [r for r in rows if r[1].startswith("이관됨")]
+    ledger_bad = []
+    for rid, state, note in migrated:
+        for name in sorted(cited_names(state, note, pool)):
+            if name not in req_all:
+                ledger_bad.append((rid, name, ",".join(pool[name])))
+
+    exposed, held = [], 0
+    for t in sorted(sel_types):
+        for f in sorted(set(sc.fields.get(t, {})) - requested.get(t, set())):
+            if ledger and f not in {n for _r, n, _o in ledger_bad} \
+                    and not any(f in cited_names(s, nt, pool)
+                                for _i, s, nt in migrated):
+                held += 1
+                continue
+            exposed.append(f"{t}.{f}")
+
+    # ------------------------------------------------------------- 출력
+    print(f"# 스키마 {schema_dir}  [파일 {len(sc.files)}개 · 타입 "
+          f"{len(sc.fields)}개 · 루트 {'·'.join(sorted(roots_used)) or '없음'}]")
+    for path, line, shape, enc, op, tree in docs:
+        print(f"# 질의 {path}:{line}  [{shape}, {enc}]  {op}")
+    for t in sorted(requested):
+        print(f"   요청  {t}: " + ", ".join(sorted(requested[t])))
+    if ledger:
+        print(f"# 원장 {ledger}  [{lfmt} · 행 {len(rows)} · 이관됨 "
+              f"{len(migrated)}]")
+    if unknown_t:
+        print("# 참고 — 스키마 디렉터리에 정의가 없는 타입을 가진 필드: "
+              + ", ".join(sorted(set(unknown_t))[:8]))
+
+    if exposed:
+        print("# 위반 · 노출되었으나 요청 안 됨 — 어댑터가 이 필드를 묻지 않는다")
+        for name in exposed:
+            print(f"   {name}")
+    if missing:
+        print("# 위반 · 요청했으나 스키마에 없음 — 이 요청은 값을 받지 못한다")
+        for name, path, line, why2 in missing:
+            print(f"   {name}\n       └ {os.path.basename(path)}:{line} · {why2}")
+    if ledger_bad:
+        print("# 위반 · `이관됨` 행이 인용한 필드가 요청 안 됨 — 규칙은 옮겨갔고 "
+              "아무도 그 값을 읽지 않는다")
+        for rid, name, owner in ledger_bad:
+            print(f"   {rid}  {name}  ({owner} 의 필드)")
+    if nofind:
+        print("# 못 찾음 · 어댑터에서 질의를 찾지 못함")
+        for path, enc, n in nofind:
+            print(f"   {path}  [{enc}, 문자열 후보 {n}개]")
+    if unsupported:
+        print("# 못 찾음 · 다루지 못하는 질의 모양")
+        for path, line, shape, why2 in unsupported:
+            print(f"   {os.path.basename(path)}:{line} [{shape}]\n       └ {why2}")
+    sys.stdout.flush()
+
+    if held:
+        print(f"# 원장 범위로 좁혀 판정 보류 {held}건 — 원장이 인용하지 않은 필드는 "
+              "다른 페이지의 것일 수 있다.", file=sys.stderr)
+    if nofind or unsupported:
+        print(f"# 못 찾았다 — 질의 없음 {len(nofind)} · 다루지 못하는 모양 "
+              f"{len(unsupported)}. 이 답은 불완전하므로 '어긋남 없음'이 아니다.",
+              file=sys.stderr)
+        return 3
+    bad = len(exposed) + len(missing) + len(ledger_bad)
+    if bad:
+        print(f"# 위반 {bad}건 — 노출-요청안됨 {len(exposed)} · 요청-스키마없음 "
+              f"{len(missing)} · 원장인용-요청안됨 {len(ledger_bad)}", file=sys.stderr)
+        return 1
+    print(f"# 질의 {len(docs)}개에서 필드 {len(req_all)}개를 요청했고 어긋남 0건 "
+          "— '못 찾았다'가 아니라 '없다'.", file=sys.stderr)
+    if not ledger:
+        print("# 원장 없이 돈 판정이다. `이관됨` 행이 인용한 필드 검사는 "
+              "--ledger 가 있어야 돈다.", file=sys.stderr)
+    return 0
+
+
 # --------------------------------------------------------------------- cli
 
 def main(argv):
@@ -915,7 +1493,7 @@ def main(argv):
         i += 1
 
     if not rest:
-        die("하위 명령이 없다. lint · pin · check · callers 중 하나여야 한다.")
+        die("하위 명령이 없다. lint · pin · check · callers · fields 중 하나여야 한다.")
     cmd, args = rest[0], rest[1:]
     cfg, where, proj = load_cfg(cfg_path)
 
@@ -980,7 +1558,36 @@ def main(argv):
             die("사용법: phpseam callers <symbol> [--allow-file f]... [--scope dir]")
         return cmd_callers(pos[0], cfg, where, allow, scope, proj, cfg_path)
 
-    die(f"모르는 하위 명령 {cmd!r}. lint · pin · check · callers 중 하나여야 한다.")
+    if cmd == "fields":
+        schema, ledger, adapters = None, None, []
+        j = 0
+        while j < len(args):
+            a = args[j]
+            if a in ("--schema", "--ledger"):
+                j += 1
+                if j >= len(args):
+                    die(f"{a} 뒤에 경로가 없다")
+                if a == "--schema":
+                    schema = args[j]
+                else:
+                    ledger = args[j]
+            elif a == "--adapter":
+                # 파일 여럿을 받는다. 다음 플래그를 만나면 멈춘다.
+                j += 1
+                if j >= len(args) or args[j].startswith("-"):
+                    die("--adapter 뒤에 파일이 없다")
+                while j < len(args) and not args[j].startswith("-"):
+                    adapters.append(args[j])
+                    j += 1
+                continue
+            elif a.startswith("-"):
+                die(f"모르는 옵션 {a}")
+            else:
+                die(f"위치 인자를 받지 않는다: {a} — 파일은 --adapter 뒤에 온다")
+            j += 1
+        return cmd_fields(schema, adapters, ledger, where, cfg_path, proj)
+
+    die(f"모르는 하위 명령 {cmd!r}. lint · pin · check · callers · fields 중 하나여야 한다.")
 
 
 if __name__ == "__main__":

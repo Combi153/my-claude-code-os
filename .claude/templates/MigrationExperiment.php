@@ -40,6 +40,31 @@
  *   absent under one of them, which would pin that runtime to legacy forever with
  *   no error and no failing test. The switch helper carries the measurement.
  *
+ * TWO MEASUREMENT ENVELOPES ON TOP OF THE MODES (set by `slicecheck`, never by hand)
+ *   NOISE_ENV non-empty     legacy vs legacy. The control runs twice and is compared
+ *                           against itself, the log line is marked `noise`, and the
+ *                           control value is returned. The toggle stays `legacy`, so
+ *                           the page is exactly as it was. This measures the noise
+ *                           FLOOR: the diff keys that move between two runs of the
+ *                           same code (clocks, session tokens, another team writing
+ *                           rows). Without it, an equivalence loop cannot tell its own
+ *                           jitter from a missing rule, and the cheapest way to close
+ *                           the loop becomes ignoring keys until it is quiet.
+ *   POISON_ENV non-empty    Only in `migrated`. The control still RUNS - every side
+ *                           effect it has happens exactly as before - but its return
+ *                           value is thrown away and replaced by the marker, and the
+ *                           candidate's value is what the page binds. Then a golden
+ *                           capture must be BYTE-IDENTICAL to the migrated baseline.
+ *                           Two different leaks turn that red: a wrapper or page that
+ *                           still derives a rendered value from the control's return
+ *                           (it renders the marker), and a legacy body that writes
+ *                           screen state as a side effect (it runs here and did not in
+ *                           the baseline, so the screen moves). What it cannot see is a
+ *                           side effect that is byte-identical to what the candidate
+ *                           produces; that one belongs to the executed-lines check.
+ *                           The legacy body is not edited, so its pinned hash holds -
+ *                           `slicecheck` re-checks the pin inside the same stage.
+ *
  * WHY THE CANDIDATE'S EXCEPTIONS ARE SWALLOWED IN DUAL MODE
  *   The new path is designed to fail loudly rather than fall back, because a silent
  *   fallback returns 200 with an empty list and paints a failure green. Dual mode
@@ -74,6 +99,16 @@ class MigrationExperiment
     /** Must equal legacy.dualRun.logEnvVar in workspace.json. */
     const LOG_ENV = 'MIGRATION_EXPERIMENT_LOG';
 
+    /**
+     * Must equal legacy.dualRun.noiseEnvVar / .poisonEnvVar in workspace.json.
+     * Only `slicecheck` sets these, and it clears them again in the same stage.
+     * Both are OFF for every value that is unset or empty - the same fail-safe
+     * shape as the toggle, for the same reason: a measurement envelope left on by
+     * accident must not be able to change what a page returns.
+     */
+    const NOISE_ENV = 'MIGRATION_EXPERIMENT_NOISE';
+    const POISON_ENV = 'MIGRATION_EXPERIMENT_POISON';
+
     const MAX_LINE = 65536;
     const MAX_DEPTH = 32;
 
@@ -87,13 +122,95 @@ class MigrationExperiment
                                $ignoreKeys = array(), $context = array())
     {
         $mode = self::mode($envVar);
+
+        // Noise floor. Deliberately ahead of the mode dispatch: the toggle must stay
+        // `legacy` while it is measured, and `legacy` returns before reaching dual().
+        $noise = self::env(self::NOISE_ENV);
+        if ($noise !== null) {
+            $context['noise'] = true;
+            return self::dual($name, $control, $control, $ignoreKeys, $context);
+        }
+
         if ($mode === 'legacy') {
             return call_user_func($control);
         }
         if ($mode === 'migrated') {
+            $poison = self::env(self::POISON_ENV);
+            if ($poison !== null) {
+                return self::poisoned($name, $control, $candidate, $poison, $context);
+            }
             return call_user_func($candidate);
         }
         return self::dual($name, $control, $candidate, $ignoreKeys, $context);
+    }
+
+    /** An env var's value, or null when it is unset or empty. */
+    private static function env($name)
+    {
+        $raw = getenv($name);
+        if ($raw === false || $raw === '') {
+            return null;
+        }
+        return $raw;
+    }
+
+    // ---------------------------------------------------------------- poison
+
+    /**
+     * Run the control for its side effects, discard its return value, and hand the
+     * page the candidate's. Returns the candidate - poison never reaches the screen
+     * through this function's return; it reaches it only if something ELSE on the
+     * page is still deriving a rendered value from the control's return.
+     */
+    private static function poisoned($name, $control, $candidate, $marker, $context)
+    {
+        $ran = true;
+        $discarded = null;
+        try {
+            // The return value is read and then dropped on purpose. What the page
+            // gets in its place is poisonValue($marker) wherever anything still
+            // substitutes for it; here it gets the candidate's value instead.
+            $discarded = self::ser(call_user_func($control), 0);
+        } catch (Exception $e) {
+            $ran = false;                  // the body throwing is itself an observation
+        } catch (Throwable $e) {
+            $ran = false;
+        }
+        $candidateValue = call_user_func($candidate);
+        try {
+            $rec = array(
+                'ts' => date('c'),
+                'experiment' => $name,
+                'mode' => 'migrated',
+                'poison' => $marker,
+                'control_ran' => $ran,
+                'discarded_sha' => ($discarded === null
+                    ? null : hash('sha256', $discarded)),
+                'equal' => true,
+                'diff_keys' => array(),
+                'ignored_keys' => array(),
+                'truncated' => false,
+                'input' => isset($context['input']) ? $context['input'] : null,
+                'page' => self::page($context),
+                'caller' => self::caller(),
+            );
+            self::write($rec);
+        } catch (Exception $e) {
+            self::warn('log failed: ' . $e->getMessage());
+        } catch (Throwable $e) {
+            self::warn('log failed: ' . $e->getMessage());
+        }
+        return $candidateValue;
+    }
+
+    /**
+     * The value that stands in for the legacy body's return. Public so a seam wrapper
+     * that legitimately has to substitute deeper than this function can use the same
+     * marker - the capture comparison looks for these bytes and nothing else.
+     */
+    public static function poisonValue($marker)
+    {
+        return 'POISON:' . $marker;
     }
 
     /**

@@ -116,7 +116,7 @@ JSONL 한 줄이 규칙 하나이고 열마다 주인이 하나다. 분석가는
 phpseam check --pins pins.json                  # 레거시 본문 0 바이트 변경
 phpseam lint <page.php>                         # 페이지가 허용된 모양 안
 phpseam callers <symbol> --allow-file <이음새>   # 이음새 밖 호출자 없음
-phpseam fields --schema <graphqlSchemaDir> --adapter <어댑터> --ledger <원장>
+phpseam fields --adapter <어댑터> --ledger <원장>   # 스키마는 설정에서 읽는다
 ```
 
 네가 볼 것은 **무엇이** green 이 됐는지다. 판정이 BFF 에 들어갔는지(리졸버가 거르거나 정렬하거나 기본값을 정하면 모듈을 잘못 골랐다) · 도메인 규칙이 질의 어댑터에 하드코딩됐는지(조건은 완성된 채로 어댑터에 넘어가야 한다) · **아키텍처 규칙 자체가 바뀌었는지**(제약을 풀어 green 이 된 빌드는 진전으로 위장한 퇴행이다) · `의도수정`·`불가` 행마다 단위 테스트 **심볼**이 인용됐는지("테스트했다"는 문장은 인용이 아니다).

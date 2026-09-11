@@ -241,9 +241,22 @@ if not os.path.isfile(TEMPLATE):
     skip("템플릿 5.6 구문 검사", f"템플릿 없음: {TEMPLATE}")
 else:
     raw = open(TEMPLATE, "rb").read()
+    nonascii = [i for i, b in enumerate(raw) if b > 127]
+    where = ""
+    if nonascii:
+        # 어느 줄인지 말한다. "비ASCII 45바이트"만으로는 그 45바이트를 찾으러
+        # 파일 전체를 눈으로 훑어야 한다.
+        lines = sorted({raw[:i].count(b"\n") + 1 for i in nonascii})
+        where = (f"비ASCII {len(nonascii)}바이트 · {len(lines)}줄 "
+                 f"({', '.join(str(n) for n in lines[:6])}"
+                 + (" 외" if len(lines) > 6 else "") + ")")
     check("템플릿이 순수 ASCII 다 (레거시 트리는 파일마다 인코딩이 다르다)",
-          all(b < 128 for b in raw), f"비ASCII {sum(1 for b in raw if b > 127)}바이트")
-    code = re.sub(r"/\*.*?\*/", "", raw.decode("ascii"), flags=re.S)
+          not nonascii, where)
+    # `errors="replace"`. 위 검사가 빨간불일 때 이 줄이 예외로 죽으면 **뒤의 검사가
+    # 아예 돌지 않는다** — 실패 하나가 나머지 전부를 건너뛰게 만드는 것은 검사
+    # 스위트가 가질 수 있는 가장 나쁜 성질이다. 한 줄이 깨져도 5.6 구문 검사는
+    # 여전히 답할 수 있다.
+    code = re.sub(r"/\*.*?\*/", "", raw.decode("ascii", "replace"), flags=re.S)
     code = re.sub(r"//[^\n]*", "", code)
     hits = {name: len(re.findall(rx, code)) for name, rx in BANNED.items()
             if re.search(rx, code)}

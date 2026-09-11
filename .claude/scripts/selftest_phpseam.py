@@ -17,7 +17,8 @@
 토큰화하면 멈추는가 — 안 멈추면 제어 구조가 통째로 빠진 채 "위반 0건"이 나온다.
 (2) CP949 페이지의 한글 위반 원문이 깨지지 않고 나오는가 — 깨지면 사람이 그 줄을
 읽지 못한다. (3) `callers` 가 0건과 검색 실패를 구분하는가 — 못 하면 "호출자 없음"이
-스왑을 통과시킨다.
+스왑을 통과시킨다. (4) `fields` 에서 필드 하나를 요청에서 빼면 빨간불이 켜지는가 —
+안 켜지면 두 번째 슬라이스를 FAIL 시킨 결함이 다시 통과한다.
 """
 import json
 import os
@@ -429,6 +430,265 @@ else:
     rc, out, err, s = run(["callers", "fetchRows"], cfg=broken)
     check("검색이 실패하면 0건이 아니라 exit 2",
           rc == 2 and "검색" in err, f"exit={rc}", secs=s)
+
+# -------------------------------------------------------------- 5. fields
+# 이 절이 재현하는 것은 두 번째 슬라이스를 감사에서 FAIL 시킨 결함 그 자체다 —
+# 백엔드에 규칙이 있고 스키마에 필드가 있고 원장이 `이관됨` 이라고 적혀 있는데
+# 어댑터가 그 필드를 요청하지 않는 상태. 그래서 여기서 가장 중요한 사례는 통과가
+# 아니라 **필드 하나를 요청에서 뺐을 때 빨간불이 켜지는가**다. 새 검사는 신뢰하기
+# 전에 고의로 깨뜨려 본다.
+print("\n### 5. fields — 어댑터가 스키마의 그 필드를 묻는가")
+
+GQL_DIR = os.path.join(BASE, "schema")
+ADP = os.path.join(BASE, "adapter")
+os.makedirs(GQL_DIR, exist_ok=True)
+os.makedirs(ADP, exist_ok=True)
+
+# 타입·필드 이름은 이 파일이 스스로 정한다. 실제 스키마의 이름을 적으면 이 파일이
+# 회사 정보를 담게 된다. `fields` 는 이름이 아니라 두 목록의 차집합으로 판정하므로
+# 가짜 이름이어도 검사의 가치는 같다.
+SCHEMA = '''"""이 영역의 읽기 표면."""
+type Query {
+  widgets(page: Int, size: Int): WidgetPage!
+  gadgets: [Gadget!]!
+}
+
+type WidgetPage {
+  items: [Widget!]!
+  total: Int!
+}
+
+type Widget {
+  id: ID!
+  name: String
+  fooBar: Int
+  state: WidgetState!
+  ownedByAnotherPage: String
+}
+
+enum WidgetState { OPEN CLOSED }
+
+type Gadget { id: ID! label: String }
+'''
+
+# 히어독. 실제 어댑터가 가장 많이 쓰는 모양이다.
+ADP_OK = '''<?php
+$sQuery = <<<GQL
+query WidgetList($page: Int) {
+  widgets(page: $page, size: 20) {
+    items { id name fooBar state ownedByAnotherPage }
+    total
+  }
+}
+GQL;
+$aRes = $oClient->call($sQuery, array('page' => $nPage));
+'''
+# 필드 하나가 빠진 어댑터. 이것이 실제로 일어난 결함이다.
+ADP_DROP = ADP_OK.replace(" fooBar", "")
+# 원장이 인용한 필드 하나와 인용하지 않은 필드 하나가 함께 빠진 어댑터. 원장이
+# 범위를 좁히는 것을 보려면 둘이 갈라져야 한다.
+ADP_NARROW = ADP_DROP.replace(" ownedByAnotherPage", "")
+# 연결된 단일 인용 문자열
+ADP_CONCAT = '''<?php
+$sQ = 'query { widgets(page: 1) {'
+    . ' items { id name fooBar state ownedByAnotherPage }'
+    . ' total } }';
+$r = $oClient->call($sQ);
+'''
+# CP949 로 저장되는 어댑터. 한글 주석이 있고 질의는 이중 인용 문자열이다.
+ADP_CP949 = f'''<?php
+// {KOREAN} (이 주석이 CP949 로 저장된다. `-` 밖의 줄표는 CP949 에 없다)
+$sQuery = "query {{ widgets {{ items {{ id name fooBar state ownedByAnotherPage }} total }} }}";
+$aRes = $oClient->call($sQuery);   // {KOREAN}
+'''
+# 스키마에 없는 필드를 요청한다
+ADP_GHOST = '''<?php
+$sQ = 'query { widgets { items { id name fooBar state ownedByAnotherPage nope } total } }';
+'''
+# 질의가 아예 없다 (REST 호출만 한다)
+ADP_NONE = '''<?php
+$aRes = $oClient->rest('/widget/list.json', array('page' => $nPage));
+$aList = $aRes['items'];
+'''
+# 다루지 못하는 모양 — 프래그먼트
+ADP_FRAG = '''<?php
+$sQ = <<<GQL
+query { widgets { items { ...WidgetBits } total } }
+GQL;
+'''
+# 다루지 못하는 모양 — 필드 이름 자리가 보간이다
+ADP_INTERP = '''<?php
+$sQ = "query { widgets { items { id $sExtraField } total } }";
+'''
+# 질의처럼 보이는 JSON 본문. 이것을 질의로 오인하면 exit 3 이 흔해지고,
+# 흔한 exit 3 은 아무도 읽지 않는다.
+ADP_JSON = '''<?php
+$sBody = '{ "filter": { "state": "OPEN" }, "page": 1 }';
+$aRes = $oClient->post('/widget/list', $sBody);
+'''
+
+LEDGER_JSONL = (
+    '{"id":"R-01","rule":"분류를 지정하지 않으면 기본 분류가 정해진다",'
+    '"class":"도메인","src":["<page>:12-20"],"range":"12-20",'
+    '"obs":"이중실행:widget","state":"이관됨:WidgetPolicy.applyDefault (fooBar)",'
+    '"approve":null,"note":""}\n'
+    '{"id":"R-02","rule":"한 페이지에 20개","class":"화면","src":["<page>:8"],'
+    '"range":"8","obs":"골든:c1","state":"대기","approve":null,"note":""}\n'
+)
+LEDGER_MD = """# 행위 원장
+
+## 요약
+
+행 2개 · 도메인 1 · 화면 1.
+
+| ID | 규칙 | 분류 | 출처 | 관찰 | 이관 | 비고 |
+|---|---|---|---|---|---|---|
+| R-01 | 분류를 지정하지 않으면 기본 분류가 정해진다 | 도메인 | `<page>:12` | 이중실행:widget | 이관됨:WidgetPolicy.applyDefault | 응답의 fooBar 로 관찰한다 |
+| R-02 | 한 페이지에 20개 | 화면 | `<page>:8` | 골든:c1 | 대기 | |
+
+## 남은 의문
+없음.
+"""
+NOT_LEDGER = "# 원장이 아니다\n\n표가 없는 산문뿐이다.\n"
+
+with open(os.path.join(GQL_DIR, "widget.graphqls"), "w", encoding="utf-8") as fh:
+    fh.write(SCHEMA)
+for name, body in (("ok.php", ADP_OK), ("drop.php", ADP_DROP),
+                   ("concat.php", ADP_CONCAT), ("ghost.php", ADP_GHOST),
+                   ("none.php", ADP_NONE), ("frag.php", ADP_FRAG),
+                   ("interp.php", ADP_INTERP), ("json.php", ADP_JSON),
+                   ("narrow.php", ADP_NARROW)):
+    with open(os.path.join(ADP, name), "w", encoding="utf-8") as fh:
+        fh.write(body)
+with open(os.path.join(ADP, "cp949.php"), "wb") as fh:
+    fh.write(ADP_CP949.encode("cp949"))          # 트리처럼 파일마다 인코딩이 다르다
+LJ = os.path.join(BASE, "ledger.jsonl")
+LM = os.path.join(BASE, "ledger.md")
+LX = os.path.join(BASE, "notaledger.md")
+for path, body in ((LJ, LEDGER_JSONL), (LM, LEDGER_MD), (LX, NOT_LEDGER)):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(body)
+
+# `backend.graphqlSchemaDir` 이 있는 설정과 없는 설정. 같은 명령이 두 설정에서
+# 다르게 끝나는 것을 봐야 그 키가 실제로 읽히는지 알 수 있다.
+CFG_BE = os.path.join(CFG_DIR, "backend.json")
+CFG_BE_NOKEY = os.path.join(CFG_DIR, "backend-nokey.json")
+for path, backend in ((CFG_BE, {"root": BASE, "graphqlSchemaDir": "schema"}),
+                      (CFG_BE_NOKEY, {"root": BASE})):
+    doc = json.loads(json.dumps(BARE))
+    doc["legacy"].update(json.loads(json.dumps(SEAM)))
+    doc["backend"] = backend
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, ensure_ascii=False, indent=2)
+
+
+def adp(name):
+    return os.path.join(ADP, name)
+
+
+def fields(*args, cfg=CFG):
+    return run(["fields", "--schema", GQL_DIR] + list(args), cfg=cfg)
+
+
+rc, out, err, s = fields("--adapter", adp("ok.php"), "--ledger", LJ)
+check("전부 요청하는 어댑터 → exit 0, '못 찾았다'가 아니라 '없다'",
+      rc == 0 and "없다" in err and "fooBar" in out,
+      f"exit={rc}" if rc else "", secs=s)
+
+# ---- 이 절의 핵심. 필드 하나를 빼면 빨간불이 켜져야 한다.
+rc, out, err, s = fields("--adapter", adp("drop.php"), "--ledger", LJ)
+check("필드 하나를 요청에서 빼면 exit 1 (실제 결함의 재현)",
+      rc == 1 and "fooBar" in out and "R-01" in out,
+      f"exit={rc}" if rc != 1 else "", secs=s)
+
+check("세 종류를 구별해 출력한다 (노출-요청안됨 · 원장인용-요청안됨)",
+      "노출되었으나 요청 안 됨" in out and "인용한 필드가 요청 안 됨" in out
+      and "노출-요청안됨 1" in err and "원장인용-요청안됨 1" in err,
+      err.strip()[-120:] if "원장인용" not in err else "")
+
+rc, out, err, s = fields("--adapter", adp("ghost.php"), "--ledger", LJ)
+check("스키마에 없는 필드를 요청하면 exit 1 과 그 종류",
+      rc == 1 and "요청했으나 스키마에 없음" in out and "nope" in out,
+      f"exit={rc}", secs=s)
+
+rc, out, err, s = fields("--adapter", adp("cp949.php"), "--ledger", LJ)
+check("CP949 어댑터에서도 필드를 뽑는다 (utf-8 로 고정해 읽으면 조용히 사라진다)",
+      rc == 0 and "cp949" in out and "fooBar" in out,
+      f"exit={rc} " + out.strip()[-120:] if rc else "", secs=s)
+
+rc, out, err, s = fields("--adapter", adp("concat.php"), "--ledger", LJ)
+check("연결된 문자열에 흩어진 질의도 뽑는다",
+      rc == 0 and "fooBar" in out, f"exit={rc}", secs=s)
+
+# ---- 못 찾았다(3)는 어긋남 없음(0)과 절대 섞이지 않는다
+rc, out, err, s = run(["fields", "--schema", os.path.join(BASE, "no-schema-dir"),
+                       "--adapter", adp("ok.php")])
+check("스키마 디렉터리가 없으면 exit 3 (통과가 아니다)",
+      rc == 3 and "디렉터리가 없다" in err, f"exit={rc}", secs=s)
+
+rc, out, err, s = fields("--adapter", adp("none.php"))
+check("어댑터에서 질의를 못 찾으면 exit 3",
+      rc == 3 and "질의를 찾지 못함" in out, f"exit={rc}", secs=s)
+
+rc, out, err, s = fields("--adapter", adp("frag.php"))
+check("프래그먼트처럼 다루지 못하는 모양이면 exit 3 과 그 이유",
+      rc == 3 and "프래그먼트" in out, f"exit={rc}", secs=s)
+
+rc, out, err, s = fields("--adapter", adp("interp.php"))
+check("필드 자리에 보간이 있으면 exit 3 (정적으로 정해지지 않는다)",
+      rc == 3 and "보간" in out, f"exit={rc}", secs=s)
+
+rc, out, err, s = fields("--adapter", adp("json.php"))
+check("질의처럼 생긴 JSON 본문을 질의로 오인하지 않는다 (질의 없음으로 3)",
+      rc == 3 and "질의를 찾지 못함" in out and "다루지 못하는" not in out,
+      f"exit={rc}", secs=s)
+
+rc, out, err, s = fields("--adapter", adp("ok.php"),
+                         "--adapter", adp("cp949.php"), "--ledger", LJ)
+check("어댑터 여럿을 한 번에 받는다", rc == 0 and out.count("# 질의") == 2,
+      f"exit={rc} 질의={out.count('# 질의')}", secs=s)
+
+# ---- 원장
+rc, out, err, s = fields("--adapter", adp("drop.php"), "--ledger", LM)
+check("Markdown 표 원장도 읽는다 (v3 이전 원장이 이 모양이다)",
+      rc == 1 and "markdown" in out and "R-01" in out, f"exit={rc}", secs=s)
+
+rc, out, err, s = fields("--adapter", adp("ok.php"), "--ledger", LX)
+check("원장을 알아보지 못하면 인용 0건이 아니라 exit 3",
+      rc == 3 and "알아보지 못했다" in err, f"exit={rc}", secs=s)
+
+rc, out, err, s = fields("--adapter", adp("ok.php"),
+                         "--ledger", os.path.join(BASE, "nope.jsonl"))
+check("원장 파일이 없으면 exit 3", rc == 3, f"exit={rc}", secs=s)
+
+# ---- 범위. 거짓 위반을 내는 검사는 꺼진다.
+rc0, out0, err0, s0 = run(["fields", "--schema", GQL_DIR,
+                           "--adapter", adp("narrow.php")])
+rc1, out1, err1, s1 = fields("--adapter", adp("narrow.php"), "--ledger", LJ)
+check("원장이 범위를 좁힌다 — 인용 안 된 필드는 위반이 아니라 판정 보류로 센다",
+      rc0 == 1 and rc1 == 1
+      and "노출-요청안됨 2" in err0 and "노출-요청안됨 1" in err1
+      and "판정 보류" not in err0 and "판정 보류 1건" in err1,
+      f"원장없이 exit={rc0} · 원장있이 exit={rc1} · "
+      + (err1.strip().splitlines() or [""])[0][:80], secs=s0 + s1)
+
+# ---- 설정 소비처
+rc, out, err, s = run(["fields", "--adapter", adp("ok.php"), "--ledger", LJ],
+                      cfg=CFG_BE)
+check("--schema 가 없으면 backend.graphqlSchemaDir 을 읽는다",
+      rc == 0 and GQL_DIR in out, f"exit={rc}", secs=s)
+
+rc, out, err, s = run(["fields", "--adapter", adp("ok.php")], cfg=CFG_BE_NOKEY)
+check("그 키가 없으면 좁은 답을 내지 않고 어느 키인지 말하며 exit 2",
+      rc == 2 and "graphqlSchemaDir" in err, f"exit={rc}", secs=s)
+
+rc, out, err, s = fields()
+check("--adapter 가 없으면 exit 2", rc == 2 and "사용법" in err,
+      f"exit={rc}", secs=s)
+
+rc, out, err, s = fields("--adapter", adp("ok.php"), "--bogus")
+check("모르는 옵션 → exit 2", rc == 2 and "모르는 옵션" in err,
+      f"exit={rc}", secs=s)
 
 # ------------------------------------------------------------------ 정리
 shutil.rmtree(BASE, ignore_errors=True)

@@ -35,8 +35,11 @@ from _phpenc import state_dir  # noqa: E402
 
 # v2 의 도구 넷을 포함한다. 훅의 `OUR_TOOLS` 와 같은 목록이어야 한다 — 한쪽에만
 # 있는 이름은 기록되지만 전용 호출로 세어지지 않아 비율을 낮은 쪽으로 기울인다.
+# 그 "같아야 한다"를 `selftest.py` 가 세 목록에 대해 실제로 댄다. 적어만 두고
+# 검사하지 않는 동안 이 목록에서 `phpstats` 가 빠져 있었다.
 OURS = ["phpv", "phpgrep", "phpwhere", "phped", "phplint", "phpindex",
-        "phpseam", "htmlsnap", "dualrun-report", "ctxstats"]
+        "phpstats", "phpseam", "htmlsnap", "dualrun-report", "ctxstats",
+        "ctxevolve"]
 BYPASS = {"Read": "Read 툴", "raw-read": "cat·head·sed", "raw-grep": "rg·grep",
           "read-index": "인덱스 직접 읽기"}
 PAIRS = [("읽기", ["phpv"], ["Read", "raw-read"]),

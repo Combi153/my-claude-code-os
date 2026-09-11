@@ -48,7 +48,8 @@ NAME_IN_PATTERN = re.compile(r"\$?([A-Za-z_]\w{2,})")
 # v2 의 도구 넷이 여기 없는 동안, 그 도구를 부른 명령은 우회로도 전용으로도
 # 세어지지 않고 통째로 빠졌다 — 그리고 빠진 기록은 낮은 사용률로 보인다.
 OUR_TOOLS = ("phpv", "phpgrep", "phped", "phplint", "phpindex", "phpwhere",
-             "phpstats", "phpseam", "htmlsnap", "dualrun-report", "ctxstats")
+             "phpstats", "phpseam", "htmlsnap", "dualrun-report", "ctxstats",
+             "ctxevolve")
 STOP = {"function", "class", "interface", "trait", "define", "scope", "all",
         "tests", "web", "php", "inc"}
 # 인덱스는 2026-09-08 에 `.claude/.state/index/` 로 옮겼다. 옛 경로만 보는 동안
@@ -273,7 +274,7 @@ def classify(cmd, root_abs, cwd_in_tree):
             sub = ""
             if clean and re.match(
                     r"^(--?[\w-]+|open|save|discard|status|replace"
-                    r"|lint|pin|check|callers|capture|compare|corpus)$",
+                    r"|lint|pin|check|callers|fields|capture|compare|corpus)$",
                     clean[0]):
                 sub = clean[0]
             out.append((base, sub, " ".join(clean)[:60]))

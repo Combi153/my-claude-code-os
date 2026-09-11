@@ -56,7 +56,7 @@ return MigrationExperiment::run(
 phpseam check --pins <pins.json>                        # 레거시 본문 0 바이트
 phpseam lint <page>                                     # 페이지가 허용 모양 안
 phpseam callers <method> --allow-file <이음새>           # 이음새 밖 호출자 없음
-phpseam fields --schema <graphqlSchemaDir> --adapter <어댑터> --ledger <원장>
+phpseam fields --adapter <어댑터> --ledger <원장>   # 스키마는 설정에서 읽는다
 ```
 
 실패는 escalate 할 것이 아니라 당신이 고칠 것이다. 그래서 이 단계에 게이트가 없다. 올릴 만한 예외는 둘이다 — `check` 가 본문이 정말로 바뀌어야 해서 실패하는 것(Phase 1 의 질문)과 `callers` 가 아무도 몰랐던 호출자를 찾는 것(범위의 질문). 어느 쪽인지 말하고 멈춘다. **`fields` 가 exit 1 이면 그것이 이 역할이 합쳐진 이유다**: 백엔드에 규칙이 있고 스키마에 필드가 있고 테스트가 그것을 고정하는데 어댑터가 요청하지 않으면 원장의 `이관됨` 은 거짓이고 두 오라클은 영원히 초록이다. exit 3 은 **검사할 수 없었다**이고 통과가 아니다.
