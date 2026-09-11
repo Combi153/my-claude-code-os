@@ -73,13 +73,16 @@ json.dump({"legacy": {"root": CHECKOUT}, "backend": {"root": BACKEND}},
           open(CONFIG, "w"))
 
 
-def ctxfile(name, kind, agents, skills, paths, token, tools=None, body=None):
+def ctxfile(name, kind, agents, skills, paths, token, tools=None, body=None,
+            priority=None):
     lines = ["---", f"name: {name}", f"kind: {kind}", "inject:",
              f"  agents: [{', '.join(agents)}]",
              f"  skills: [{', '.join(skills)}]",
              "  paths: [" + ", ".join(f'"{p}"' for p in paths) + "]"]
     if tools:
         lines.append(f"  tools: [{', '.join(tools)}]")
+    if priority is not None:
+        lines.append(f"  priority: {priority}")
     lines += [f"token: {token}", "---", "", body or f"# {name}", "본문."]
     open(os.path.join(CTX, name + ".md"), "w",
          encoding="utf-8").write("\n".join(lines) + "\n")
@@ -154,7 +157,7 @@ check("에이전트 이름으로 주입", tokens_in(p) == {"CTX-T-ALPHA"},
       f"got={tokens_in(p)} rc={p.returncode} err={p.stderr[:120]}", s)
 
 reset()
-p, s = run(sub("backend-slice-implementer"))
+p, s = run(sub("backend-slice-builder"))
 check("대상이 아닌 에이전트에는 주입 안 함", tokens_in(p) == set(),
       f"got={tokens_in(p)}", s)
 
@@ -444,6 +447,66 @@ if os.path.isfile(CTXSTATS):
     os.remove(probe)
 else:
     check("ctxstats 가 있다", False, CTXSTATS)
+
+# ------------------------------------------------- 10. 예산과 우선순위
+# 예산을 넘길 때 **무엇이 남는가**. 담는 순서를 파일 이름에 맡기면 알파벳이 정책이
+# 되고, 그 순서의 마지막은 하필 공개 저장소 경계 파일이었다. 그래서 여기서는 예산을
+# 실제로 넘겨 본다 — 해피 패스는 이 결함을 한 번도 밟지 않는다.
+def injected_text(proc):
+    out = proc.stdout or ""
+    try:
+        return (json.loads(out).get("hookSpecificOutput")
+                or {}).get("additionalContext", "")
+    except ValueError:
+        return out
+
+
+BIG = ("예산을 채우기 위한 본문. " * 40 + "\n") * 10     # 약 14KB
+# 하나는 예산 안에 들어가고 둘은 못 들어간다 — 실제 모양(작은 파일 여섯의 합)과
+# 같은 조건이다. 한 파일만으로 예산을 넘기면 "첫 항목은 무조건 담는다" 쪽만
+# 밟고 우선순위 비교는 밟지 않는다.
+ctxfile("ya-big", "전문성", ["budget-probe"], [], [], "CTX-T-BIG", body=BIG)
+ctxfile("zz-keep", "팀", ["budget-probe"], [], [], "CTX-T-KEEP", body=BIG,
+        priority=0)
+reset()
+p, s = run(sub("budget-probe", agent_id="b1"))
+text = injected_text(p)
+check("예산 초과: 우선순위 높은 쪽이 살아남는다",
+      "CTX-T-KEEP" in text and "CTX-T-BIG" not in text,
+      f"len={len(text)} err={p.stderr[:100]!r}", s)
+check("잘린 파일 이름이 주입 블록 안에 남는다",
+      "ya-big.md" in text and "예산" in text, text[:200])
+check("주입 로그에는 담은 파일만 남는다",
+      [r["file"] for r in logs()] == ["zz-keep.md"], str([r["file"] for r in logs()]))
+
+# 프론트매터를 읽지 못한 파일도 받는 쪽에서는 "안 오는 파일"과 구별되지 않는다.
+ctxfile("zprio", "전문성", ["budget-probe"], [], [], "CTX-T-PRIO",
+        priority="높음")
+reset()
+p, s = run(sub("budget-probe", agent_id="b2"))
+text = injected_text(p)
+check("priority 가 정수가 아니면 그 사실을 블록에도 적는다",
+      "zprio" in text and "CTX-T-KEEP" in text,
+      f"err={p.stderr[:120]!r} text={text[:120]!r}", s)
+c = subprocess.run([sys.executable, HOOK, "--check"], capture_output=True,
+                   text=True, env={**os.environ, "CLAUDE_PROJECT_DIR": PROJ})
+check("priority 가 정수가 아니면 --check 가 exit 2",
+      c.returncode == 2 and "priority" in c.stdout, f"rc={c.returncode} {c.stdout[:160]}")
+for n in ("ya-big", "zz-keep", "zprio"):
+    os.remove(os.path.join(CTX, n + ".md"))
+
+# 훅만 고치고 실제 파일에 우선순위를 주지 않으면 아무것도 달라지지 않는다.
+prios = {}
+for f in files:
+    prios[f] = 50
+    for line in open(os.path.join(realdir, f), encoding="utf-8").read().splitlines():
+        s2 = line.strip()
+        if s2.startswith("priority:"):
+            prios[f] = int(s2.split(":", 1)[1].split("#")[0].strip())
+lowest = min(prios.values())
+check("실제 경계 파일이 유일하게 가장 높은 우선순위를 갖는다",
+      prios.get("team-boundary.md") == lowest
+      and sum(1 for v in prios.values() if v == lowest) == 1, str(prios))
 
 shutil.rmtree(BASE, ignore_errors=True)
 print("-" * 84)

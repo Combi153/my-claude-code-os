@@ -12,6 +12,11 @@
 빠뜨렸다는 사실이 아무 데도 남지 않는다. 훅은 ms 단위이고, 결정적이고, **주입한 것을
 로그로 남기므로 주입 자체를 테스트할 수 있다.** 이 파일이 존재하는 이유가 마지막 항목이다.
 
+예산과 우선순위. 한 번에 넣는 양에는 상한(`MAX_INJECT_BYTES`)이 있고, 넘치면 파일
+단위로 자른다. 자르는 순서는 프론트매터의 `inject.priority` 가 정한다(작을수록 먼저
+담고, 없으면 `DEFAULT_PRIORITY`). **잘린 파일 이름은 주입된 블록 머리에 남는다** —
+받는 에이전트가 자기가 무엇을 못 받았는지 알아야 하고, stderr 는 그쪽에 닿지 않는다.
+
 중복 억제. 같은 세션·같은 에이전트에 같은 파일을 두 번 주입하지 않는다. 컨텍스트는
 쓸수록 썩는 유한 자원이고, 같은 문단을 반복해 넣는 것은 그 자원을 태우면서 아무것도
 더 알려주지 않는다. 상태는 `.claude/.state/context-injected.json` 에 남는다 — 훅은
@@ -54,6 +59,16 @@ TASK_FALLBACK = False
 # 한 번에 주입할 수 있는 최대 바이트. 넘으면 파일 단위로 자른다(문단 중간에서 자르지
 # 않는다). 컨텍스트를 아끼자고 만든 장치가 컨텍스트를 태우면 안 된다.
 MAX_INJECT_BYTES = 24 * 1024
+
+# 예산이 찼을 때 **무엇을 먼저 버리는가**. 프론트매터의 `inject.priority` 가 그것을
+# 정한다 — 작을수록 먼저 담고, 없으면 이 값이다.
+#
+# 예산 안에 넣는 순서를 파일 이름에 맡기면 알파벳이 정책이 된다. 감사자에게 들어가는
+# 파일 여섯은 예산의 9할을 쓰고 있었고, 그 순서에서 마지막인 것은 공개 저장소 경계
+# 파일이었다 — 즉 예산이 넘칠 때 가장 먼저 버려지는 것이 하필 "회사 내용을 추적
+# 파일에 쓰지 말라"는 규칙이었다. 우선순위는 그 결과를 이름이 아니라 판단으로
+# 정하기 위해 있다.
+DEFAULT_PRIORITY = 50
 MAX_LOG = 5 * 1024 * 1024
 STATE_TTL = 86400
 COUNTS = "__counts"
@@ -211,6 +226,13 @@ def parse_front(text, name):
         if not isinstance(v, list):
             raise ValueError(f"{name}: `inject.{k}` 가 목록이 아니다")
         inject[k] = v
+    # 우선순위는 정수다. 숫자가 아니면 여기서 말한다 — 조용히 기본값으로 바꾸면
+    # 오타 하나가 그 파일을 예산 경계로 밀어내고, 밀려난 사실이 아무 데도 남지 않는다.
+    prio = inject.get("priority", DEFAULT_PRIORITY)
+    try:
+        inject["priority"] = int(str(prio).strip())
+    except (TypeError, ValueError):
+        raise ValueError(f"{name}: `inject.priority` 가 정수가 아니다 — {prio!r}")
     meta["inject"] = inject
     meta["body"] = body
     return meta
@@ -378,22 +400,41 @@ def match_path(items, paths, tool, cfg, project):
 
 # ---------------------------------------------------------------- 조립·출력
 
-def render(items, trigger):
-    parts = ["# 자동 주입된 컨텍스트 — `.claude/context/` "
-             f"(트리거: {trigger} · 세션·에이전트당 파일 1회)"]
+def render(items, trigger, errors=()):
+    """`(주입할 텍스트, 실제로 담은 항목)`.
+
+    **우선순위 순으로 담고, 잘린 것을 블록 안에 적는다.** 예산이 차면 그 뒤는 전부
+    잘린다 — 남은 자리에 더 작은 뒤 파일을 끼워 넣으면 우선순위가 뒤집힌다.
+
+    잘렸다는 사실은 stderr 만으로는 부족하다. exit 0 한 훅의 stderr 는 받는
+    에이전트에 닿지 않으므로, 그쪽에서는 "이 파일은 원래 안 오는 것"과 구별할 수
+    없다. 그래서 블록 머리에 한 줄로 남긴다 — 무엇을 못 받았는지 알면 직접 읽을 수
+    있고, 모르면 없는 규칙처럼 행동한다.
+    """
+    parts, kept, cut = [], [], []
     used = 0
-    kept = []
-    for it in items:
+    for it in sorted(items, key=lambda x: (x["inject"]["priority"], x["file"])):
         block = (f"\n<context name=\"{it['name']}\" kind=\"{it['kind']}\" "
                  f"token=\"{it['token']}\">\n{it['body'].rstrip()}\n</context>")
         b = len(block.encode("utf-8"))
-        if used + b > MAX_INJECT_BYTES and kept:
-            warn(f"{it['file']} 은 이번 주입에서 잘렸다(예산 {MAX_INJECT_BYTES}B)")
-            break
+        if cut or (used + b > MAX_INJECT_BYTES and kept):
+            cut.append(it["file"])
+            continue
         parts.append(block)
         used += b
         kept.append(it)
-    return "\n".join(parts), kept
+    head = ["# 자동 주입된 컨텍스트 — `.claude/context/` "
+            f"(트리거: {trigger} · 세션·에이전트당 파일 1회)"]
+    if cut:
+        warn(f"{', '.join(cut)} 은 이번 주입에서 잘렸다(예산 {MAX_INJECT_BYTES}B)")
+        head.append(f"# 예산({MAX_INJECT_BYTES}B)이 차서 넣지 못한 파일: "
+                    + ", ".join(cut)
+                    + " — 이 내용은 받지 못했으므로, 필요하면 "
+                      "`.claude/context/<파일>` 을 직접 읽어라.")
+    if errors:
+        head.append("# 읽지 못한 컨텍스트 파일이 있다(프론트매터 오류): "
+                    + " / ".join(str(e) for e in errors))
+    return "\n".join(head + parts), kept
 
 
 def emit_pre(text, updated_input=None):
@@ -456,9 +497,12 @@ def check(argv):
                 unknown.append(f"{it['file']}: 경로 글롭 `{spec}` 의 키를 설정에서 못 찾았다")
     print(f"컨텍스트 {len(items)}개 · 토큰 {len(tokens)}개"
           + (f" · 설정 문제: {problem}" if problem else ""))
-    for it in items:
+    # 우선순위 순으로 찍는다. 예산이 찰 때 잘리는 순서가 이 순서이고, 그것을 눈으로
+    # 확인할 수 있는 자리가 여기밖에 없다.
+    for it in sorted(items, key=lambda x: (x["inject"]["priority"], x["file"])):
         n = len(it["body"].splitlines())
-        print(f"  {it['file']:<30} {it['kind']:<4} {it['token']:<26} 본문 {n}줄")
+        print(f"  {it['file']:<30} {it['kind']:<4} {it['token']:<26} "
+              f"우선 {it['inject']['priority']:>3} · 본문 {n}줄")
     for d in dup:
         print(f"오류  {d}")
     for u in unknown:
@@ -555,7 +599,7 @@ def main():
             bump(state, sess, len(hits), 0, now)
             write_state(project, state)
         return
-    text, kept = render(fresh, trigger)
+    text, kept = render(fresh, trigger, errors)
     for it in kept:
         room[f"{who}|{it['name']}"] = now
         log(project, {"ts": now, "session_id": sess, "agent_id": agent_id,

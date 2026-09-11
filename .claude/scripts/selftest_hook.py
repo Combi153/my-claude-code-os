@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
-"""계측 훅 케이스. 가짜 프로젝트·가짜 트리를 향하게 해 실로그를 건드리지 않는다.
+"""계측 훅과 공개 저장소 가드의 케이스. 가짜 프로젝트·가짜 트리를 향하게 해
+실로그를 건드리지 않는다.
 
-    python3 selftest_hook.py <훅 경로>
+    python3 selftest_hook.py <php-tooling-hook.py 경로>
+
+가드 훅(`guard-company-content.py`)은 같은 디렉터리에서 찾는다. 그쪽 케이스는
+**임시 git 저장소를 실제로 만들어** 거기서 진짜로 커밋·푸시한 상태에서 훅을 부른다.
+인덱스가 비어 있는 순간이 그 가드의 결함이 살던 자리이므로, 그 순간을 흉내내지 않고
+실제로 만든다.
 
 가짜 트리의 디렉터리 이름은 이 파일이 스스로 정한다. 대상 체크아웃의 실제 이름을
 쓰면 이 파일이 회사 정보를 담게 되고, 그러면 추적될 수 없다. 가짜여도 검사의
@@ -38,7 +44,7 @@ json.dump({"legacy": {"root": CHECKOUT, "treeRoot": TREE, "treeMarker": MARKER,
 
 S = os.path.join(PROJ, ".claude", "scripts")
 for name in ("phpv", "phpgrep", "phpwhere", "phped", "phplint", "phpindex",
-             "phpseam", "htmlsnap", "dualrun-report", "ctxstats"):
+             "phpstats", "phpseam", "htmlsnap", "dualrun-report", "ctxstats"):
     open(os.path.join(S, name), "w").write("#!/usr/bin/env python3\n")
 SRC = os.path.join(TREE, SVC, "page.php")
 open(SRC, "w").write("<?php echo 1;")
@@ -193,8 +199,195 @@ one("입력이 있으면 Task 등록 상태보다 우선", [("php-seam-extractor
     extra={"agent_type": "php-seam-extractor", "agent_id": "ag-01"})
 run("Task", {"subagent_type": "php-behavior-analyst"}, event="PostToolUse")
 
-total = len(CASES) + len(extra_cases) + len(attrib_cases)
-passed = ok + sum(extra_cases) + sum(attrib_cases)
+
+# ------------------------------------------------------ 공개 저장소 가드 케이스
+# 같은 디렉터리의 `guard-company-content.py`. 이 가드가 트리거하는 명령은 셋인데
+# 검사 대상은 인덱스 하나뿐이었고, 인덱스가 비어 있는 두 명령(`commit -am` 과
+# `push`)이 한 줄도 검사되지 않은 채 통과했다. 그래서 아래 케이스는 전부 **실패
+# 경로**를 밟는다 — 인덱스가 비는 순간, 기준을 정할 수 없는 순간, 설정이 없는 순간.
+# 해피 패스는 대조군으로만 둔다(인덱스만 보는 `commit -m` 이 통과하는 것).
+print("-" * 96)
+GUARD = os.path.join(os.path.dirname(os.path.abspath(HOOK)),
+                     "guard-company-content.py")
+guard_cases = []
+
+GBASE = os.path.join(BASE, "guard")
+REPO = os.path.join(GBASE, "repo")
+OTHER = os.path.join(GBASE, "other")
+REMOTE = os.path.join(GBASE, "remote.git")
+NOUP = os.path.join(GBASE, "noupstream")
+IGNORED_DIR = "company-checkout"        # 가짜. 실제 이름을 적지 않는다
+HOST = "gate.internal.invalid"          # 예약 TLD. 실제 호스트가 아니다
+ISSUE = "TICKET-4471"                   # 가짜 트래커
+CFG = os.path.join(REPO, ".claude", "config", "redaction.json")
+PATTERNS = {"patterns": [{"name": "internal-hostname",
+                          "regex": r"\b[a-z0-9-]+\.internal\.invalid\b"},
+                         {"name": "issue-id", "regex": r"\bTICKET-\d+\b"}],
+            "allowPaths": [".claude/config/redaction.json"]}
+
+
+def git_in(repo, *args):
+    p = subprocess.run(["git", "-c", "user.email=t@example.invalid",
+                        "-c", "user.name=selftest", "-c", "commit.gpgsign=false",
+                        "-C", repo, *args],
+                       capture_output=True, text=True, timeout=60)
+    if p.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} 실패: {p.stderr.strip()}")
+    return p
+
+
+def init_repo(d, bare=False):
+    os.makedirs(d, exist_ok=True)
+    subprocess.run(["git", "init", "-q"] + (["--bare"] if bare else []) + [d],
+                   capture_output=True, text=True, timeout=60)
+    git_in(d, "symbolic-ref", "HEAD", "refs/heads/main")   # 버전 무관하게 main
+
+
+def write(path, text):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def guard(command, project=REPO):
+    body = {"tool_name": "Bash", "tool_input": {"command": command},
+            "hook_event_name": "PreToolUse", "cwd": project}
+    return subprocess.run([sys.executable, GUARD], input=json.dumps(body),
+                          capture_output=True, text=True, timeout=60,
+                          env={**os.environ, "CLAUDE_PROJECT_DIR": project})
+
+
+def gtext(p):
+    """훅이 사람에게 보이려는 문장. stdout 의 JSON 을 풀고 stderr 를 붙인다."""
+    out = ""
+    try:
+        out += json.loads(p.stdout)["hookSpecificOutput"]["additionalContext"]
+    except Exception:
+        out += p.stdout or ""
+    return out + (p.stderr or "")
+
+
+def gcase(desc, p, want_rc, needles=(), absent=(), in_stdout=()):
+    text = gtext(p)
+    ok = (p.returncode == want_rc
+          and all(n in text for n in needles)
+          and all(n not in text for n in absent)
+          and all(n in (p.stdout or "") for n in in_stdout))
+    guard_cases.append(ok)
+    no = len(CASES) + len(extra_cases) + len(attrib_cases) + len(guard_cases)
+    print(f"{no:>2} {desc:<40} {'exit ' + str(p.returncode):<26} {'':<6} "
+          + ("통과" if ok else
+             f"FAIL 기대 exit={want_rc} 필요={list(needles) + list(in_stdout)} "
+             f"금지={list(absent)} :: " + " ".join(text.split())[:180]))
+
+
+if not os.path.isfile(GUARD):
+    # 훅이 없는 것은 건너뜀이 아니다. 가드가 사라진 저장소가 초록으로 찍히면
+    # 이 파일이 막으려는 실패 모양을 이 파일이 스스로 만든다.
+    guard_cases.append(False)
+    print(f"{len(CASES) + len(extra_cases) + len(attrib_cases) + 1:>2} "
+          f"{'가드 훅이 같은 디렉터리에 있다':<40} {'없음':<26} {'':<6} FAIL {GUARD}")
+else:
+    init_repo(REPO)
+    init_repo(OTHER)
+    init_repo(NOUP)
+    init_repo(REMOTE, bare=True)
+    write(os.path.join(REPO, ".gitignore"),
+          f"/{IGNORED_DIR}/\nhandoff/\n/.claude/config/redaction.json\n")
+    write(CFG, json.dumps(PATTERNS, ensure_ascii=False))
+    write(os.path.join(REPO, "docs", "clean.md"), "# 깨끗한 문서\n본문 한 줄.\n")
+    git_in(REPO, "add", ".gitignore", "docs/clean.md")
+    git_in(REPO, "commit", "-q", "-m", "baseline")
+    git_in(REPO, "remote", "add", "origin", REMOTE)
+    git_in(REPO, "push", "-q", "-u", "origin", "main")
+
+    # (1) 인덱스 — 예전에도 걸리던 경로. 대조를 위해 남긴다
+    # 줄마다 첫 매치만 보고한다(줄당 break). 그래서 두 패턴이 각각 보고되는지
+    # 보려면 두 줄이어야 한다 — 한 줄에 몰아넣으면 뒤 패턴의 보고를 확인할 수 없다.
+    write(os.path.join(REPO, "docs", "leak.md"),
+          f"운영 호스트는 {HOST} 이다.\n관련 티켓은 {ISSUE} 이다.\n")
+    git_in(REPO, "add", "docs/leak.md")
+    gcase("git add: 인덱스의 유출을 막는다", guard("git add docs/leak.md"), 2,
+          ["인덱스", "issue-id"])
+    git_in(REPO, "reset", "-q")
+    os.remove(os.path.join(REPO, "docs", "leak.md"))
+
+    # (2)~(4) 인덱스는 비어 있고 유출은 작업 트리에만 있다
+    write(os.path.join(REPO, "docs", "clean.md"),
+          f"# 깨끗한 문서\n운영 호스트 {HOST} 를 적었다.\n")
+    gcase("commit -m: 인덱스만 커밋되므로 통과 (대조군)",
+          guard('git commit -m "x"'), 0, absent=["internal-hostname"])
+    gcase("commit -am: 작업 트리를 검사해 막는다",
+          guard('git commit -am "x"'), 2, ["작업 트리", "internal-hostname"])
+    gcase("복합 명령 뒤쪽의 git 도 따로 본다",
+          guard('echo hi && git commit -am "x"'), 2, ["작업 트리"])
+
+    # (5) 유출을 **지우는** 변경은 막지 않는다. 추가된 줄만 읽는다는 성질이
+    #     작업 트리 검사에도 그대로 붙어 있는지 본다.
+    git_in(REPO, "add", "docs/clean.md")
+    git_in(REPO, "commit", "-q", "-m", "leak lands")
+    write(os.path.join(REPO, "docs", "clean.md"),
+          "# 깨끗한 문서\n호스트 줄을 지웠다.\n")
+    gcase("commit -am: 유출을 지우는 변경은 막지 않는다",
+          guard('git commit -am "지움"'), 0, absent=["internal-hostname"])
+
+    # (6) push — 커밋은 이미 있고 인덱스는 비어 있다
+    gcase("push: 원격에 없는 커밋을 검사해 막는다", guard("git push"), 2,
+          ["origin/main..HEAD", "internal-hostname"])
+
+    # (7) 기준을 정할 수 없을 때. 통과시키지 않고 이유를 말한다
+    write(os.path.join(NOUP, "note.md"), f"티켓 {ISSUE}\n")
+    git_in(NOUP, "add", "note.md")
+    git_in(NOUP, "commit", "-q", "-m", "x")
+    gcase("push: 기준을 못 정하면 막고 무엇이 없는지 말한다",
+          guard("git push", project=NOUP), 2,
+          ["기준", "@{upstream}", "origin/main", "통과가 아닙니다"],
+          absent=["redaction.example.json"])
+
+    # (8)~(9) 설정이 없을 때. 내용 검사는 막고, 경로 검사는 그대로 돈다
+    os.rename(CFG, CFG + ".bak")
+    gcase("redaction 설정이 없으면 막는다", guard("git add docs/clean.md"), 2,
+          ["한 줄도", "redaction.example.json"])
+    write(os.path.join(REPO, IGNORED_DIR, "note.md"), "회사 내용 한 줄\n")
+    git_in(REPO, "add", "-f", IGNORED_DIR + "/note.md")
+    gcase("설정이 없어도 경로 검사는 돈다",
+          guard("git add -f " + IGNORED_DIR + "/note.md"), 2,
+          ["회사 경로", IGNORED_DIR, "redaction.example.json"])
+    git_in(REPO, "reset", "-q")
+    os.rename(CFG + ".bak", CFG)
+
+    # (10)~(11) 설정은 있지만 아무것도 보지 못하는 상태
+    write(CFG, json.dumps({"patterns": []}))
+    gcase("패턴이 0개면 막는다", guard("git add docs/clean.md"), 2,
+          ["0개", "redaction.example.json"])
+    write(CFG, json.dumps({"patterns": [{"name": "half-open",
+                                         "regex": "[unclosed"}]}))
+    gcase("패턴 컴파일 실패는 이름을 말하고 막는다",
+          guard("git add docs/clean.md"), 2, ["half-open", "컴파일"])
+    write(CFG, json.dumps(PATTERNS, ensure_ascii=False))
+
+    # (12) 공개하지 않는 명령은 트리거가 아니다
+    gcase("git status 는 트리거가 아니다", guard("git status"), 0,
+          absent=["공개 저장소 가드"])
+
+    # (13) 다른 저장소를 향한 명령. 판정하지 않았다는 사실이 **Claude 가 보는
+    #      자리**(stdout 의 additionalContext)에 남아야 한다 — exit 0 의 stderr 는
+    #      그쪽에 닿지 않으므로, stderr 만으로는 검사한 것과 구별되지 않는다.
+    write(os.path.join(OTHER, "note.md"), f"{HOST}\n")
+    git_in(OTHER, "add", "note.md")
+    gcase("다른 저장소 대상이면 판정하지 않았다고 말한다",
+          guard(f"git -C {OTHER} commit -am x"), 0,
+          ["판정하지 않았습니다"], in_stdout=["additionalContext"])
+
+    # (14) `-C` 를 확정할 수 없으면 막는다. 셸 변수는 훅에 펼쳐지지 않은 채로 오고,
+    #      그 저장소가 이 공개 저장소일 수도 있다 — 모르는 상태를 통과로 내보내지
+    #      않는 것이 이 가드가 이미 한 번 고친 결함이다.
+    gcase("-C 가 셸 변수면 확정할 수 없다고 막는다",
+          guard('git -C "$REPO" commit -am x'), 2,
+          ["확정할 수 없습니다", "절대경로를 리터럴로", "통과가 아닙니다"])
+
+total = len(CASES) + len(extra_cases) + len(attrib_cases) + len(guard_cases)
+passed = ok + sum(extra_cases) + sum(attrib_cases) + sum(guard_cases)
 shutil.rmtree(BASE, ignore_errors=True)
 print("-" * 96)
 print(f"{passed}/{total} 통과")
