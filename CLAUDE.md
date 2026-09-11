@@ -25,14 +25,18 @@ A migration OS: it moves the backend half of a legacy PHP service into Spring/Ko
 
 Those need different oracles. An equivalence oracle answers the first. It cannot answer the second, because when PHP still computes a rule and the backend is never asked, the observable outcome is identical and every check stays green. So a slice is done only when equivalence is green **and** a completeness pass says every domain rule left PHP.
 
-v2 puts both oracles at the same height — a **seam service function** per page. 동등성은 그 함수 안의 **이중 실행**(레거시 본문과 새 백엔드를 둘 다 실행해 비교하고, 화면에는 언제나 레거시 값을 돌려준다)과 PHP 내부 리팩터를 지키는 **골든 마스터**가 답한다. 완전성은 **구조 린트 · 본문 해시 고정 · 호출자 전수**가 먼저 답하고, 감사자에게는 분류와 배치의 판단만 남는다. e2e 는 이제 스모크다.
+두 오라클을 같은 높이에 두는 것이 **페이지마다 하나인 이음새 서비스 함수**다. 동등성은 그 함수 안의 **이중 실행**(레거시 본문과 새 백엔드를 둘 다 실행해 비교하고, 화면에는 언제나 레거시 값을 돌려준다)과 PHP 내부 리팩터를 지키는 **골든 마스터**가 답한다. 완전성은 **구조 린트 · 본문 해시 고정 · 호출자 전수 · 필드 대조**가 먼저 답하고, 감사자에게는 분류와 배치의 판단만 남는다. e2e 는 스모크다.
 
-Both oracles join on the **behavior ledger**: the numbered list of rules a slice enforces, each classified 도메인 / 화면 / 경계, each carrying its source, its observation, and its migration state. 계약은 `.claude/context/ledger-contract.md`, 포맷 정본은 `.claude/skills/legacy-slice/references/ledger-format.md`. 도메인 문서도 이 원장에서 나온다 — 그래서 그 문서가 계속 참인 것이고, 그것이 별도 프로젝트가 아니라 작업의 부산물인 이유다.
+정적 검사는 각각 한 층만 보므로 층이 하나 생기면 사각지대가 하나 생긴다. v1 은 규칙이 이음새 위에 있어서, v2 는 규칙이 백엔드에 있는데 어댑터가 그 필드를 요청하지 않아서 실패했다. **v3 는 층에 무관한 검사를 더한다** — `migrated` 모드에서 래퍼의 레거시 반환값을 독으로 바꿔도 화면이 그대로면 그 값은 백엔드에서 왔다.
+
+Both oracles join on the **behavior ledger**: 슬라이스가 지키는 규칙의 목록이고, v3 부터 **JSONL 한 줄이 규칙 하나**다. 행마다 분류(도메인 / 화면 / 경계)·출처·줄 범위·필요 픽스처·관찰·이관 상태·승인이 있고 **열마다 주인이 하나**다. 계약은 `.claude/context/ledger-contract.md`, 포맷 정본은 `.claude/skills/legacy-slice/references/ledger-format.md`. 도메인 문서도 이 원장에서 나온다 — 그래서 그 문서가 계속 참인 것이고, 그것이 별도 프로젝트가 아니라 작업의 부산물인 이유다.
+
+**v3 는 축소다(2026-09-11).** 회차 길이의 원인이 슬라이스 크기가 아니라 Phase 일정에 박힌 고정 비용임을 확인하고, 작업 단위를 **이음새 함수 하나(페이지 하나)** 로 내렸다. 비싼 산출물(설계·도메인 문서)은 **영역 단위 살아있는 문서**가 되어 여러 페이지가 나눠 쓰고, 기계 절차는 `slicecheck` 와 `state.json` 이 진다. 그리고 회차가 회차를 가르치는 장치가 들어왔다 — **근거를 인용한 역할별 저널**과 **사람이 diff 로 승인하는 컨텍스트 델타**. 근거 없는 자기 반성은 하네스를 나쁘게 만든다는 측정이 그 규칙의 이유다. 검토 근거는 `docs/reviews/2026-09-11-os-shape-review.md`, 설계는 `docs/legacy-migration-os.md` 1.6장.
 
 | 스킬 | |
 |---|---|
-| `legacy-slice` | 오케스트레이터. Phase 0–8, 루프 5개, 사람 게이트 2개(G1 추출 계획 · G2 설계), 기계 게이트 2개 |
-| `slice-scout` | 다음에 옮길 슬라이스 선정 |
+| `legacy-slice` | 오케스트레이터. Phase 0–7, 루프 5개, 사람이 멈추는 곳 3개(묻는 단계 · G1 추출 계획 · G2 설계), 기계 게이트 2개 |
+| `slice-scout` | 다음에 옮길 페이지 선정 (호출자 전수는 영역 API 설계의 입력이다) |
 | `golden-master` | 화면 HTML 골든 마스터 캡처·비교 |
 | `dual-run` | 이음새 이중 실행 배선과 불일치 보고 |
 | `boundary-audit` | 도메인 로직이 화면에 남아있는지 감사 (슬라이스별 / 표면 훑기) |
@@ -46,22 +50,33 @@ Both oracles join on the **behavior ledger**: the numbered list of rules a slice
 | 서브에이전트 | Phase |
 |---|---|
 | `php-seam-extractor` | 1 — 이음새 추출 (계획 / 추출 두 모드) |
-| `php-behavior-analyst` | 2 — 행위 원장과 커버리지 표 |
-| `php-rule-redteam` | 2 — 원장 반증 (라운드 수는 depth 가 정한다) |
-| `equivalence-corpus-author` | 2 — `필요 픽스처` → 골든 corpus, 원장 `관찰` 열 |
-| `backend-slice-designer` | 3 — 규칙 배치·부재 점검표·교정표 |
-| `backend-slice-implementer` | 4 — Kotlin/Spring 구현 |
-| `php-swap-engineer` | 5 — 실험 스위치와 페이지별 어댑터 |
-| `domain-boundary-auditor` | 7 — 분류·배치 판정 (판정 어휘 여섯의 정본) |
-| `domain-scribe` | 8 — 영역 단위 도메인 문서 |
+| `php-behavior-analyst` | 2 — 행위 원장(JSONL). 커버리지는 행의 `range` 열이다 |
+| `php-rule-redteam` | 2 — 원장 반증. **v3 에서 기본 0 라운드**이고 근거가 있을 때 켠다 |
+| `equivalence-corpus-author` | 2 — 행의 `fixture` → 골든 corpus, 원장 `obs` 열 |
+| `backend-slice-designer` | 3 — 영역 설계에 대한 **델타**. 규칙 배치·부재 점검·교정표 |
+| `backend-slice-builder` | 4 — Kotlin/Spring 구현 + 실험 스위치·페이지 어댑터 배선 (v3 에서 둘을 합쳤다) |
+| `domain-boundary-auditor` | 6 — 분류·배치 판정 (판정 어휘 여섯의 정본) |
+| `domain-scribe` | 7 — 영역 단위 도메인 문서. **N 페이지마다** 부른다 |
 
-Models are assigned by role: judgment-heavy roles (분석·반증·설계·감사) run on opus, pattern-following roles (코퍼스·구현·문서) on sonnet. 오케스트레이터는 에이전트에게 산출물 파일명을 외우게 하지 않는다 — 절대경로를 프롬프트로 넘긴다.
+Models are assigned by role: judgment-heavy roles (분석·반증·설계·감사·구현) run on opus, pattern-following roles (코퍼스·문서) on sonnet. 오케스트레이터는 에이전트에게 산출물 파일명을 외우게 하지 않는다 — 절대경로를 프롬프트로 넘긴다.
+
+**성장 규칙(v3).** 장치 하나는 관찰된 실패 하나에 대응하고, 설계 정본에 먼저 적히며, **그 장치가 대체하는 산문은 같은 변경에서 지운다.** 구속력 있는 상한은 주입 예산이고(`selftest_budget.py` 가 어떤 소비처도 90% 를 넘지 않는지 본다), 줄 수는 게이트가 아니라 냄새다. 상한을 조용히 넘기는 것은 제약을 풀어 green 을 만드는 것과 같으므로, 지울 것이 없으면 규칙을 정본에서 고친다.
 
 The design and the reasoning behind it — decisions, loops, gates, open questions — live in `docs/legacy-migration-os.md`. That document is maintained as the design changes; edit it before changing the skills, not after.
 
+## 목표 수렴 루프 (goal-loop)
+
+마이그레이션 OS 와 별개로 도는 스킬 하나. 정량 목표 하나("E2E 전체 수행 시간을 5분 이하로")를 받아 달성될 때까지 서브에이전트를 라운드마다 교체하며 돌린다. 중심은 **작업하는 쪽과 재는 쪽의 분리**다 — 서브에이전트의 "완료했습니다"는 판정 근거가 아니고, 오케스트레이터가 라운드마다 게이지 명령을 자기 손으로 돌려 판정한다.
+
+게이지는 다섯 값이다: 측정 명령 · 파싱 · 임계값과 방향 · **불변 조건 명령** · confirm 횟수. 불변 조건이 없는 게이지는 만들지 않는다 — 어떤 지표든 가장 싼 해법은 측정 자체를 약화시키는 것이고(스펙 삭제·skip·타임아웃 증가), 지표만 있는 루프는 반드시 그리로 수렴한다.
+
+개선은 프롬프트가 아니라 **저널**에서 온다. 프롬프트는 라운드마다 동일하고 달라지는 것은 `.claude/loop/<작업>/` 에 쌓인 기록뿐이다. 흐름은 한쪽으로만 간다: 오케스트레이터가 쓴 `state.json` 을 서브에이전트가 읽고, 서브에이전트가 쓴 저널을 다음 서브에이전트가 읽는다. 오케스트레이터는 저널을 읽지 않는다. 멈추는 이유는 셋뿐이다(달성·상한·측정 불가 2회 연속). 정체와 회귀는 멈춤이 아니라 다음 라운드가 읽는 정보다.
+
+`.claude/loop/` 는 대상이 회사 코드일 수 있으므로 추적하지 않는다. 오케스트레이터는 `goal-loop`, 서브에이전트는 `goal-gauge-author`(계측 한 번)와 `goal-loop-worker`(라운드마다 새로).
+
 ## 도구 · 훅 · 컨텍스트
 
-`.claude/scripts/` 에 도구 열하나. 여섯은 레거시 트리를 답할 수 있게 만들고(읽기·검색·정의 조회·인덱스·왕복 편집·문법 검사), `phpstats` 는 그것들이 실제로 쓰였는지 보고하며, 넷은 v2 의 것이다 — `phpseam`(모양·본문 해시·호출자), `htmlsnap`(캡처·비교), `dualrun-report`(불일치 집계), `ctxstats`(주입 계측). 전부 같은 실패를 막으려고 있다: **답을 찾지 못한 도구가 "답이 없다"고 보고하는 것.** 무엇이고 왜인지는 `docs/php-legacy-tooling.md`, 어떻게 부르는지는 `php-legacy-io`·`php-legacy-trace`.
+`.claude/scripts/` 에 도구 열셋. 여섯은 레거시 트리를 답할 수 있게 만들고(읽기·검색·정의 조회·인덱스·왕복 편집·문법 검사), `phpstats` 는 그것들이 실제로 쓰였는지 보고하며, 넷은 v2 의 것이다 — `phpseam`(모양·본문 해시·호출자·**필드 대조**), `htmlsnap`(캡처·비교), `dualrun-report`(불일치 집계), `ctxstats`(주입 계측). 둘은 v3 의 것이다 — `slicecheck`(기계 절차 일곱 단계와 `state.json`), `ctxevolve`(저널 → 컨텍스트 개정 제안. **적용하지 않는다**). 전부 같은 실패를 막으려고 있다: **답을 찾지 못한 도구가 "답이 없다"고 보고하는 것.** 무엇이고 왜인지는 `docs/php-legacy-tooling.md`, 어떻게 부르는지는 `php-legacy-io`·`php-legacy-trace`.
 
 `.claude/scripts/selftest.py` 는 도구·훅·계측과 교차 검사(감사 어휘 ↔ 라우팅표, 산출물 표 ↔ `artifacts.json`, 실험 헬퍼 상수 ↔ 설정 키, 컨텍스트 주입 대상, 옛 이름 부재)를 한 번에 돌린다. 그중 하나라도 건드렸으면 돌린다. 인자가 없고 검사마다 걸린 시간을 찍는다 — 정확하지만 느린 도구는 우회되고, 그 우회는 로그에 설계 문제처럼 보인다.
 

@@ -2,7 +2,7 @@
 name: legacy-tree
 kind: 전문성
 inject:
-  agents: [php-seam-extractor, php-behavior-analyst, php-rule-redteam, php-swap-engineer, domain-boundary-auditor]
+  agents: [php-seam-extractor, php-behavior-analyst, php-rule-redteam, backend-slice-builder, domain-boundary-auditor]
   skills: [php-legacy-io, php-legacy-trace, php-legacy-map, slice-scout, boundary-audit]
   paths: ["${legacy.root}/**"]
 token: CTX-LEGACY-TREE-7f3a

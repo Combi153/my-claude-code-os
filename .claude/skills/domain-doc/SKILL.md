@@ -19,7 +19,7 @@ That single constraint is what makes the resulting document trustworthy, and the
 
 1. Read `.claude/config/workspace.json` for the docs root. Slices live under
    `<docs.root>/<docs.slicesDir>/<slice-id>/`.
-2. Collect the ledgers for the area — `01-ledger.md` in each slice directory. A domain
+2. Collect the ledgers for the area — `01-ledger.jsonl` in each slice directory. A domain
    area usually spans several slices, and the document is per *area*, not per slice.
 3. If a document for the area already exists, read it. You are revising in place.
    Two documents about one area is how a single source of truth dies.

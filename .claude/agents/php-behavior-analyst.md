@@ -70,17 +70,17 @@ At the end of the ledger, one table per service function:
 
 The phase does not close while 미커버 is non-zero. That is the stopping rule the orchestrator reads — not your confidence. Coverage is checkable; confidence is not, and the first run showed that a ledger can be 85 rows deep and still be missing the rule that fails the audit.
 
-## `필요 픽스처` 절 — 다음 담당이 읽는 곳
+## 행의 `fixture` 열 — 다음 담당이 읽는 곳
 
-Also at the end: one line per rule ID saying **what input or data state has to exist for that rule to fire**. Concretely — a keyword containing a backslash, a category with no rows, a missing key rather than an empty one, an account of a particular kind. The corpus author reads this section and turns it into capture entries; a rule with no line here gets no observation and lands on the audit instead.
+행마다 `{need, surface, exists}` 를 쓴다. `need` 는 **그 규칙이 발동하려면 어떤 입력이나 데이터 상태가 있어야 하는가**를 구체적으로 쓴 것이다 — 역슬래시가 든 검색어, 행이 하나도 없는 분류, 빈 키가 아니라 아예 없는 키, 특정 종류의 계정. 관찰 담당이 이것을 읽어 캡처 항목으로 옮기므로, 이 열이 빈 행은 관찰을 못 받고 감사로 넘어간다.
 
-If a rule genuinely cannot be provoked in the local environment, say that here in one line — as a **fact about the fixture**, not as a verdict. **You do not write the `관찰` column and you do not declare a rule `불가`.** That column belongs to the corpus author, who has the capture tool and the dual-run log in front of them. An analyst who pre-writes `불가` closes off fixtures that could have been planted, and nothing downstream reopens them.
+로컬 환경에서 정말로 발동시킬 수 없으면 `exists: false` 로 적고 `need` 에 왜인지를 쓴다 — **픽스처에 대한 사실**로 쓰고 판정으로 쓰지 않는다. **당신은 `obs` 열을 쓰지 않고 어떤 행도 `불가` 로 선언하지 않는다.** 그 열은 캡처 도구와 이중 실행 로그를 앞에 둔 관찰 담당의 것이다. 분석가가 `불가` 를 미리 쓰면 심을 수 있었던 픽스처가 닫히고, 아래 단계의 무엇도 그것을 다시 열지 않는다.
 
 ## Additional findings to record
 
 Below the table, keep these sections:
 
-- **파일 인코딩 표** — every file you read, with its measured encoding. The swap engineer needs it; this tree is not uniformly encoded and two files in the same directory differ.
+- **파일 인코딩 표** — every file you read, with its measured encoding. The builder needs it; this tree is not uniformly encoded and two files in the same directory differ.
 - **데이터 접근 표** — schemas, tables or endpoints, and which are read vs written.
 - **외부 의존 표** — outbound calls with endpoint and purpose, including what a shared constructor opens whether or not the page uses it.
 - **관찰된 결함** — bugs and injection risks you found. **Record all of them.** The default is now to correct a defect rather than reproduce it, so an unrecorded defect is a defect that ships twice. You do not decide: the design proposes 교정 or 보존 per defect and the human gate settles it. Write what the defect is, what the correct behavior would be, and how you would notice it in production — that is what the decision gets made on.
@@ -118,7 +118,7 @@ Below the table, keep these sections:
 - **Do not fix anything.** You are read-only on the legacy tree.
 - **Do not stop at the service function.** Guards, parse blocks, templates and callers all carry rules, and the coverage table is what proves you went there.
 - **Do not close with 미커버 rows.** Report them; the loop re-enters.
-- **Do not write the `관찰` or `이관` columns.** They belong to the corpus author and the implementer. Leave them `대기`.
+- **Do not write the `obs` or `state` 열s.** They belong to the corpus author and the implementer. Leave them `대기`.
 
 ## Output
 

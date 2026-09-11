@@ -2,7 +2,7 @@
 name: backend-architecture
 kind: 도메인
 inject:
-  agents: [backend-slice-designer, backend-slice-implementer, domain-boundary-auditor]
+  agents: [backend-slice-designer, backend-slice-builder, domain-boundary-auditor]
   skills: []
   paths: ["${backend.root}/**"]
 token: CTX-BACKEND-ARCH-3e07

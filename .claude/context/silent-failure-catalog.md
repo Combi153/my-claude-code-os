@@ -2,7 +2,7 @@
 name: silent-failure-catalog
 kind: 전문성
 inject:
-  agents: [php-rule-redteam, backend-slice-designer, domain-boundary-auditor]
+  agents: [php-rule-redteam, backend-slice-designer, domain-boundary-auditor, php-behavior-analyst, php-seam-extractor]
   skills: [slice-scout, local-stack]
   paths: []
 token: CTX-SILENT-FAIL-8b73

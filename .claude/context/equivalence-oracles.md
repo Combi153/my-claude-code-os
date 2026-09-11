@@ -2,7 +2,7 @@
 name: equivalence-oracles
 kind: 전문성
 inject:
-  agents: [php-seam-extractor, php-swap-engineer, equivalence-corpus-author]
+  agents: [php-seam-extractor, backend-slice-builder, equivalence-corpus-author]
   skills: [legacy-slice, golden-master, dual-run, local-stack]
   paths: []
 token: CTX-EQUIV-ORACLES-6d52
@@ -36,7 +36,9 @@ token: CTX-EQUIV-ORACLES-6d52
 
 토글은 **한 곳에서만** 만진다. 두 관찰이 같은 프로세스를 공유하므로 병렬로 바꾸면 어느 쪽 결과인지 알 수 없다.
 
-그리고 **설정한 값이 아니라 관찰된 값을 믿는다.** 설정 파일에 그 줄이 있다는 것은 그 줄이 동작한다는 증거가 아니다 — 몇 년째 아무 일도 하지 않던 줄을 근거로 인용한 적이 있다. 캡처 전에 애플리케이션에게 현재 모드를 **물어서** 확인하고, 다르면 캡처하지 않고 멈춘다.
+그리고 **설정한 값이 아니라 관찰된 값을 믿는다.** 설정 파일에 그 줄이 있다는 것은 그 줄이 동작한다는 증거가 아니다 — 몇 년째 아무 일도 하지 않던 줄을 근거로 인용한 적이 있다. 캡처 전에 애플리케이션에게 현재 모드를 **물어서** 확인하고, 다르면 캡처하지 않고 멈춘다. `docker exec printenv` 도 증거가 아니다 — 컨테이너의 환경이지 요청 핸들러의 환경이 아니다. 되읽기 응답에 **SAPI 를 함께** 실어서 어느 런타임이 답했는지도 본다.
+
+실측된 함정 넷. 워커 환경 목록의 빈 값이 풀 기동을 실패시켜 모든 페이지가 502 가 된다 · 설정 파일이 지시어를 담고도 **아무 데도 마운트되지 않아** 그 지시어가 실행되지 않는다 · `restart` 는 환경을 다시 읽지 않고 `up -d` 는 읽는다 · 핸들러를 다시 만든 뒤 리버스 프록시가 옛 상류 주소를 캐시해 502 가 토글 고장처럼 보인다.
 
 ## 로그가 비어 있을 때
 

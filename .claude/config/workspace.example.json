@@ -94,6 +94,31 @@
       "                       VALUE_DUAL, and `migrated` its VALUE_MIGRATED; selftest.py",
       "                       compares the two files."
     ],
+    "_slicecheck": [
+      "The three keys below have exactly one consumer each: `slicecheck`. They are the",
+      "two measurement envelopes and the coverage artifact, and each of them exists",
+      "because the stage that needs it must be able to FAIL rather than be skipped.",
+      "",
+      "  dualRun.noiseEnvVar   - stage 2. Set non-empty, the helper runs the legacy body",
+      "                          against itself and logs the diff keys that move between",
+      "                          two runs of the same code. That is the noise floor, and",
+      "                          without it an equivalence loop cannot tell its own jitter",
+      "                          from a missing rule. Must equal the helper's NOISE_ENV.",
+      "  dualRun.poisonEnvVar  - stage 5. Set non-empty in `migrated`, the helper runs the",
+      "                          legacy body but throws its return value away. The golden",
+      "                          capture must then be byte-identical to the migrated",
+      "                          baseline; anything that moves is a screen value that still",
+      "                          comes from PHP. Must equal the helper's POISON_ENV.",
+      "  dualRun.coveragePath  - stage 6. Host path of the JSON that Xdebug coverage is",
+      "                          collected into, shaped like xdebug_get_code_coverage():",
+      "                          {\"<abs file>\": {\"<line>\": <hits>}}. When Xdebug is absent",
+      "                          the stage is SKIPPED and says so in state.json; when Xdebug",
+      "                          is present but this file never appears, the stage exits 3.",
+      "                          Neither of those is a pass.",
+      "",
+      "Leave all three empty in a checkout that has not wired them: the stage that needs",
+      "one stops with the key name rather than reporting a narrow answer."
+    ],
     "tooling": { "phpBinary": "php" },
     "seam": {
       "servicesDir": "<relative dir under a surface docroot where seam service files live>",
@@ -118,7 +143,10 @@
       "logPath": "<abs path of the JSONL the PHP helper appends to (must be mounted into the container)>",
       "logEnvVar": "MIGRATION_EXPERIMENT_LOG",
       "readbackPath": "/<relative path of a page that prints the current toggle mode - one token, nothing else>",
-      "ignoreFile": "ignore.json"
+      "ignoreFile": "ignore.json",
+      "noiseEnvVar": "MIGRATION_EXPERIMENT_NOISE",
+      "poisonEnvVar": "MIGRATION_EXPERIMENT_POISON",
+      "coveragePath": "<abs path of the JSON Xdebug coverage is collected into, or \"\" if not wired>"
     },
 
     "surfaces": {
@@ -225,7 +253,11 @@
   "docs": {
     "root": "<abs path where slice artifacts and domain docs are written>",
     "slicesDir": "slices",
-    "domainDir": "domain"
+    "domainDir": "domain",
+    "_designDir": "영역 단위 설계가 사는 곳. 소비처: legacy-slice Phase 3 (D-25)",
+    "designDir": "design",
+    "_journalDir": "역할별 저널이 사는 곳. 소비처: ctxevolve, 각 에이전트 (D-28)",
+    "journalDir": "journal"
   },
 
   "upstreamOs": {

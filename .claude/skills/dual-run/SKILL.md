@@ -42,7 +42,7 @@ So wire dual run **only around read paths**. For a write slice the honest plan i
 
 ## 헬퍼 설치
 
-The template is `.claude/templates/MigrationExperiment.php` in this repository. It is PHP 5.6 syntax and holds no environment values, which is why it can be tracked here at all. The swap engineer copies it into the legacy tree beside `legacy.switch.helperPath`.
+The template is `.claude/templates/MigrationExperiment.php` in this repository. It is PHP 5.6 syntax and holds no environment values, which is why it can be tracked here at all. The builder copies it into the legacy tree beside `legacy.switch.helperPath`.
 
 ```php
 MigrationExperiment::run($name, $envVar, $control, $candidate, $ignoreKeys = array(), $context = array())
@@ -111,7 +111,7 @@ Per experiment it prints four counts:
 | equal | 두 값이 같았다 |
 | 불일치 | 달랐다 — 아래 둘의 합 |
 | 예상 | `ignore.json` 이 설명한다. 승인된 결함 교정 |
-| **예상 밖** | 아무도 설명하지 않았다. **루프의 종료 조건은 이 숫자 하나뿐이다** |
+| **예상 밖** | 아무도 설명하지 않았다. 이 숫자가 0 이어야 한다 — **다만 그것만으로 루프가 닫히지는 않는다.** 종료 조건 전체는 `slicecheck` 의 단계 3~6 이고(migrated 골든·독 주입·레거시 본문 실행까지), 정본은 오케스트레이터의 루프 표다. 실제로 이중 실행이 "예상 밖 0" 을 보고한 상태에서 골든이 결함 둘을 잡은 회차가 있었다 |
 
 Unexpected mismatches are grouped by their `diff_keys` signature, each group carrying a count and three sample inputs, plus the ledger hint when one exists. Read the signature before the samples: twenty mismatches under one signature are one defect, and the samples only tell you which input reaches it.
 
@@ -133,14 +133,7 @@ This is the cheapest test data the pipeline produces and the easiest to throw aw
 
 ## 진단표
 
-| 증상 | 원인 | 담당 |
-|---|---|---|
-| 예상 밖 불일치, 값이 다름 | 규칙 누락·오역 — `diff_keys` 가 원장 행을 지목한다 | 구현 |
-| 예상 밖 불일치, 그 규칙이 원장에 없음 | 새 규칙 | 원장 단계로 (새 ID) |
-| 예상 밖 불일치, 모양(키·타입·빈 값)이 다름 | 어댑터 반환 형태 | 스왑 담당 |
-| `의도수정` 인데 예상 밖으로 잡힘 | `ignore.json` 누락 | 스왑 담당 |
-| 로그가 비어 있음 | 토글이 PHP 에 도달하지 않았거나 로그 경로가 컨테이너 안에 없다 | 스왑 담당 + `local-stack` 되읽기 |
-| `migrated` 골든 차이가 `의도수정` 으로 설명 안 됨 | 화면 규칙 누락 또는 어댑터 | 구현 / 스왑 담당 |
+**정본은 `.claude/skills/legacy-slice/references/routing.md` 다.** 여기 사본을 두지 않는다 — v2 에서 이 표가 네 곳에 복사되어 이미 갈라져 있었고, 갈라진 뒤에는 어느 쪽이 맞는지 아무도 모른다. 증상에서 담당으로 가는 판정, 그리고 오라클을 약하게 만들어 루프를 닫지 말라는 규칙이 거기 있다.
 
 ## 토글은 한 주체만 직렬로 만진다
 

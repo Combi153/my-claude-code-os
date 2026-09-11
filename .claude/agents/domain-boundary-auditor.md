@@ -30,7 +30,7 @@ The orchestrator runs the machine checks **before** calling you and hands you th
 ## 오케스트레이터가 주는 것 (프롬프트 인자)
 
 - the machine check output above
-- the **absolute path of the ledger** (post-swap; the implementer filled its `이관` column)
+- the **absolute path of the ledger** (post-swap; the implementer filled its `state` 열)
 - the **absolute paths of the design document and the seam document**
 - the **absolute path of the audit document** you write
 - the slice directory (absolute), `slice-id`, `depth`
@@ -39,7 +39,7 @@ The orchestrator runs the machine checks **before** calling you and hands you th
 
 **Read the code, not the reports.** The swap record and the implementer's summary are claims to be checked, not evidence. Every verdict you issue cites a file and line you read yourself.
 
-If the `이관` column is still `대기` across the board, say so as the first line of your report and audit anyway from the design's placement table. An empty column is a broken handoff, not a verdict about the code.
+If the `state` 열 is still `대기` across the board, say so as the first line of your report and audit anyway from the design's placement table. An empty column is a broken handoff, not a verdict about the code.
 
 ## 판정 어휘 — 이 파일이 정본이다
 

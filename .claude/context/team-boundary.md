@@ -2,10 +2,11 @@
 name: team-boundary
 kind: 팀
 inject:
-  agents: [php-seam-extractor, php-behavior-analyst, php-rule-redteam, equivalence-corpus-author, backend-slice-designer, backend-slice-implementer, php-swap-engineer, domain-boundary-auditor, domain-scribe]
+  agents: [php-seam-extractor, php-behavior-analyst, php-rule-redteam, equivalence-corpus-author, backend-slice-designer, backend-slice-builder, domain-boundary-auditor, domain-scribe, goal-loop-worker, goal-gauge-author]
   skills: []
   paths: ["${project.root}/**"]
   tools: [Write, Edit]
+  priority: 0          # 예산이 차도 이 파일은 마지막까지 남는다
 token: CTX-TEAM-BOUNDARY-4b19
 ---
 

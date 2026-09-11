@@ -61,7 +61,7 @@ Exit codes are the ones this OS uses everywhere: `0` clean, `1` a real differenc
 
 - **`id`** is the capture's filename stem and the key comparison joins on. Renaming one makes the old capture `missing`, not `different` — which reads like a tool error rather than a rename.
 - **`mode`** is `full` (every byte after normalization) or `structure` (see below).
-- **`rules`** are ledger row IDs this entry is meant to exercise. That is the join back to `01-ledger.md`: a row whose 관찰 value is `골든:<corpus-id>` has to name an entry that exists here.
+- **`rules`** are ledger row IDs this entry is meant to exercise. That is the join back to `01-ledger.jsonl`: a row whose 관찰 value is `골든:<corpus-id>` has to name an entry that exists here.
 - **`note`** says why the entry is shaped the way it is — in practice, why it is `structure`.
 
 Run `htmlsnap corpus validate` before the first capture. A mistyped path captures a 404, and a 404 compares identically to itself forever.
@@ -129,8 +129,8 @@ In the equivalence phase a capture is taken against a specific toggle mode, and 
 | L0 에서 전 항목 `different` | 공통 include 나 머리·꼬리 템플릿을 건드렸다 | 편집 범위를 다시 본다. 한 항목씩 보지 말고 공통 파일부터 |
 | `invalid` | 세션 만료, 표면 다운, 또는 오류 페이지 | 세션과 스택을 고치고 다시 캡처한다. 그 캡처는 기준선이 될 수 없다 |
 | `missing` | corpus 의 id 가 바뀌었다 | 이름을 되돌린다. 새 id 는 비교 이력을 끊는다 |
-| `dual` 에서 `different` | 실험이 화면으로 샜다 (예외·출력·헤더) | 스왑 담당. 이중 실행은 화면에 아무것도 남기지 않아야 한다 |
-| `migrated` 에서만 `different` | 화면 규칙 누락이거나 어댑터 반환 형태 | 값이 다르면 구현, 모양(키·타입·빈 값)이 다르면 스왑 담당 |
+| `dual` 에서 `different` | 실험이 화면으로 샜다 (예외·출력·헤더) | builder. 이중 실행은 화면에 아무것도 남기지 않아야 한다 |
+| `migrated` 에서만 `different` | 화면 규칙 누락이거나 어댑터 반환 형태 | 값이 다르면 구현, 모양(키·타입·빈 값)이 다르면 builder |
 
 ## 하지 않는 것
 
