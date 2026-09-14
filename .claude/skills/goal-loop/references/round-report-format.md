@@ -1,8 +1,8 @@
-# Journal format
+# Round report format
 
 The next round's worker has no memory of yours, and its prompt is identical to yours. **This file is the only reason round N+1 differs from round N.** A failure recorded nowhere is a failure the next round repeats.
 
-Write journals in **English**, in the journal directory, as `YYYY-MM-DD-r<NN>.md` (two-digit round number from the prompt).
+Write records in **English**, in the record directory, as `YYYY-MM-DD-r<NN>.md` (two-digit round number from the prompt).
 
 ## Required sections
 
@@ -19,7 +19,7 @@ Write journals in **English**, in the journal directory, as `YYYY-MM-DD-r<NN>.md
 
 ## Write it during the round, not at the end
 
-If context runs out or the round is interrupted, a journal you meant to write at the end does not exist, and the whole round is wasted. Add a line to `## Attempts` and `## Dead ends` as each attempt closes.
+If context runs out or the round is interrupted, a record you meant to write at the end does not exist, and the whole round is wasted. Add a line to `## Attempts` and `## Dead ends` as each attempt closes.
 
 ## One number, one place
 
@@ -27,6 +27,6 @@ If context runs out or the round is interrupted, a journal you meant to write at
 
 ## Reading order and budget
 
-`goal.md` in full, then `state.json` in full (stagnation and regression are visible there), then journals newest first: the last three in full, older ones only their `## Summary`, `## Dead ends` and `## For the next round`. By round eight, reading everything costs the round it was supposed to help — which is why those three sections have to stay short.
+`goal.md` in full, then `state.json` in full (stagnation and regression are visible there), then records newest first: the last three in full, older ones only their `## Summary`, `## Dead ends` and `## For the next round`. By round eight, reading everything costs the round it was supposed to help — which is why those three sections have to stay short.
 
 Write for someone who was not here. "As mentioned above" and "that file" do not exist in the next round: paths, symbol names, and reasons in full.

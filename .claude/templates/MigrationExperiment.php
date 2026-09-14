@@ -5,17 +5,17 @@
  *
  * WHERE THIS FILE GOES
  *   Copy it next to the migration switch helper - the directory named by
- *   `legacy.switch.helperPath` in workspace.json - and require it from the seam
- *   wrapper. It is a template: it carries no paths, hosts, table names or slice
+ *   `legacy.switch.helperPath` in workspace.json - and require it from the swap
+ *   wrapper. It is a template: it carries no paths, hosts, table names or page
  *   names, so it can live in the public OS repository and be copied into the
  *   legacy tree unchanged.
  *
  *   require_once dirname(__FILE__) . '/MigrationExperiment.php';
  *
- * HOW A SEAM USES IT
+ * HOW A SWAP USES IT
  *   $data = MigrationExperiment::run(
  *       '<experiment-name>',               // appears in every log line
- *       '<TOGGLE_ENV_VAR>',                // the switch helper's env var for this slice
+ *       '<TOGGLE_ENV_VAR>',                // the switch helper's env var for this page
  *       $control,                          // control: the legacy body, as a closure
  *       $candidate,                        // candidate: the new backend call
  *       array('total'),                    // keys excluded from the equal verdict
@@ -37,24 +37,24 @@
  *   migrated   candidate only. Exceptions propagate, as they do in production.
  *
  *   getenv() and not $_SERVER: two runtimes serve this docroot and $_SERVER is
- *   absent under one of them, which would pin that runtime to legacy forever with
+ *   absent under one of them, which would lock that runtime to legacy forever with
  *   no error and no failing test. The switch helper carries the measurement.
  *
- * TWO MEASUREMENT ENVELOPES ON TOP OF THE MODES (set by `slicecheck`, never by hand)
+ * TWO INSTRUMENTATION VARIABLES ON TOP OF THE MODES (set by `pagecheck`, never by hand)
  *   NOISE_ENV non-empty     legacy vs legacy. The control runs twice and is compared
  *                           against itself, the log line is marked `noise`, and the
  *                           control value is returned. The toggle stays `legacy`, so
- *                           the page is exactly as it was. This measures the noise
- *                           FLOOR: the diff keys that move between two runs of the
- *                           same code (clocks, session tokens, another team writing
- *                           rows). Without it, an equivalence loop cannot tell its own
- *                           jitter from a missing rule, and the cheapest way to close
- *                           the loop becomes ignoring keys until it is quiet.
- *   POISON_ENV non-empty    Only in `migrated`. The control still RUNS - every side
+ *                           the page is exactly as it was. This measures the
+ *                           RUN-TO-RUN DIFFERENCE: the diff keys that move between two
+ *                           runs of the same code (clocks, session tokens, another team
+ *                           writing rows). Without it, an equivalence loop cannot tell
+ *                           its own jitter from a missing rule, and the cheapest way to
+ *                           close the loop becomes ignoring keys until it is quiet.
+ *   FAKEVALUE_ENV non-empty Only in `migrated`. The control still RUNS - every side
  *                           effect it has happens exactly as before - but its return
  *                           value is thrown away and replaced by the marker, and the
- *                           candidate's value is what the page binds. Then a golden
- *                           capture must be BYTE-IDENTICAL to the migrated baseline.
+ *                           candidate's value is what the page binds. The capture taken
+ *                           must then be BYTE-IDENTICAL to the migrated baseline.
  *                           Two different leaks turn that red: a wrapper or page that
  *                           still derives a rendered value from the control's return
  *                           (it renders the marker), and a legacy body that writes
@@ -62,8 +62,8 @@
  *                           the baseline, so the screen moves). What it cannot see is a
  *                           side effect that is byte-identical to what the candidate
  *                           produces; that one belongs to the executed-lines check.
- *                           The legacy body is not edited, so its pinned hash holds -
- *                           `slicecheck` re-checks the pin inside the same stage.
+ *                           The legacy body is not edited, so its recorded body hash
+ *                           holds - `pagecheck` re-checks that hash in the same stage.
  *
  * WHY THE CANDIDATE'S EXCEPTIONS ARE SWALLOWED IN DUAL MODE
  *   The new path is designed to fail loudly rather than fall back, because a silent
@@ -100,14 +100,14 @@ class MigrationExperiment
     const LOG_ENV = 'MIGRATION_EXPERIMENT_LOG';
 
     /**
-     * Must equal legacy.dualRun.noiseEnvVar / .poisonEnvVar in workspace.json.
-     * Only `slicecheck` sets these, and it clears them again in the same stage.
+     * Must equal legacy.dualRun.noiseEnvVar / .fakeValueEnvVar in workspace.json.
+     * Only `pagecheck` sets these, and it clears them again in the same stage.
      * Both are OFF for every value that is unset or empty - the same fail-safe
-     * shape as the toggle, for the same reason: a measurement envelope left on by
+     * shape as the toggle, for the same reason: an instrumentation variable left set by
      * accident must not be able to change what a page returns.
      */
     const NOISE_ENV = 'MIGRATION_EXPERIMENT_NOISE';
-    const POISON_ENV = 'MIGRATION_EXPERIMENT_POISON';
+    const FAKEVALUE_ENV = 'MIGRATION_EXPERIMENT_FAKEVALUE';
 
     const MAX_LINE = 65536;
     const MAX_DEPTH = 32;
@@ -123,7 +123,7 @@ class MigrationExperiment
     {
         $mode = self::mode($envVar);
 
-        // Noise floor. Deliberately ahead of the mode dispatch: the toggle must stay
+        // Run-to-run difference. Deliberately ahead of the mode dispatch: the toggle must stay
         // `legacy` while it is measured, and `legacy` returns before reaching dual().
         $noise = self::env(self::NOISE_ENV);
         if ($noise !== null) {
@@ -135,9 +135,9 @@ class MigrationExperiment
             return call_user_func($control);
         }
         if ($mode === 'migrated') {
-            $poison = self::env(self::POISON_ENV);
-            if ($poison !== null) {
-                return self::poisoned($name, $control, $candidate, $poison, $context);
+            $fakevalue = self::env(self::FAKEVALUE_ENV);
+            if ($fakevalue !== null) {
+                return self::faked($name, $control, $candidate, $fakevalue, $context);
             }
             return call_user_func($candidate);
         }
@@ -154,25 +154,25 @@ class MigrationExperiment
         return $raw;
     }
 
-    // ---------------------------------------------------------------- poison
+    // ---------------------------------------------------------------- fakevalue
 
     /**
      * Run the control for its side effects, discard its return value, and hand the
-     * page the candidate's. Returns the candidate - poison never reaches the screen
+     * page the candidate's. Returns the candidate - fakevalue never reaches the screen
      * through this function's return; it reaches it only if something ELSE on the
      * page is still deriving a rendered value from the control's return.
      */
-    private static function poisoned($name, $control, $candidate, $marker, $context)
+    private static function faked($name, $control, $candidate, $marker, $context)
     {
         $ran = true;
         $discarded = null;
         try {
             // The return value is read and then dropped on purpose. What the page
-            // gets in its place is poisonValue($marker) wherever anything still
+            // gets in its place is fakeValue($marker) wherever anything still
             // substitutes for it; here it gets the candidate's value instead.
             $discarded = self::ser(call_user_func($control), 0);
         } catch (Exception $e) {
-            $ran = false;                  // the body throwing is itself an observation
+            $ran = false;                  // the body throwing is itself a result to record
         } catch (Throwable $e) {
             $ran = false;
         }
@@ -182,7 +182,7 @@ class MigrationExperiment
                 'ts' => date('c'),
                 'experiment' => $name,
                 'mode' => 'migrated',
-                'poison' => $marker,
+                'fakevalue' => $marker,
                 'control_ran' => $ran,
                 'discarded_sha' => ($discarded === null
                     ? null : hash('sha256', $discarded)),
@@ -204,13 +204,13 @@ class MigrationExperiment
     }
 
     /**
-     * The value that stands in for the legacy body's return. Public so a seam wrapper
+     * The value that stands in for the legacy body's return. Public so a swap wrapper
      * that legitimately has to substitute deeper than this function can use the same
      * marker - the capture comparison looks for these bytes and nothing else.
      */
-    public static function poisonValue($marker)
+    public static function fakeValue($marker)
     {
-        return 'POISON:' . $marker;
+        return 'FAKEVALUE:' . $marker;
     }
 
     /**
@@ -263,7 +263,7 @@ class MigrationExperiment
             $controlMs = (int) round((microtime(true) - $t) * 1000);
         }
 
-        // The observation must not be able to change what the page renders.
+        // Recording must not be able to change what the page renders.
         try {
             self::record($name, $controlValue, $candidateValue, $error, $ignoreKeys,
                          $context, $controlMs, $candidateMs, $first);

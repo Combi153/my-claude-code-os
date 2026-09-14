@@ -22,15 +22,16 @@ if not tasks:
 
 for t in tasks:
     d = os.path.join(loop, t)
-    journals = sorted(f for f in os.listdir(d) if f.endswith(".md") and f != "goal.md")
+    reports = sorted(f for f in os.listdir(d) if f.endswith(".md") and f != "goal.md")
     try:
         with open(os.path.join(d, "state.json"), encoding="utf-8") as fh:
             s = json.load(fh)
     except Exception as e:
-        print(f"loop : {t} - no/broken state.json ({type(e).__name__}). {len(journals)} journals")
+        print(f"loop : {t} - no/broken state.json ({type(e).__name__}). {len(reports)} "
+              f"report{'' if len(reports) == 1 else 's'}")
         continue
 
-    g = s.get("gauge", {})
+    g = s.get("criteria", {})
     rounds = s.get("rounds", [])
     cap = s.get("cap", "?")
     conf = s.get("confirm", "?")
@@ -44,9 +45,10 @@ for t in tasks:
     inv = last.get("invariants", "?")
 
     print(f"loop : {t} - goal {goal} / round {n}/{cap} (confirm {conf})")
-    print(f"       trail {trail} · last invariants {inv} · {len(journals)} journals")
-    if len(journals) < n:
-        print(f"       ! fewer journals than rounds ({len(journals)} < {n}): a round started blind")
+    print(f"       trail {trail} · last invariants {inv} · {len(reports)} "
+          f"report{'' if len(reports) == 1 else 's'}")
+    if len(reports) < n:
+        print(f"       ! fewer reports than rounds ({len(reports)} < {n}): a round started blind")
     done = (s.get("result") or {}).get("outcome")
     if done:
         nxt = f"{done} at round {(s.get('result') or {}).get('at_round', '?')} - nothing to run"

@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""계측 훅과 공개 저장소 가드의 케이스. 가짜 프로젝트·가짜 트리를 향하게 해
-실로그를 건드리지 않는다.
+"""Cases for the instrumentation hook and the public-repository guard. Pointed at a fake
+project and a fake tree so it touches no real log.
 
-    python3 selftest_hook.py <php-tooling-hook.py 경로>
+    python3 selftest_hook.py <path to php-tooling-hook.py>
 
-가드 훅(`guard-company-content.py`)은 같은 디렉터리에서 찾는다. 그쪽 케이스는
-**임시 git 저장소를 실제로 만들어** 거기서 진짜로 커밋·푸시한 상태에서 훅을 부른다.
-인덱스가 비어 있는 순간이 그 가드의 결함이 살던 자리이므로, 그 순간을 흉내내지 않고
-실제로 만든다.
+The guard hook (`guard-company-content.py`) is found in the same directory. Its cases
+**actually build a temporary git repository** and call the hook after really committing and
+pushing there. The moment the index is empty is where that guard's defect lived, so that
+moment is built rather than imitated.
 
-가짜 트리의 디렉터리 이름은 이 파일이 스스로 정한다. 대상 체크아웃의 실제 이름을
-쓰면 이 파일이 회사 정보를 담게 되고, 그러면 추적될 수 없다. 가짜여도 검사의
-가치는 같다 — 훅은 이름이 아니라 경로 형태와 명령 위치로 판정하기 때문이고,
-그것이 이 케이스들이 애초에 확인하려는 것이다.
+The fake tree's directory names are chosen by this file. Using the real checkout's names would
+put company information in here, and then it could not be tracked. Fake names cost the checks
+nothing - the hook judges by path shape and command position, not by name, and that is what
+these cases set out to verify.
 """
 import json
 import os
@@ -23,12 +23,12 @@ import tempfile
 
 HOOK = sys.argv[1] if len(sys.argv) > 1 else None
 if not HOOK or not os.path.isfile(HOOK):
-    sys.exit("사용법: selftest_hook.py <php-tooling-hook.py 경로>")
+    sys.exit("usage: selftest_hook.py <path to php-tooling-hook.py>")
 
 BASE = tempfile.mkdtemp(prefix="phphook-")
 PROJ = os.path.join(BASE, "proj")
 CHECKOUT = os.path.join(BASE, "checkout")
-MARKER = "src/tree"                       # 가짜. 실제 이름을 적지 않는다
+MARKER = "src/tree"                       # fake. The real name is never written here
 SVC = "svc/one"
 TREE = os.path.join(CHECKOUT, MARKER)
 
@@ -44,13 +44,13 @@ json.dump({"legacy": {"root": CHECKOUT, "treeRoot": TREE, "treeMarker": MARKER,
 
 S = os.path.join(PROJ, ".claude", "scripts")
 for name in ("phpv", "phpgrep", "phpwhere", "phped", "phplint", "phpindex",
-             "phpstats", "phpseam", "htmlsnap", "dualrun-report", "ctxstats",
-             "ctxevolve"):
+             "phpstats", "phpmove", "htmlsnap", "dualrun-report", "ctxstats",
+             "ctxevolve", "pagecheck"):
     open(os.path.join(S, name), "w").write("#!/usr/bin/env python3\n")
 SRC = os.path.join(TREE, SVC, "page.php")
 open(SRC, "w").write("<?php echo 1;")
 DOC = os.path.join(CHECKOUT, "CLAUDE.md")
-open(DOC, "w").write("phpgrep phpv 를 이야기하는 문서\n")
+open(DOC, "w").write("a document talking about phpgrep and phpv\n")
 IDX = os.path.join(PROJ, ".claude", ".state", "index", "one.json")
 open(IDX, "w").write("{}")
 LOG = os.path.join(PROJ, ".claude", ".state", "tooling.jsonl")
@@ -75,60 +75,60 @@ def lines():
 
 
 CASES = [
-    # (설명, tool, input, 기대 기록 도구, 넛지 기대)
-    ("따옴표로 감싼 경로 호출",
+    # (description, tool, input, tools expected to be recorded, steer expected)
+    ("a call with the path quoted",
      "Bash", {"command": f'"{S}/phpgrep" "한글낱말"'}, ["phpgrep"], False),
-    ("도구 이름 나열은 호출이 아니다",
+    ("listing tool names is not a call",
      "Bash", {"command": f"{S}/phpv phpgrep phped phplint phpwhere phpindex"},
      ["phpv"], False),
-    ("도구 스크립트를 읽는 명령",
+    ("a command that reads the tool script",
      "Bash", {"command": f"cat {S}/phpgrep"}, [], False),
-    ("인용부호 안 도구 이름 검색",
+    ("a search for a tool name inside quotes",
      "Bash", {"command": f"grep -n 'phpgrep\\|phpv' {DOC}"}, [], False),
-    ("전용 + 우회를 한 명령에",
+    ("a dedicated tool and a detour in one command",
      "Bash", {"command": f'{S}/phpgrep "x" ; grep -n "y" {SRC}'},
      ["phpgrep", "raw-grep"], True),
-    ("트리 밖 경로는 세지 않는다",
-     # 경로를 조립한다. 소스 확장자로 끝나는 경로 리터럴은 이 저장소의 콘텐츠
-     # 가드가 잡으므로(그것이 그 패턴의 일이다), 가짜 경로여도 리터럴로 적을 수
-     # 없다. 예외를 두는 쪽이 아니라 이쪽을 고치는 것이 맞다 — 가드의 커버리지를
-     # 테스트 편의로 줄이면 정작 막아야 할 것이 지나간다.
+    ("a path outside the tree is not counted",
+     # The path is assembled. A path literal ending in a source extension is caught by this
+     # repository's content guard (that is what the pattern is for), so even a fake path cannot
+     # be written as a literal. Fixing this side rather than adding an exception is the right
+     # move - narrowing the guard's coverage for test convenience lets through what it must block.
      "Bash", {"command": "cat " + os.path.join(BASE, "outside", "other.php")},
      [], False),
-    ("env 접두사 호출",
+    ("a call with an env prefix",
      "Bash", {"command": f"env -u PHP_LEGACY_ROOT {S}/phpwhere SomeName"},
      ["phpwhere"], False),
-    ("python3 접두사 호출",
+    ("a call with a python3 prefix",
      "Bash", {"command": f"python3 {S}/phpv {SRC}"}, ["phpv"], False),
-    ("맨 grep 우회",
+    ("a bare grep detour",
      "Bash", {"command": f'rg -n "someKey" {SRC}'}, ["raw-grep"], True),
-    ("맨 읽기 우회",
+    ("a bare read detour",
      "Bash", {"command": f"sed -n '1,40p' {SRC}"}, ["raw-read"], True),
-    ("정의형 phpgrep 은 넛지",
+    ("a definition-shaped phpgrep is steered",
      "Bash", {"command": f"{S}/phpgrep '$someVar ='"}, ["phpgrep"], True),
-    ("SQL 조건 검색은 정의형이 아니다",
+    ("a search on an SQL condition is not definition-shaped",
      "Bash", {"command": f"{S}/phpgrep \"WHERE seq = 59\""}, ["phpgrep"], False),
-    ("Read 로 마크다운은 세지 않는다",
+    ("Read on markdown is not counted",
      "Read", {"file_path": DOC}, [], False),
-    ("Read 로 PHP 소스는 우회",
+    ("Read on PHP source is a detour",
      "Read", {"file_path": SRC}, ["Read"], True),
-    ("Read 로 인덱스 JSON — 체크아웃 밖이어도 잡는다",
+    ("Read on the index JSON - caught even outside the checkout",
      "Read", {"file_path": IDX}, ["read-index"], True),
 
-    # v2 의 도구 넷. 목록에 없는 동안 이 호출들은 전용으로도 우회로도 세어지지
-    # 않고 통째로 빠졌고, 빠진 기록은 "도구를 안 썼다"와 같은 모양으로 도착한다.
-    ("phpseam 은 전용 도구다",
-     "Bash", {"command": f"{S}/phpseam lint {SRC}"}, ["phpseam"], False),
-    ("htmlsnap 서브명령이 mode 로 기록된다",
-     "Bash", {"command": f"{S}/htmlsnap capture --corpus c.json --out {BASE}/c"},
+    # The four v2 tools. While they were absent from the list these calls counted as neither
+    # dedicated nor detour and dropped out entirely, and a dropped record looks like "the tool was not used".
+    ("phpmove is a dedicated tool",
+     "Bash", {"command": f"{S}/phpmove lint {SRC}"}, ["phpmove"], False),
+    ("an htmlsnap subcommand is recorded as mode",
+     "Bash", {"command": f"{S}/htmlsnap capture --observations c.json --out {BASE}/c"},
      ["htmlsnap"], False),
-    ("dualrun-report 는 하이픈이 있어도 전용 도구다",
+    ("dualrun-report is a dedicated tool even with a hyphen",
      "Bash", {"command": f"{S}/dualrun-report --json"}, ["dualrun-report"], False),
-    ("ctxstats 도 전용 도구다",
+    ("ctxstats is a dedicated tool too",
      "Bash", {"command": f"{S}/ctxstats --days 1"}, ["ctxstats"], False),
 ]
 
-print(f"{'':2} {'케이스':<40} {'기록':<26} {'넛지':<6} 판정")
+print(f"{'':2} {'case':<40} {'recorded':<26} {'steer':<6} verdict")
 print("-" * 96)
 ok = 0
 for i, (desc, tool, inp, want_tools, want_nudge) in enumerate(CASES, 1):
@@ -140,20 +140,20 @@ for i, (desc, tool, inp, want_tools, want_nudge) in enumerate(CASES, 1):
     passed = got_tools == want_tools and got_nudge == want_nudge
     ok += passed
     print(f"{i:>2} {desc:<40} {str(got_tools):<26} {str(got_nudge):<6} "
-          + ("통과" if passed else f"FAIL 기대={want_tools}/{want_nudge}"))
+          + ("pass" if passed else f"FAIL expected={want_tools}/{want_nudge}"))
 
-# 서브명령 정규식이 v2 도구의 낱말을 알아야 `mode` 가 빈 값이 되지 않는다.
+# The subcommand regex has to know the v2 tools' words or `mode` comes back empty.
 extra_cases = []
 before = len(lines())
-run("Bash", {"command": f"{S}/phpseam callers SomeName"})
+run("Bash", {"command": f"{S}/phpmove callers SomeName"})
 _rows = lines()[before:]
 _mode = _rows[0].get("mode") if _rows else None
 extra_cases.append(_mode == "callers")
-print(f"{len(CASES) + 1:>2} {'phpseam 서브명령이 mode 에 남는다':<40} "
+print(f"{len(CASES) + 1:>2} {'a phpmove subcommand stays in mode':<40} "
       f"{str(_mode):<26} {'':<6} "
-      + ("통과" if _mode == "callers" else "FAIL 기대='callers'"))
+      + ("pass" if _mode == "callers" else "FAIL expected='callers'"))
 
-# ------------------------------------------------------------ 귀속 케이스
+# ------------------------------------------------------------ attribution cases
 print("-" * 96)
 attrib_cases = []
 
@@ -170,43 +170,43 @@ def one(desc, want, extra=None):
     attrib_cases.append(passed)
     print(f"{len(CASES) + len(extra_cases) + len(attrib_cases):>2} "
           f"{desc:<40} {str(got):<26} "
-          + ("      통과" if passed else f"      FAIL 기대={want}"))
+          + ("      pass" if passed else f"      FAIL expected={want}"))
 
 
-one("서브에이전트 밖 → 부모로 귀속", [(None, 0)])
+one("outside a subagent → attributed to the parent", [(None, 0)])
 
 run("Task", {"subagent_type": "php-behavior-analyst"})
-one("Task 하나 열림 → 그 에이전트로 귀속", [("php-behavior-analyst", 1)])
+one("one Task open → attributed to that agent", [("php-behavior-analyst", 1)])
 
-run("Task", {"subagent_type": "php-rule-redteam"})
-one("Task 둘 열림 → 모호하다고 적는다", [(None, 2)])
+run("Task", {"subagent_type": "php-rule-recheck"})
+one("two Tasks open → recorded as ambiguous", [(None, 2)])
 
-run("Task", {"subagent_type": "php-rule-redteam"}, event="PostToolUse")
-one("하나 닫힘 → 남은 하나로 귀속", [("php-behavior-analyst", 1)])
+run("Task", {"subagent_type": "php-rule-recheck"}, event="PostToolUse")
+one("one closed → attributed to the remaining one", [("php-behavior-analyst", 1)])
 
 run("Task", {"subagent_type": "php-behavior-analyst"}, event="PostToolUse")
-one("전부 닫힘 → 다시 부모", [(None, 0)])
+one("all closed → the parent again", [(None, 0)])
 
-# 다른 세션의 Task 가 이 세션의 귀속을 오염시키지 않는가
+# Does a Task from another session contaminate this session's attribution
 run("Task", {"subagent_type": "domain-scribe"}, session="othersess")
-one("다른 세션의 Task 는 섞이지 않는다", [(None, 0)])
+one("a Task from another session does not mix in", [(None, 0)])
 
-# 훅 입력이 스스로 에이전트를 말하면 그것이 정본이다. `Task` 등록은 폴백이다.
-one("입력의 agent_type 으로 귀속", [("php-seam-extractor", 1)],
-    extra={"agent_type": "php-seam-extractor", "agent_id": "ag-01"})
+# When the hook input states its own agent, that is canonical. `Task` registration is the fallback.
+one("attributed by the input's agent_type", [("php-swap-extractor", 1)],
+    extra={"agent_type": "php-swap-extractor", "agent_id": "ag-01"})
 
 run("Task", {"subagent_type": "php-behavior-analyst"})
-one("입력이 있으면 Task 등록 상태보다 우선", [("php-seam-extractor", 1)],
-    extra={"agent_type": "php-seam-extractor", "agent_id": "ag-01"})
+one("the input wins over the Task registration state", [("php-swap-extractor", 1)],
+    extra={"agent_type": "php-swap-extractor", "agent_id": "ag-01"})
 run("Task", {"subagent_type": "php-behavior-analyst"}, event="PostToolUse")
 
 
-# ------------------------------------------------------ 공개 저장소 가드 케이스
-# 같은 디렉터리의 `guard-company-content.py`. 이 가드가 트리거하는 명령은 셋인데
-# 검사 대상은 인덱스 하나뿐이었고, 인덱스가 비어 있는 두 명령(`commit -am` 과
-# `push`)이 한 줄도 검사되지 않은 채 통과했다. 그래서 아래 케이스는 전부 **실패
-# 경로**를 밟는다 — 인덱스가 비는 순간, 기준을 정할 수 없는 순간, 설정이 없는 순간.
-# 해피 패스는 대조군으로만 둔다(인덱스만 보는 `commit -m` 이 통과하는 것).
+# ------------------------------------------------------ public-repository guard cases
+# `guard-company-content.py` in the same directory. Three commands trigger this guard but only
+# the index was checked, and the two commands whose index is empty (`commit -am` and `push`)
+# passed without a single line being checked. So every case below walks a **failure path** - the
+# moment the index is empty, the moment no baseline can be decided, the moment there is no config.
+# The happy path is kept only as a control (that `commit -m`, which only reads the index, passes).
 print("-" * 96)
 GUARD = os.path.join(os.path.dirname(os.path.abspath(HOOK)),
                      "guard-company-content.py")
@@ -217,9 +217,9 @@ REPO = os.path.join(GBASE, "repo")
 OTHER = os.path.join(GBASE, "other")
 REMOTE = os.path.join(GBASE, "remote.git")
 NOUP = os.path.join(GBASE, "noupstream")
-IGNORED_DIR = "company-checkout"        # 가짜. 실제 이름을 적지 않는다
-HOST = "gate.internal.invalid"          # 예약 TLD. 실제 호스트가 아니다
-ISSUE = "TICKET-4471"                   # 가짜 트래커
+IGNORED_DIR = "company-checkout"        # fake. The real name is never written here
+HOST = "gate.internal.invalid"          # a reserved TLD. Not a real host
+ISSUE = "TICKET-4471"                   # a fake tracker
 CFG = os.path.join(REPO, ".claude", "config", "redaction.json")
 PATTERNS = {"patterns": [{"name": "internal-hostname",
                           "regex": r"\b[a-z0-9-]+\.internal\.invalid\b"},
@@ -233,7 +233,7 @@ def git_in(repo, *args):
                         "-C", repo, *args],
                        capture_output=True, text=True, timeout=60)
     if p.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)} 실패: {p.stderr.strip()}")
+        raise RuntimeError(f"git {' '.join(args)} failed: {p.stderr.strip()}")
     return p
 
 
@@ -241,7 +241,7 @@ def init_repo(d, bare=False):
     os.makedirs(d, exist_ok=True)
     subprocess.run(["git", "init", "-q"] + (["--bare"] if bare else []) + [d],
                    capture_output=True, text=True, timeout=60)
-    git_in(d, "symbolic-ref", "HEAD", "refs/heads/main")   # 버전 무관하게 main
+    git_in(d, "symbolic-ref", "HEAD", "refs/heads/main")   # main regardless of version
 
 
 def write(path, text):
@@ -259,7 +259,7 @@ def guard(command, project=REPO):
 
 
 def gtext(p):
-    """훅이 사람에게 보이려는 문장. stdout 의 JSON 을 풀고 stderr 를 붙인다."""
+    """The sentence the hook means to show a person. Unwraps the JSON on stdout and appends stderr."""
     out = ""
     try:
         out += json.loads(p.stdout)["hookSpecificOutput"]["additionalContext"]
@@ -277,17 +277,17 @@ def gcase(desc, p, want_rc, needles=(), absent=(), in_stdout=()):
     guard_cases.append(ok)
     no = len(CASES) + len(extra_cases) + len(attrib_cases) + len(guard_cases)
     print(f"{no:>2} {desc:<40} {'exit ' + str(p.returncode):<26} {'':<6} "
-          + ("통과" if ok else
-             f"FAIL 기대 exit={want_rc} 필요={list(needles) + list(in_stdout)} "
-             f"금지={list(absent)} :: " + " ".join(text.split())[:180]))
+          + ("pass" if ok else
+             f"FAIL expected exit={want_rc} needed={list(needles) + list(in_stdout)} "
+             f"forbidden={list(absent)} :: " + " ".join(text.split())[:180]))
 
 
 if not os.path.isfile(GUARD):
-    # 훅이 없는 것은 건너뜀이 아니다. 가드가 사라진 저장소가 초록으로 찍히면
-    # 이 파일이 막으려는 실패 모양을 이 파일이 스스로 만든다.
+    # A missing hook is not a skip. A repository whose guard has disappeared printing green would
+    # make this file create the very failure shape it exists to prevent.
     guard_cases.append(False)
     print(f"{len(CASES) + len(extra_cases) + len(attrib_cases) + 1:>2} "
-          f"{'가드 훅이 같은 디렉터리에 있다':<40} {'없음':<26} {'':<6} FAIL {GUARD}")
+          f"{'the guard hook is in the same directory':<40} {'none':<26} {'':<6} FAIL {GUARD}")
 else:
     init_repo(REPO)
     init_repo(OTHER)
@@ -296,100 +296,100 @@ else:
     write(os.path.join(REPO, ".gitignore"),
           f"/{IGNORED_DIR}/\nhandoff/\n/.claude/config/redaction.json\n")
     write(CFG, json.dumps(PATTERNS, ensure_ascii=False))
-    write(os.path.join(REPO, "docs", "clean.md"), "# 깨끗한 문서\n본문 한 줄.\n")
+    write(os.path.join(REPO, "docs", "clean.md"), "# a clean document\none line of body.\n")
     git_in(REPO, "add", ".gitignore", "docs/clean.md")
     git_in(REPO, "commit", "-q", "-m", "baseline")
     git_in(REPO, "remote", "add", "origin", REMOTE)
     git_in(REPO, "push", "-q", "-u", "origin", "main")
 
-    # (1) 인덱스 — 예전에도 걸리던 경로. 대조를 위해 남긴다
-    # 줄마다 첫 매치만 보고한다(줄당 break). 그래서 두 패턴이 각각 보고되는지
-    # 보려면 두 줄이어야 한다 — 한 줄에 몰아넣으면 뒤 패턴의 보고를 확인할 수 없다.
+    # (1) the index - the path that was caught even before. Kept as a control
+    # Only the first match on a line is reported (break per line). So seeing both patterns
+    # reported needs two lines - putting them on one line makes the second report unverifiable.
     write(os.path.join(REPO, "docs", "leak.md"),
-          f"운영 호스트는 {HOST} 이다.\n관련 티켓은 {ISSUE} 이다.\n")
+          f"the production host is {HOST}.\nthe related ticket is {ISSUE}.\n")
     git_in(REPO, "add", "docs/leak.md")
-    gcase("git add: 인덱스의 유출을 막는다", guard("git add docs/leak.md"), 2,
-          ["인덱스", "issue-id"])
+    gcase("git add: blocks a leak in the index", guard("git add docs/leak.md"), 2,
+          ["the index", "issue-id"])
     git_in(REPO, "reset", "-q")
     os.remove(os.path.join(REPO, "docs", "leak.md"))
 
-    # (2)~(4) 인덱스는 비어 있고 유출은 작업 트리에만 있다
+    # (2)-(4) the index is empty and the leak is only in the working tree
     write(os.path.join(REPO, "docs", "clean.md"),
-          f"# 깨끗한 문서\n운영 호스트 {HOST} 를 적었다.\n")
-    gcase("commit -m: 인덱스만 커밋되므로 통과 (대조군)",
+          f"# a clean document\nwrote the production host {HOST}.\n")
+    gcase("commit -m: passes because only the index is committed (control)",
           guard('git commit -m "x"'), 0, absent=["internal-hostname"])
-    gcase("commit -am: 작업 트리를 검사해 막는다",
-          guard('git commit -am "x"'), 2, ["작업 트리", "internal-hostname"])
-    gcase("복합 명령 뒤쪽의 git 도 따로 본다",
-          guard('echo hi && git commit -am "x"'), 2, ["작업 트리"])
+    gcase("commit -am: checks the working tree and blocks",
+          guard('git commit -am "x"'), 2, ["the working tree", "internal-hostname"])
+    gcase("a git later in a compound command is read separately",
+          guard('echo hi && git commit -am "x"'), 2, ["the working tree"])
 
-    # (5) 유출을 **지우는** 변경은 막지 않는다. 추가된 줄만 읽는다는 성질이
-    #     작업 트리 검사에도 그대로 붙어 있는지 본다.
+    # (5) A change that **removes** a leak is not blocked. Check that the property of reading only
+    #     added lines carries into the working-tree check too.
     git_in(REPO, "add", "docs/clean.md")
     git_in(REPO, "commit", "-q", "-m", "leak lands")
     write(os.path.join(REPO, "docs", "clean.md"),
-          "# 깨끗한 문서\n호스트 줄을 지웠다.\n")
-    gcase("commit -am: 유출을 지우는 변경은 막지 않는다",
-          guard('git commit -am "지움"'), 0, absent=["internal-hostname"])
+          "# a clean document\nremoved the host line.\n")
+    gcase("commit -am: a change that removes a leak is not blocked",
+          guard('git commit -am "removed"'), 0, absent=["internal-hostname"])
 
-    # (6) push — 커밋은 이미 있고 인덱스는 비어 있다
-    gcase("push: 원격에 없는 커밋을 검사해 막는다", guard("git push"), 2,
+    # (6) push - the commits already exist and the index is empty
+    gcase("push: checks commits absent from the remote and blocks", guard("git push"), 2,
           ["origin/main..HEAD", "internal-hostname"])
 
-    # (7) 기준을 정할 수 없을 때. 통과시키지 않고 이유를 말한다
-    write(os.path.join(NOUP, "note.md"), f"티켓 {ISSUE}\n")
+    # (7) When no baseline can be decided. It does not let it through and says why
+    write(os.path.join(NOUP, "note.md"), f"ticket {ISSUE}\n")
     git_in(NOUP, "add", "note.md")
     git_in(NOUP, "commit", "-q", "-m", "x")
-    gcase("push: 기준을 못 정하면 막고 무엇이 없는지 말한다",
+    gcase("push: blocks when no baseline can be decided and says what is missing",
           guard("git push", project=NOUP), 2,
-          ["기준", "@{upstream}", "origin/main", "통과가 아닙니다"],
+          ["baseline", "@{upstream}", "origin/main", "that is not a pass"],
           absent=["redaction.example.json"])
 
-    # (8)~(9) 설정이 없을 때. 내용 검사는 막고, 경로 검사는 그대로 돈다
+    # (8)-(9) When there is no config. The content check blocks and the path check still runs
     os.rename(CFG, CFG + ".bak")
-    gcase("redaction 설정이 없으면 막는다", guard("git add docs/clean.md"), 2,
-          ["한 줄도", "redaction.example.json"])
-    write(os.path.join(REPO, IGNORED_DIR, "note.md"), "회사 내용 한 줄\n")
+    gcase("a missing redaction config blocks", guard("git add docs/clean.md"), 2,
+          ["not one line", "redaction.example.json"])
+    write(os.path.join(REPO, IGNORED_DIR, "note.md"), "one line of company content\n")
     git_in(REPO, "add", "-f", IGNORED_DIR + "/note.md")
-    gcase("설정이 없어도 경로 검사는 돈다",
+    gcase("the path check runs even with no config",
           guard("git add -f " + IGNORED_DIR + "/note.md"), 2,
-          ["회사 경로", IGNORED_DIR, "redaction.example.json"])
+          ["company path", IGNORED_DIR, "redaction.example.json"])
     git_in(REPO, "reset", "-q")
     os.rename(CFG + ".bak", CFG)
 
-    # (10)~(11) 설정은 있지만 아무것도 보지 못하는 상태
+    # (10)-(11) The config exists but sees nothing
     write(CFG, json.dumps({"patterns": []}))
-    gcase("패턴이 0개면 막는다", guard("git add docs/clean.md"), 2,
-          ["0개", "redaction.example.json"])
+    gcase("zero patterns blocks", guard("git add docs/clean.md"), 2,
+          ["0 usable patterns", "redaction.example.json"])
     write(CFG, json.dumps({"patterns": [{"name": "half-open",
                                          "regex": "[unclosed"}]}))
-    gcase("패턴 컴파일 실패는 이름을 말하고 막는다",
-          guard("git add docs/clean.md"), 2, ["half-open", "컴파일"])
+    gcase("a pattern that fails to compile is named and blocks",
+          guard("git add docs/clean.md"), 2, ["half-open", "compiled"])
     write(CFG, json.dumps(PATTERNS, ensure_ascii=False))
 
-    # (12) 공개하지 않는 명령은 트리거가 아니다
-    gcase("git status 는 트리거가 아니다", guard("git status"), 0,
-          absent=["공개 저장소 가드"])
+    # (12) A command that publishes nothing is not a trigger
+    gcase("git status is not a trigger", guard("git status"), 0,
+          absent=["public-repository guard"])
 
-    # (13) 다른 저장소를 향한 명령. 판정하지 않았다는 사실이 **Claude 가 보는
-    #      자리**(stdout 의 additionalContext)에 남아야 한다 — exit 0 의 stderr 는
-    #      그쪽에 닿지 않으므로, stderr 만으로는 검사한 것과 구별되지 않는다.
+    # (13) A command aimed at another repository. The fact that it did not judge has to stay
+    #      **where Claude can see it** (additionalContext on stdout) - the stderr of an exit 0
+    #      does not reach there, so stderr alone is indistinguishable from having checked.
     write(os.path.join(OTHER, "note.md"), f"{HOST}\n")
     git_in(OTHER, "add", "note.md")
-    gcase("다른 저장소 대상이면 판정하지 않았다고 말한다",
+    gcase("it says it did not judge when the target is another repository",
           guard(f"git -C {OTHER} commit -am x"), 0,
-          ["판정하지 않았습니다"], in_stdout=["additionalContext"])
+          ["did not judge"], in_stdout=["additionalContext"])
 
-    # (14) `-C` 를 확정할 수 없으면 막는다. 셸 변수는 훅에 펼쳐지지 않은 채로 오고,
-    #      그 저장소가 이 공개 저장소일 수도 있다 — 모르는 상태를 통과로 내보내지
-    #      않는 것이 이 가드가 이미 한 번 고친 결함이다.
-    gcase("-C 가 셸 변수면 확정할 수 없다고 막는다",
+    # (14) It blocks when `-C` cannot be determined. A shell variable arrives at the hook
+    #      unexpanded, and that repository might be this public one - not sending an unknown
+    #      state out as a pass is a defect this guard has already fixed once.
+    gcase("a shell variable in -C blocks as undeterminable",
           guard('git -C "$REPO" commit -am x'), 2,
-          ["확정할 수 없습니다", "절대경로를 리터럴로", "통과가 아닙니다"])
+          ["could not determine the repository", "write the absolute path as a literal", "that is not a pass"])
 
 total = len(CASES) + len(extra_cases) + len(attrib_cases) + len(guard_cases)
 passed = ok + sum(extra_cases) + sum(attrib_cases) + sum(guard_cases)
 shutil.rmtree(BASE, ignore_errors=True)
 print("-" * 96)
-print(f"{passed}/{total} 통과")
+print(f"{passed}/{total} pass")
 sys.exit(0 if passed == total else 1)

@@ -27,7 +27,7 @@
     "or absolute path into the legacy tree still has one at its first segment.",
     "",
     "legacy-tree-dir is the third and it does need filling in, because a service",
-    "directory has no extension to recognise it by - only its name. Build it from",
+    "directory has no extension to recognize it by - only its name. Build it from",
     "workspace.json's legacy.treeMarker and legacy.services so the two cannot drift.",
     "Anchor both ends on a non-word character: the trailing anchor is what keeps a",
     "directory named `x` out of a match for `xy`, and the leading one must allow `/`",

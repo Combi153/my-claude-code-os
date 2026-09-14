@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""ctxevolve 검사 — 합성 저널로만 돈다. 회사 트리를 요구하지 않는다.
+"""ctxevolve checks - runs on synthetic records only. It requires no company tree.
 
-실패 경로를 밟는 것이 이 파일의 목적이다. 해피 패스만 검사하면, 이 도구가 조용히
-빈손이 되는 경우를 아무도 못 본다 — 그게 이 저장소가 반복해 고쳐 온 결함이다.
+Walking the failure paths is the purpose of this file. Checking only the happy path leaves nobody
+watching the case where this tool goes quietly empty - the defect this repository has fixed again and again.
 """
 import json
 import os
@@ -24,7 +24,7 @@ def case(name, cond, detail=""):
     global ok, fail
     if cond:
         ok += 1
-        print(f"  통과   {name}   {detail}")
+        print(f"  pass   {name}   {detail}")
     else:
         fail += 1
         print(f"  FAIL   {name}   {detail}")
@@ -38,14 +38,14 @@ def jl(d, role, rows):
 
 
 def item(**kw):
-    base = {"ts": "2026-09-11T00:00:00+09:00", "slice": "p1", "role": "php-behavior-analyst",
-            "lesson": "L", "trigger": "T", "evidence": ".claude/context/ledger-contract.md:1",
+    base = {"ts": "2026-09-11T00:00:00+09:00", "page": "p1", "role": "php-behavior-analyst",
+            "lesson": "L", "trigger": "T", "evidence": ".claude/context/rules-contract.md:1",
             "scope": "global"}
     base.update(kw)
     return base
 
 
-print("### 1. 형식 검사는 실패를 잡는다")
+print("### 1. the form check catches failures")
 with tempfile.TemporaryDirectory() as td:
     d = os.path.join(td, "area")
     jl(d, "php-behavior-analyst", [
@@ -56,72 +56,72 @@ with tempfile.TemporaryDirectory() as td:
         item(role=""),
     ])
     open(os.path.join(d, "php-behavior-analyst.jsonl"), "a", encoding="utf-8").write("{not json\n")
-    rc, out = run(["--check", "--journal-dir", d])
-    case("evidence 없는 항목을 FAIL 로 잡는다", "빠진 열" in out and "evidence" in out)
-    case("trigger 없는 항목을 FAIL 로 잡는다", out.count("빠진 열") >= 2)
-    case("scope 어휘 밖을 FAIL 로 잡는다", "scope 가" in out)
-    case("role 없는 항목을 FAIL 로 잡는다", "role 이 없다" in out)
-    case("깨진 JSON 줄을 조용히 넘기지 않는다", "JSON 이 아니다" in out)
-    case("실패가 있으면 exit 1", rc == 1, f"exit={rc}")
+    rc, out = run(["--check", "--record-dir", d])
+    case("an entry with no evidence is caught as FAIL", "missing fields" in out and "evidence" in out)
+    case("an entry with no trigger is caught as FAIL", out.count("missing fields") >= 2)
+    case("a scope outside the vocabulary is caught as FAIL", "scope is" in out)
+    case("an entry with no role is caught as FAIL", "no role" in out)
+    case("a broken JSON line is not passed over in silence", "not JSON" in out)
+    case("a failure means exit 1", rc == 1, f"exit={rc}")
 
-print("\n### 2. 한 줄이 깨져도 나머지는 산다")
+print("\n### 2. one broken line leaves the rest alive")
 with tempfile.TemporaryDirectory() as td:
     d = os.path.join(td, "area")
-    jl(d, "php-behavior-analyst", [item(lesson="살아있는 항목")])
+    jl(d, "php-behavior-analyst", [item(lesson="a living entry")])
     open(os.path.join(d, "php-behavior-analyst.jsonl"), "a", encoding="utf-8").write("{broken\n")
-    rc, out = run(["--propose", "--journal-dir", d])
-    case("깨진 줄 뒤에도 정상 항목이 후보가 된다", "살아있는 항목" in out)
+    rc, out = run(["--propose", "--record-dir", d])
+    case("a valid entry after a broken line still becomes a candidate", "a living entry" in out)
 
-print("\n### 3. scope 가 전파 범위를 정한다")
+print("\n### 3. scope decides how far it propagates")
 with tempfile.TemporaryDirectory() as td:
     d = os.path.join(td, "area")
     jl(d, "php-behavior-analyst", [
-        item(lesson="전역 교훈", scope="global"),
-        item(lesson="표면 교훈", scope="surface"),
-        item(lesson="영역 교훈", scope="area"),
+        item(lesson="a global lesson", scope="global"),
+        item(lesson="a surface lesson", scope="surface"),
+        item(lesson="an area lesson", scope="area"),
     ])
-    rc, out = run(["--propose", "--journal-dir", d])
-    case("global 만 후보가 된다", "전역 교훈" in out and "표면 교훈" not in out and "영역 교훈" not in out)
-    case("후보 수를 말한다", "1 후보" in out)
+    rc, out = run(["--propose", "--record-dir", d])
+    case("only global becomes a candidate", "a global lesson" in out and "a surface lesson" not in out and "an area lesson" not in out)
+    case("it states the candidate count", "1 candidates" in out)
 
-print("\n### 4. 근거가 사라진 항목은 후보가 아니다")
+print("\n### 4. an entry whose evidence is gone is not a candidate")
 with tempfile.TemporaryDirectory() as td:
     d = os.path.join(td, "area")
     jl(d, "php-behavior-analyst", [
-        item(lesson="살아있는 근거"),
-        item(lesson="죽은 근거", evidence="no-such-evidence.md:12"),
+        item(lesson="living evidence"),
+        item(lesson="dead evidence", evidence="no-such-evidence.md:12"),
     ])
-    rc, out = run(["--stale", "--propose", "--journal-dir", d])
-    case("만료 후보로 표시한다", "만료 후보" in out and "no-such-evidence.md" in out)
-    case("개정 후보에서는 뺀다", "제외:" in out and "1 후보" in out)
-    case("빼면서 이유를 말한다", "근거가 사라진" in out)
+    rc, out = run(["--stale", "--propose", "--record-dir", d])
+    case("it marks it an expiry candidate", "expiry candidate" in out and "no-such-evidence.md" in out)
+    case("it drops it from the revision candidates", "excluded:" in out and "1 candidates" in out)
+    case("it says why it dropped it", "evidence is gone" in out)
 
-print("\n### 5. 적용하지 않는다")
+print("\n### 5. it applies nothing")
 with tempfile.TemporaryDirectory() as td:
     d = os.path.join(td, "area")
     jl(d, "php-behavior-analyst", [item()])
-    target = os.path.join(HERE, "..", "context", "ledger-contract.md")
+    target = os.path.join(HERE, "..", "context", "rules-contract.md")
     before = open(target, "rb").read()
-    rc, out = run(["--propose", "--journal-dir", d])
-    case("컨텍스트 파일을 고치지 않는다", open(target, "rb").read() == before)
-    case("적용하지 않았다고 말한다", "적용하지 않았다" in out)
-    case("무엇을 지울지 정하라고 말한다", "대체하는 산문" in out)
+    rc, out = run(["--propose", "--record-dir", d])
+    case("it does not edit the context file", open(target, "rb").read() == before)
+    case("it says nothing was applied", "Nothing was applied" in out)
+    case("it says to decide what to delete", "replaces" in out)
 
-print("\n### 6. 답을 못 찾은 것과 답이 없는 것을 구별한다")
+print("\n### 6. it separates could-not-find from there-is-none")
 with tempfile.TemporaryDirectory() as td:
-    rc, out = run(["--check", "--journal-dir", os.path.join(td, "없는디렉터리")])
-    case("저널 디렉터리가 없으면 exit 3 으로 멈춘다", rc == 3, f"exit={rc}")
-    case("무엇이 없는지 말한다", "저널 디렉터리가 없다" in out)
+    rc, out = run(["--check", "--record-dir", os.path.join(td, "nosuchdir")])
+    case("a missing record directory stops with exit 3", rc == 3, f"exit={rc}")
+    case("it says what is missing", "no record directory" in out)
     d = os.path.join(td, "area")
     os.makedirs(d)
-    rc, out = run(["--propose", "--journal-dir", d])
-    case("빈 저널은 '항목이 없다'로 말한다 (후보 0 과 구별)", "항목이 없다" in out, f"exit={rc}")
+    rc, out = run(["--propose", "--record-dir", d])
+    case("an empty record says 'no entry' (told apart from zero candidates)", "no entry" in out, f"exit={rc}")
 
-print("\n### 7. 인자 없이 부르면 사용법과 exit 2")
+print("\n### 7. called with no argument, usage and exit 2")
 rc, out = run([])
-case("인자 없이 exit 2", rc == 2, f"exit={rc}")
-case("사용법을 찍는다", "--propose" in out)
+case("no argument is exit 2", rc == 2, f"exit={rc}")
+case("it prints usage", "--propose" in out)
 
 print("\n" + "-" * 70)
-print(f"{ok}/{ok + fail} 통과")
+print(f"{ok}/{ok + fail} pass")
 sys.exit(0 if fail == 0 else 1)

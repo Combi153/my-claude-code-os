@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""도구와 훅이 실제로 동작하는지 검사한다. 프로젝트 루트에서, 환경변수 없이.
+"""Check that the tools and hooks actually work. From the project root, with no env vars.
 
-    python3 .claude/scripts/selftest.py           전부
-    python3 .claude/scripts/selftest.py --quick    트리를 훑는 검사는 건너뛴다
+    python3 .claude/scripts/selftest.py           everything
+    python3 .claude/scripts/selftest.py --quick    skip the checks that sweep the tree
 
-**이 파일에는 환경 상수가 없다.** 대상 경로와 서비스 이름은 도구와 같은 자리인
-`.claude/config/workspace.json` 에서 읽는다. 그래야 이 파일이 추적될 수 있고, 검사가
-설정과 어긋나는 일도 생기지 않는다. 계측 훅 검사는 가짜 트리를 만들어 그쪽을 향하게
-하므로 실제 로그와 상태 파일을 건드리지 않는다.
+**This file holds no environment constants.** Target paths and service names are read from
+`.claude/config/workspace.json`, the same place the tools read them. That is what lets this file
+be tracked, and it stops the checks drifting from the config. The instrumentation-hook checks
+build a fake tree and point at that, so they touch no real log or state file.
 
-**각 검사의 소요 시간을 찍는다.** 도구가 정확해도 한 번에 1분이 걸리면 호출자는
-우회하고, 그 우회는 로그에 "도구를 안 썼다"로 남는다. 그러면 원인이 설계에 있는 것처럼
-읽힌다. 시간이 보이면 그 오독을 막을 수 있다. `--quick` 은 트리 전체를 훑는 검사를
-빼는 것이고, 그 경우 무엇을 빼먹었는지 마지막에 말한다.
+**It prints how long each check took.** A tool can be correct and still be routed around when
+one call costs a minute, and that detour is recorded in the log as "did not use the tool",
+which then reads as a design problem. Visible timings prevent that misreading. `--quick` drops
+the checks that sweep the whole tree, and says at the end what was dropped.
 """
 import ast
 import json
@@ -38,13 +38,13 @@ skipped = []
 def check(name, ok, detail="", secs=None):
     results.append((name, ok, detail))
     t = f"  {secs:5.1f}s" if secs is not None else "        "
-    print(f"  {'통과' if ok else 'FAIL'}{t}  {name}"
+    print(f"  {'pass' if ok else 'FAIL'}{t}  {name}"
           + (f"   {detail}" if detail else ""))
 
 
 def skip(name, why):
     skipped.append((name, why))
-    print(f"  건너뜀       {name}   ({why})")
+    print(f"  skipped      {name}   ({why})")
 
 
 def run(cmd, timeout=180, env=None, **kw):
@@ -62,8 +62,8 @@ def load_config():
 
 LG = load_config()
 if not LG.get("root"):
-    sys.exit("selftest: workspace.json 의 legacy 절이 비어 있다. "
-             "workspace.example.json 을 보고 채워라.")
+    sys.exit("selftest: the legacy section of workspace.json is empty. "
+             "Fill it in from workspace.example.json.")
 
 TREE = LG.get("treeRoot") or os.path.join(LG["root"], LG["treeMarker"])
 PRIMARY = LG["primaryService"]
@@ -71,14 +71,14 @@ SHARED = LG.get("sharedLibrary") or PRIMARY
 
 
 def sample(prefix, want_encoding=None, limit=400):
-    """트리에서 검사에 쓸 .php 파일 하나. 심볼명을 이 파일에 적지 않기 위한 것이다."""
+    """One .php file from the tree to check against, so no symbol name is written into this file."""
     sys.path.insert(0, HERE)
     from _phpenc import detect
     base = os.path.join(TREE, prefix)
     seen = 0
-    # 벤더 번들을 뽑으면 안 된다. `phplint` 가 그것을 검사 대상에서 빼므로,
-    # 벤더 파일로 문법 검사를 확인하면 "건너뜀"을 "통과"로 읽는다. 검사가 실제
-    # 동작을 재려면 대상이 우리 코드여야 한다.
+    # It must not pick a vendor bundle. `phplint` excludes those from checking, so verifying the
+    # syntax check against a vendor file reads a "skip" as a "pass". For a check to measure real
+    # behavior, its target has to be our code.
     SKIP = ("vendor", "node_modules", "bower_components", "external", "test",
             "tests", "old", "backup")
     for root, dirs, names in os.walk(base):
@@ -102,49 +102,56 @@ def sample(prefix, want_encoding=None, limit=400):
     return None
 
 
-print(f"# 대상 트리 확인: {os.path.isdir(TREE)}"
-      f" · 서비스 {len(LG.get('services') or {})}개"
-      f" · 런타임 {len(LG.get('runtimes') or {})}개"
+print(f"# target tree present: {os.path.isdir(TREE)}"
+      f" · {len(LG.get('services') or {})} services"
+      f" · {len(LG.get('runtimes') or {})} runtimes"
       + ("  [--quick]" if QUICK else ""))
 
-# ------------------------------------------- 3~8. 케이스 모듈을 먼저 띄운다
-# 각 모듈은 스스로 합성 픽스처를 만들고 마지막 줄에 `N/M 통과` 를 찍는다. 아래에서는
-# 그 숫자만 읽는다. 모듈을 통째로 이 파일에 옮기지 않는 이유는 하나다 — 이 파일이
-# 커지면 아무도 끝까지 돌리지 않고, 돌지 않는 검사는 없는 검사다.
+# ------------------------------------------- 3–8. start the case modules first
+# Each module builds its own synthetic fixtures and prints `N/M pass` on its last line. Below,
+# only that number is read. The reason the modules are not folded into this file is one thing:
+# once this file gets big nobody runs it to the end, and a check that does not run is no check.
 #
-# **여섯을 여기서 다 띄우고, 제자리(3~8 절)에서 거둔다.** 하나씩 기다리면 벽시계가
-# 여섯의 합이 되는데, 그 합의 대부분은 프로세스가 뜨기를 기다리는 시간이다. 여섯은
-# 서로를 모른다 — 각자 `tempfile.mkdtemp` 아래에 픽스처를 만들고, 자기
-# `CLAUDE_PROJECT_DIR` 만 보고, 컨테이너를 건드리지 않고(`slicecheck` 케이스는
-# 가짜 `docker` 를 자기 PATH 에 놓는다), 이 저장소는 읽기만 한다. 그래서 겹쳐도
-# 서로의 판정을 바꿀 수 없다.
+# **All six start here and are collected in place (sections 3–8).** Waiting one at a time makes
+# the wall clock the sum of six, and most of that sum is waiting for processes to start. The six
+# know nothing of each other - each builds fixtures under `tempfile.mkdtemp`, looks only at its
+# own `CLAUDE_PROJECT_DIR`, touches no container (the `pagecheck` cases put a fake `docker` on
+# their own PATH), and only reads this repository. So overlapping them cannot change each
+# other's verdicts.
 #
-# 출력은 **띄운 순서 그대로** 찍는다. 끝난 순서로 찍으면 같은 저장소가 실행마다
-# 다른 로그를 내고, 그러면 두 실행을 비교할 수 없다.
+# Output is printed **in the order they were started**. Printing in completion order makes the
+# same repository produce a different log every run, and then two runs cannot be compared.
 CASE_MODULES = [
-    # (절, 머리글, 검사 이름의 앞부분, 건너뜀 이름, 파일, 인자, 제한시간)
-    (3, "계측 훅 — 가짜 트리로", "계측", "계측 훅 케이스", "selftest_hook.py",
+    # (section, heading, check-name prefix, skip name, file, args, timeout)
+    (3, "instrumentation hook - against a fake tree", "instrumentation", "instrumentation hook cases", "selftest_hook.py",
      [PROJECT + "/.claude/hooks/php-tooling-hook.py"], 300),
-    (4, "phpseam — 페이지 모양·본문 해시·호출자", None, None,
-     "selftest_phpseam.py", [os.path.join(HERE, "phpseam")], 300),
-    (5, "htmlsnap — 캡처와 비교", None, None, "selftest_htmlsnap.py", [], 300),
-    (6, "dualrun-report — 이중 실행 로그", None, None, "selftest_dualrun.py",
+    (4, "phpmove - page shape · body hash · callers", None, None,
+     "selftest_phpmove.py", [os.path.join(HERE, "phpmove")], 300),
+    (5, "htmlsnap - capture and compare", None, None, "selftest_htmlsnap.py", [], 300),
+    (6, "dualrun-report - the dual-run log", None, None, "selftest_dualrun.py",
      [], 300),
-    (7, "컨텍스트 주입 — 가짜 프로젝트로", None, None, "selftest_context.py",
+    (7, "context injection - against a fake project", None, None, "selftest_context.py",
      [PROJECT + "/.claude/hooks/context-inject.py"], 300),
-    (8, "slicecheck — 단계·토글·회차·게이지", None, None,
-     "selftest_slicecheck.py", [], 420),
+    (8, "pagecheck - stages · toggle · rounds · check results", None, None,
+     "selftest_pagecheck.py", [], 420),
+    # The budget is the design's one binding cap (CLAUDE.md, growth rule 4). It ran only when
+    # someone remembered to run it by hand, which means the cap was never in the number
+    # anybody read before committing.
+    (8.5, "injection budget - no consumer over 90%", None, None, "selftest_budget.py",
+     [], 120),
+    (8.6, "ctxevolve - record → proposed revision", None, None, "selftest_ctxevolve.py",
+     [], 180),
 ]
 
 
 def launch_cases(filename, args, timeout):
-    """모듈을 띄우고 손잡이를 돌려준다. 파일이 없으면 None.
+    """Start a module and return its handle. None when the file does not exist.
 
-    **기다리는 일은 모듈마다 자기 스레드가 한다.** 거두는 자리에서 순서대로
-    `communicate` 를 부르면, 늦게 거두는 모듈은 자기가 든 시간이 아니라 앞의
-    모듈을 기다린 시간까지 함께 찍는다 — 0.8초짜리가 5.4초로 보인다. 이 파일이
-    초를 찍는 이유가 "어느 도구가 느린가"를 보이는 것이므로, 그 숫자가 거두는
-    순서에 따라 달라지면 찍는 의미가 없어진다.
+    **Each module's waiting is done by its own thread.** Calling `communicate` in collection
+    order makes a module collected late report not its own time but the time it spent waiting
+    for the ones before it - 0.8 s looks like 5.4 s. The reason this file prints seconds is to
+    show which tool is slow, so if that number changes with collection order there is no point
+    printing it.
     """
     mod = os.path.join(HERE, filename)
     if not os.path.isfile(mod):
@@ -170,157 +177,174 @@ def launch_cases(filename, args, timeout):
 
 
 def collect_cases(no, title, label, skipname, filename, timeout, handle):
-    """띄워 둔 모듈을 거두고 `N/M 통과` 를 대조한다."""
+    """Collect a started module and check its `N/M pass` line."""
     print(f"\n### {no}. {title}")
     if handle is None:
-        skip(skipname or title, f"{filename} 이 없다")
+        skip(skipname or title, f"{filename} does not exist")
         return
     handle["thread"].join()
     out = handle["out"] or ""
     if handle["over"]:
-        out += f"\n{filename} 이 {timeout}초 안에 끝나지 않았다"
-    tail = [l for l in out.strip().splitlines() if "통과" in l]
+        out += f"\n{filename} did not finish within {timeout}s"
+    tail = [l for l in out.strip().splitlines() if " pass" in l]
     last = tail[-1] if tail else out.strip()[-120:]
     n = last.split("/")[0].strip() if "/" in last else "?"
     total = last.split("/")[1].split()[0] if "/" in last else "?"
-    # `N/M` 줄을 못 찾은 것은 통과가 아니다. 못 찾으면 n·total 이 둘 다 "?" 가
-    # 되는데, 그것을 세지 않고 `n == total` 만 보면 **모듈이 죽거나 제한시간을
-    # 넘긴 실행이 초록으로 찍힌다** — 케이스를 하나도 돌리지 않은 것이 가장 빠른
-    # 실행이므로, 그 구멍은 하필 속도를 재는 동안 가장 벌어지기 쉽다.
+    # Not finding the `N/M` line is not a pass. When it is missing, n and total are both "?",
+    # and counting only `n == total` without noticing that makes **a module that died or timed
+    # out print green** - running no cases at all is the fastest run, so that hole opens widest
+    # precisely while speed is being measured.
     ok = "/" in last and n == total and not handle["over"]
-    # 모듈이 안에서 건너뛴 케이스는 그 모듈의 `N/M` 에서 **빠진다.** 그러면 부모는
-    # `43/43 통과` 를 보고 초록으로 찍고, 바깥에서는 어제 44 였던 케이스가 오늘 43 인
-    # 이유를 알 수 없다 — 사례가 사라진 것처럼 보인다. 건너뛴 것은 통과가 아니므로
-    # 그 줄을 부모의 요약까지 올린다.
+    # Cases a module skipped internally **drop out of** that module's `N/M`. The parent then sees
+    # `43/43 pass` and prints green, and from outside there is no way to know why a count that
+    # was 44 yesterday is 43 today - the case looks like it vanished. A skip is not a pass, so
+    # that line is lifted into the parent's summary.
     inner_skips = [l.strip() for l in out.splitlines()
-                   if l.strip().startswith("건너뜀 ") and "—" in l]
+                   if l.strip().startswith("skipped ") and " - " in l]
     detail = last.strip()
     if inner_skips:
         detail += "  · " + inner_skips[-1]
-    check(f"{label or title} 케이스 {total} 개", ok, detail, secs=handle["secs"])
+    check(f"{label or title}: {total} cases", ok, detail, secs=handle["secs"])
     if inner_skips:
-        print(f"{'':2} {'':<44} ↳ {inner_skips[-1]} (모듈 안에서 건너뜀 — 통과 아님)")
+        print(f"{'':2} {'':<44} ↳ {inner_skips[-1]} (skipped inside the module - not a pass)")
     if not ok:
         print(out)
         print((handle["err"] or "")[-1500:], file=sys.stderr)
 
 
 handles = [launch_cases(m[4], m[5], m[6]) for m in CASE_MODULES]
-print(f"# 케이스 모듈 {sum(h is not None for h in handles)}개를 먼저 띄웠다"
-      " — 3~8 절의 초는 겹쳐서 잰 값이라 합이 벽시계가 아니다")
+print(f"# started {sum(h is not None for h in handles)} case modules first"
+      " - the seconds in sections 3–8 overlap, so their sum is not wall clock")
 
-# ---------------------------------------------------------------- 1. 도구
-print("\n### 1. 도구 여덟 개 — 환경변수 없이, 프로젝트 루트에서")
+# ---------------------------------------------------------------- 1. tools
+print("\n### 1. the seven tree-reading tools - no env vars, from the project root")
 
 cp949 = sample(SHARED, "cp949") or sample(PRIMARY, "cp949")
 utf8 = sample(PRIMARY, "utf-8") or sample(PRIMARY)
 
 if cp949:
     p, s = run([sys.executable, HERE + "/phpv", cp949, "1:3"])
-    check("phpv 가 CP949 를 디코드", p.returncode == 0 and "cp949" in p.stdout,
+    check("phpv decodes CP949", p.returncode == 0 and "cp949" in p.stdout,
           secs=s)
 else:
-    skip("phpv CP949 디코드", "CP949 파일을 찾지 못함")
+    skip("phpv CP949 decode", "no CP949 file found")
 
 p, s = run([sys.executable, HERE + "/phpv"])
-check("phpv 인자 없이 → 도움말, exit 2", p.returncode == 2, secs=s)
+check("phpv with no arguments → help, exit 2", p.returncode == 2, secs=s)
 
 if QUICK:
-    skip("phpgrep 정상 검색", "트리 전체를 훑는다")
+    skip("phpgrep normal search", "it sweeps the whole tree")
 else:
     p, s = run([sys.executable, HERE + "/phpgrep", "-l", "__nosuchsymbol__"])
-    check("phpgrep 이 범위를 찍고 0건을 0건으로 답함",
-          p.returncode == 1 and "범위" in p.stderr and "없음" in p.stderr, secs=s)
+    check("phpgrep prints its scope and answers zero as zero",
+          p.returncode == 1 and "scope" in p.stderr and "no hits" in p.stderr, secs=s)
 
 p, s = run([sys.executable, HERE + "/phpgrep", "-F", "x"])
-check("phpgrep 이 모르는 옵션을 거부 (검색어로 삼지 않음)",
-      p.returncode == 2 and "모르는 옵션" in p.stderr, secs=s)
+check("phpgrep rejects an unknown option (does not use it as the term)",
+      p.returncode == 2 and "unknown option" in p.stderr, secs=s)
 
 p, s = run([sys.executable, HERE + "/phpgrep", "a", "b"])
-check("phpgrep 이 검색어 두 개를 거부", p.returncode == 2 and "하나여야" in p.stderr,
+check("phpgrep rejects two search terms", p.returncode == 2 and "exactly one" in p.stderr,
       secs=s)
 
 p, s = run([sys.executable, HERE + "/phpindex", "--list"])
-check("phpindex --list 가 인덱스를 찾음",
+check("phpindex --list finds the index",
       p.returncode == 0 and ".json" in p.stdout, secs=s)
 
+# The claim in the name is that the index was not rebuilt, and nothing used to observe that.
+# `!= 0` also passed on a traceback. Compare the index directory's mtimes across the call.
+_IDX = os.path.join(PROJECT, ".claude", ".state", "index")
+
+
+def _index_mtimes():
+    if not os.path.isdir(_IDX):
+        return {}
+    return {n: os.path.getmtime(os.path.join(_IDX, n)) for n in os.listdir(_IDX)}
+
+
+_before = _index_mtimes()
 p, s = run([sys.executable, HERE + "/phpindex", "--nosuchopt"])
-check("phpindex 가 모르는 옵션에 재생성하지 않음", p.returncode != 0, secs=s)
+_after = _index_mtimes()
+check("phpindex does not rebuild on an unknown option",
+      p.returncode == 1 and "unknown option --nosuchopt" in p.stderr and _after == _before,
+      f"exit={p.returncode}" + ("" if _after == _before else " · the index was rewritten"),
+      secs=s)
 
 p, s = run([sys.executable, HERE + "/phpwhere", "--conflicts"])
-check("phpwhere 가 인덱스를 읽음", p.returncode == 0 and "범위" in p.stdout, secs=s)
+check("phpwhere reads the index", p.returncode == 0 and "scope" in p.stdout, secs=s)
 
 p, s = run([sys.executable, HERE + "/phpstats", "--days", "1"])
-check("phpstats", p.returncode == 0 and "최근 1일" in p.stdout, secs=s)
+check("phpstats", p.returncode == 0 and "last 1 days" in p.stdout, secs=s)
 
 p, s = run([sys.executable, HERE + "/phped", "status"])
-check("phped status", p.returncode == 0, secs=s)
+check("phped status", p.returncode == 0 and "open - run" in p.stderr,
+      "" if "open - run" in p.stderr else (p.stdout + p.stderr).strip()[:70], secs=s)
 
 if utf8:
     t0 = time.time()
     p = subprocess.run([sys.executable, HERE + "/phplint", "--as", utf8, "-"],
                        input="<?php function f() { return 1; }", text=True,
                        capture_output=True, cwd=PROJECT, env=ENV, timeout=180)
-    check("phplint 정상 소스 → 0, 그리고 맞는 런타임을 골랐다",
+    check("phplint good source → 0, and it picked the right runtime",
           p.returncode == 0 and "OK on PHP" in p.stderr,
           p.stderr.strip()[:70] if p.returncode else "", secs=time.time() - t0)
     t0 = time.time()
     p = subprocess.run([sys.executable, HERE + "/phplint", "--as", utf8, "-"],
                        input="<?php function f( { return 1; }", text=True,
                        capture_output=True, cwd=PROJECT, env=ENV, timeout=180)
-    check("phplint 깨진 소스 → 1", p.returncode == 1 and "FAILS" in p.stderr,
+    check("phplint broken source → 1", p.returncode == 1 and "FAILS" in p.stderr,
           secs=time.time() - t0)
 else:
-    skip("phplint 정상·실패", "대상 파일을 찾지 못함")
+    skip("phplint pass and fail", "no target file found")
 
 outside = os.path.join(SCRATCH, "outside.php")
 open(outside, "w").write("<?php echo 1;")
 p, s = run([sys.executable, HERE + "/phplint", outside])
-check("phplint 검사 못 함 → 3 (통과 아님)", p.returncode == 3, secs=s)
+check("phplint could-not-check → 3 (not a pass)", p.returncode == 3, secs=s)
 
 p, s = run([sys.executable, "-c",
             f"import sys; sys.path.insert(0, {HERE!r});\n"
             "from _phpenc import checkout_root, config_problem;\n"
             "print(config_problem() or checkout_root())"])
-check("설정 판정이 체크아웃을 가리킴",
+check("the config verdict points at the checkout",
       p.stdout.strip() == os.path.abspath(os.path.expanduser(LG["root"])),
       "" if p.stdout.strip() == os.path.abspath(os.path.expanduser(LG["root"]))
       else p.stdout.strip()[:60], secs=s)
 
-# 설정이 없으면 좁은 답을 내지 않고 멈추는가
+# Does it stop rather than give a narrowed answer when the config is missing
 empty = os.path.join(SCRATCH, "emptyproj")
 os.makedirs(empty + "/.claude/config", exist_ok=True)
 with open(empty + "/.claude/config/workspace.json", "w") as fh:
     json.dump({}, fh)
 p, s = run([sys.executable, HERE + "/phpwhere", "x"],
            env={**ENV, "CLAUDE_PROJECT_DIR": empty})
-check("설정이 비면 멈추고 이유를 말함",
+check("an empty config stops and says why",
       p.returncode != 0 and ("legacy" in p.stderr or "workspace" in p.stderr),
       secs=s)
 
-# ------------------------------------------------------- 2. 인코딩 가드
-print("\n### 2. 인코딩 가드 — 격리된 상태 파일로")
+# ------------------------------------------------------- 2. encoding guard
+print("\n### 2. encoding guard - with an isolated state file")
 GPROJ = os.path.join(SCRATCH, "guardproj")
 os.makedirs(GPROJ + "/.claude/config", exist_ok=True)
-# **설정을 통째로 넘긴다.** 전에는 세 키만 복사했고, 그러면 `phplint` 가 런타임을
-# 고를 수 없어 "검사하지 못함"으로 끝난다. 검사 항목이 "경고가 없는가"였으므로
-# 그 상태가 통과로 읽혔다. 격리는 상태 파일에만 필요하고, 설정을 줄이는 것은
-# 격리가 아니라 검사 대상을 바꾸는 것이다.
+# **Pass the whole config.** Before, only three keys were copied, and then `phplint` could not
+# pick a runtime and ended in "could not check". Because the check was "is there no warning",
+# that state read as a pass. Isolation is needed only for the state file; trimming the config is
+# not isolation but changing what is being checked.
 with open(GPROJ + "/.claude/config/workspace.json", "w") as fh:
     json.dump({"legacy": LG}, fh)
-# 가드는 도구를 `CLAUDE_PROJECT_DIR/.claude/scripts` 에서 찾는다. 격리
-# 프로젝트에도 그 자리를 만들어 준다.
+# The guard looks for tools under `CLAUDE_PROJECT_DIR/.claude/scripts`. Create that place in the
+# isolated project too.
 os.symlink(HERE, os.path.join(GPROJ, ".claude", "scripts"))
 GUARD = PROJECT + "/.claude/hooks/php-encoding-guard.py"
 
 
 def hook_text(p):
-    """훅이 사람에게 보이려는 문장. stdout 의 JSON 을 풀고 stderr 를 붙인다.
+    """The sentence the hook means to show a person. Unwraps the JSON on stdout and appends stderr.
 
-    훅은 `json.dump` 로 내보내므로 한글이 `\\uXXXX` 로 이스케이프되어 있다.
-    그것을 풀지 않고 원문 문구를 찾으면 **긍정 조건은 항상 실패하고 부정 조건은
-    항상 통과한다.** 후자가 더 나쁘다 — 검사가 통과하면서 아무것도 확인하지
-    않는다. 이 스위트에도 그런 검사가 둘 있었다.
+    The hook emits via `json.dump`, so Korean is escaped as `\\uXXXX`. Searching for the original
+    wording without unwrapping makes **every positive condition fail and every negative condition
+    pass.** The latter is worse - the check passes while verifying nothing. This suite had two
+    such checks.
     """
     out = ""
     try:
@@ -343,57 +367,57 @@ def guard(path, event="PreToolUse", project=None):
 
 if cp949:
     p, s = guard(cp949)
-    check("CP949 파일 편집 전에 경고", p.returncode == 0 and "CP949" in hook_text(p),
+    check("warns before editing a CP949 file", p.returncode == 0 and "CP949" in hook_text(p),
           "" if "CP949" in hook_text(p) else hook_text(p)[:80], secs=s)
 else:
-    skip("CP949 편집 전 경고", "CP949 파일을 찾지 못함")
+    skip("warning before a CP949 edit", "no CP949 file found")
 
 p, s = guard(os.path.join(SCRATCH, "outside.php"))
-check("트리 밖 파일은 조용히 통과",
+check("a file outside the tree passes silently",
       p.returncode == 0 and not hook_text(p).strip(), secs=s)
 
 if utf8:
-    guard(utf8, "PreToolUse")          # 편집 전 기록이 있어야 편집 후 검사가 돈다
+    guard(utf8, "PreToolUse")          # the post-edit check needs the pre-edit record
     p, s = guard(utf8, "PostToolUse")
     out = hook_text(p)
-    check("정상 PHP 편집 후 문법 실패 경고 없음", "돌지 않습니다" not in out, secs=s)
-    # **이 줄이 핵심이다.** "검사되지 않았습니다"가 없다는 것은 검사가 돌아서
-    # 통과했다는 뜻이고, 도구를 못 찾아 조용히 넘어간 상태와 다르다. 도구 경로가
-    # 옛 위치를 가리키던 동안 이 구분이 없어서 결함이 통과했다.
-    check("문법 검사가 실제로 돌았다 (미검사 상태가 아니다)",
-          "검사되지 않았습니다" not in out,
-          "" if "검사되지 않았습니다" not in out else out.strip()[-90:])
-    # 도구를 못 찾는 상황을 일부러 만들어, 그때 조용히 넘어가지 않는지 본다.
+    check("no syntax-failure warning after a valid PHP edit", "does not run on" not in out, secs=s)
+    # **This line is the point.** The absence of "was not checked" means the check ran and
+    # passed, which differs from silently skipping because the tool could not be found. While the
+    # tool path pointed at the old location this distinction was missing and a defect passed.
+    check("the syntax check really ran (not an unchecked state)",
+          "was not checked" not in out,
+          "" if "was not checked" not in out else out.strip()[-90:])
+    # Deliberately create the situation where the tool cannot be found, and see that it does not pass silently.
     BARE = os.path.join(SCRATCH, "bareproj")
     os.makedirs(BARE + "/.claude/config", exist_ok=True)
     with open(BARE + "/.claude/config/workspace.json", "w") as fh:
         json.dump({"legacy": LG}, fh)
-    # 편집 전 단계를 먼저 돌린다. PostToolUse 는 그때 기록된 인코딩과 대조하는
-    # 것부터 시작하므로, 기록이 없으면 문법 검사까지 가지 않고 조용히 끝난다.
+    # Run the pre-edit stage first. PostToolUse starts by comparing against the encoding recorded
+    # then, so with no record it ends quietly before reaching the syntax check.
     t0 = time.time()
     for ev in ("PreToolUse", "PostToolUse"):
         p, _ = guard(utf8, ev, project=BARE)
     _o = hook_text(p).strip()
-    check("문법 검사 도구가 없으면 그 사실을 말한다 (조용히 통과하지 않는다)",
-          "찾지 못했습니다" in _o,
-          "" if "찾지 못했습니다" in _o else f"exit={p.returncode} 출력={_o[:120]!r}",
+    check("it says so when the syntax-check tool is missing (no silent pass)",
+          "could not find" in _o,
+          "" if "could not find" in _o else f"exit={p.returncode} output={_o[:120]!r}",
           secs=time.time() - t0)
 
-# ------------------------------------------- 3~8. 띄워 둔 케이스 모듈을 거둔다
+# ------------------------------------------- 3–8. collect the started case modules
 for (no, title, label, skipname, filename, _args, timeout), h in zip(
         CASE_MODULES, handles):
     collect_cases(no, title, label, skipname, filename, timeout, h)
 
-# ------------------------------------------------------- 9. 교차 검사
-# **한 사실이 두 파일에 적혀 있으면 언젠가 갈린다.** 갈라진 것을 사람이 알아채는
-# 경로가 없으면 그 어긋남은 조용히 산다 — v1 에서 감사 어휘 하나가 라우팅표에
-# 없어서, 그 판정이 돌아올 때마다 갈 곳 없이 사라졌다. 여기서는 정본을 정하고
-# 사본을 대조한다. 실패는 "둘 중 하나가 틀렸다"가 아니라 "둘이 갈렸다"이다.
-print("\n### 9. 교차 검사 — 같은 사실이 두 곳에 적힌 자리")
+# ------------------------------------------------------- 9. cross-checks
+# **When one fact is written in two files, they drift eventually.** With no path for a person to
+# notice the drift, the mismatch lives quietly - in v1 one completeness verdict was absent from
+# the routing table, so every time it came back it vanished with nowhere to go. Here a canonical
+# copy is named and the copies are compared. A failure is not "one of the two is wrong" but "the two drifted".
+print("\n### 9. cross-checks - places where the same fact is written twice")
 
 AGENTS = os.path.join(PROJECT, ".claude", "agents")
 SKILLS = os.path.join(PROJECT, ".claude", "skills")
-SLICE = os.path.join(SKILLS, "legacy-slice")
+PAGE = os.path.join(SKILLS, "legacy-migrate")
 ROW = re.compile(r"^\| `?([^|`]+)`?\s*(?:\([^)]*\))?\s*\|")
 
 
@@ -406,11 +430,11 @@ def read(*parts):
 
 
 def table_first_col(text, header_needle):
-    """머리글 줄을 지난 뒤의 표 **본문** 행에서 첫 열만 뽑는다.
+    """First column of the table **body** rows, after the header line.
 
-    본문의 시작은 구분선(`|---|`)이다. 그것을 기준으로 삼지 않으면 표 머리글이
-    첫 항목으로 딸려 들어오고, 그러면 두 파일이 같아도 다르다고 말한다 —
-    어긋남을 못 보는 것보다 나쁘지는 않지만, 매번 틀리는 검사는 꺼진다.
+    The body starts at the separator (`|---|`). Without using that as the anchor the table header
+    comes in as the first item, and then two identical files are reported as different - not worse
+    than missing a drift, but a check that is wrong every time gets switched off.
     """
     out, seen, started = [], False, False
     for line in text.splitlines():
@@ -432,51 +456,62 @@ def table_first_col(text, header_needle):
     return out
 
 
-# (a) 감사 판정 어휘 — 정본은 감사자 파일 하나 -----------------------------
-# v3 에서 라우팅표가 SKILL.md 를 떠나 references/routing.md 로 갔다. 표가 이사할 때
-# 이 검사가 조용히 빈손이 되면(둘 다 `[]` 이므로 "같다"로 통과할 수도 있다) 어휘가
-# 갈라진 뒤에도 아무도 모른다. 그래서 양쪽이 **비어 있지 않은지**도 함께 본다.
-auditor = read(AGENTS, "domain-boundary-auditor.md")
-skill = read(SLICE, "SKILL.md")
-routing = read(SLICE, "references", "routing.md")
-canon = table_first_col(auditor, "## 판정 어휘")
-routed = table_first_col(routing, "| 판정 |")
-check("감사 판정 어휘가 라우팅표와 같다",
-      bool(canon) and bool(routed) and canon == routed,
-      f"감사자 {canon} vs 라우팅표 {routed}" if canon != routed
-      else f"{len(canon)}개")
+# (a) completeness verdict vocabulary - canonical in the checker file alone ---
+# In v3 the routing table left SKILL.md for references/routing.md. If this check went quietly
+# empty during that move (both being `[]` could pass as "equal"), nobody would know after the
+# vocabulary drifted. So it also checks that **neither side is empty**.
+checker = read(AGENTS, "domain-placement-checker.md")
+skill = read(PAGE, "SKILL.md")
+routing = read(PAGE, "references", "routing.md")
+canon = table_first_col(checker, "## Verdict vocabulary")
+routed = table_first_col(routing, "| Verdict |")
+# `domain-leftover/SKILL.md` keeps a third copy, and it declares itself a copy. routing.md
+# exists because in v2 this table had been copied into four places and had already drifted;
+# a copy no check compares is exactly how that happened. So all three are compared here.
+leftover = table_first_col(read(PROJECT, ".claude", "skills", "domain-leftover", "SKILL.md"),
+                           "| Verdict |")
+_v = {"checker": canon, "routing table": routed, "domain-leftover": leftover}
+_empty = [k for k, v in _v.items() if not v]
+_differ = [k for k, v in _v.items() if v and v != canon]
+check("the completeness verdict vocabulary matches across all three copies",
+      not _empty and not _differ,
+      (f"empty: {_empty} " if _empty else "")
+      + (f"differs from the checker: {_differ} · " + " · ".join(f"{k}={_v[k]}" for k in _differ)
+         if _differ else "")
+      or f"{len(canon)} words × 3 copies")
 
-# 표를 옮겼으면 오케스트레이터가 그 자리를 가리키고 있어야 한다. 가리키지 않으면
-# 판정이 돌아와도 라우팅할 곳을 모른다.
-check("오케스트레이터가 라우팅 정본을 가리킨다",
+# If the table moved, the orchestrator has to point at its new place. If it does not, a returning
+# verdict has nowhere to route.
+check("the orchestrator points at the canonical routing table",
       "references/routing.md" in skill,
-      "legacy-slice/SKILL.md 에 references/routing.md 언급이 없다")
+      "" if "references/routing.md" in skill
+      else "legacy-migrate/SKILL.md does not mention references/routing.md")
 
-# (b) 산출물 — 정본은 artifacts.json --------------------------------------
+# (b) artifacts - canonical in artifacts.json --------------------------------
 try:
-    with open(os.path.join(SLICE, "references", "artifacts.json"),
+    with open(os.path.join(PAGE, "references", "artifacts.json"),
               encoding="utf-8") as fh:
         art = json.load(fh)
 except (OSError, ValueError) as exc:
     art, art_err = {}, str(exc)
 else:
     art_err = ""
-# v3 의 스킬은 산출물을 표가 아니라 산문으로 적는다. 형식을 따라가는 대신
-# **이름의 집합**을 맞춘다 — 형식이 또 바뀌어도 이 검사는 산다. 잡으려는 것은 둘이다:
-# JSON 에 없는 산출물을 스킬이 말하는 것(유령), 그리고 JSON 에 있는데 스킬이 한 번도
-# 말하지 않는 것(아무도 쓰지 않을 산출물).
+# The v3 skill writes its artifacts as prose rather than a table. Instead of following the format,
+# the **set of names** is matched - this check survives another format change. Two things are
+# caught: an artifact the skill mentions that is absent from the JSON (a ghost), and one in the
+# JSON the skill never mentions (an artifact nobody will use).
 named = set(re.findall(r"`(\d\d-[\w.-]+)`", skill))
-check("산출물 이름이 artifacts.json 과 같다",
+check("artifact names match artifacts.json",
       bool(art) and named == set(art),
       art_err or (f"JSON {sorted(art)} vs SKILL.md {sorted(named)}"
-                  if named != set(art) else f"{len(art)}개"))
+                  if named != set(art) else f"{len(art)} names"))
 
-# (c) 실험 헬퍼 상수 ↔ 설정 키 ---------------------------------------------
+# (c) experiment helper constants ↔ config keys ---------------------------------
 tpl = read(PROJECT, ".claude", "templates", "MigrationExperiment.php")
-# 헬퍼 상수 다섯. 뒤의 둘은 `slicecheck` 의 계측 봉투이고, 그 둘이 갈리면 봉투는
-# 켜지지 않으면서 단계는 "불일치 없음"과 같은 모양으로 끝난다.
+# Five helper constants. The last two are `pagecheck`'s instrumentation variables, and if those
+# drift the variable never reaches PHP while the stage ends looking exactly like "no mismatch".
 HELPER_CONSTS = ("VALUE_DUAL", "VALUE_MIGRATED", "LOG_ENV", "NOISE_ENV",
-                 "POISON_ENV")
+                 "FAKEVALUE_ENV")
 consts = [c for c in HELPER_CONSTS
           if re.search(r"\bconst\s+" + c + r"\s*=", tpl)]
 try:
@@ -494,20 +529,20 @@ want_keys = [("legacy.switch.values.dual",
               "logEnvVar" in (exl.get("dualRun") or {})),
              ("legacy.dualRun.noiseEnvVar",
               "noiseEnvVar" in (exl.get("dualRun") or {})),
-             ("legacy.dualRun.poisonEnvVar",
-              "poisonEnvVar" in (exl.get("dualRun") or {})),
+             ("legacy.dualRun.fakeValueEnvVar",
+              "fakeValueEnvVar" in (exl.get("dualRun") or {})),
              ("legacy.dualRun.coveragePath",
               "coveragePath" in (exl.get("dualRun") or {}))]
 missing = [k for k, ok in want_keys if not ok]
-check(f"실험 헬퍼의 상수 {len(HELPER_CONSTS)}개와 example 의 키 {len(want_keys)}개가 "
-      "둘 다 있다",
+check(f"the helper's {len(HELPER_CONSTS)} constants and the example's {len(want_keys)} keys "
+      "are both present",
       len(consts) == len(HELPER_CONSTS) and not missing,
-      f"없는 상수 {[c for c in HELPER_CONSTS if c not in consts]} · "
-      f"없는 키 {missing}"
+      f"missing constants {[c for c in HELPER_CONSTS if c not in consts]} · "
+      f"missing keys {missing}"
       if len(consts) != len(HELPER_CONSTS) or missing else "")
 
-# 실제 설정이 그 절을 채웠다면 값까지 대조한다. 안 채웠으면 건너뛴다 —
-# 값이 없는 것은 어긋남이 아니라 아직 쓰지 않은 것이다.
+# If the real config filled that section, compare the values too. If it did not, skip -
+# an absent value is not a drift but something not yet written.
 real = {}
 try:
     with open(os.path.join(PROJECT, ".claude", "config", "workspace.json"),
@@ -523,54 +558,91 @@ if rv.get("dual") and rv.get("migrated") and rlog:
     same = (rv["dual"] == lit["VALUE_DUAL"]
             and rv["migrated"] == lit["VALUE_MIGRATED"]
             and rlog == lit["LOG_ENV"])
-    check("실제 설정의 토글 값이 헬퍼 상수와 같다", same,
-          "" if same else f"설정 {rv}/{rlog} vs 템플릿 {lit}")
-    # 계측 봉투는 아직 안 채운 체크아웃이 있을 수 있다. 채웠으면 대조하고, 안
-    # 채웠으면 건너뛴다 — 값이 없는 것은 어긋남이 아니다.
+    check("the real config's toggle values match the helper constants", same,
+          "" if same else f"config {rv}/{rlog} vs template {lit}")
+    # A checkout may not have filled the instrumentation variables yet. Compare when filled, skip
+    # when not - an absent value is not a drift.
     for key, const in (("noiseEnvVar", "NOISE_ENV"),
-                       ("poisonEnvVar", "POISON_ENV")):
+                       ("fakeValueEnvVar", "FAKEVALUE_ENV")):
         got = (real.get("dualRun") or {}).get(key)
         if not got:
-            skip(f"실제 설정의 {key} 대조", f"workspace.json 에 {key} 가 아직 없다")
+            skip(f"compare the real config's {key}", f"workspace.json has no {key} yet")
         else:
-            check(f"실제 설정의 {key} 가 헬퍼의 {const} 와 같다",
+            check(f"the real config's {key} matches the helper's {const}",
                   got == lit[const], "" if got == lit[const]
-                  else f"설정 {got} vs 템플릿 {lit[const]}")
+                  else f"config {got} vs template {lit[const]}")
 else:
-    skip("실제 설정의 토글 값 대조", "workspace.json 에 dualRun·dual 값이 아직 없다")
+    skip("compare the real config's toggle values", "workspace.json has no dualRun or dual value yet")
 
-# (d) 컨텍스트 파일의 주입 대상이 실재하는가 ------------------------------
+# (d) do the context files' injection targets exist ------------------------------
 inject = os.path.join(PROJECT, ".claude", "hooks", "context-inject.py")
 if os.path.isfile(inject):
     p, s = run([sys.executable, inject, "--check", "--strict"], timeout=60)
-    check("컨텍스트 파일의 inject.agents·skills 가 실제 파일과 일치",
+    check("the context files' inject.agents and inject.skills match real files",
           p.returncode == 0,
           (p.stdout + p.stderr).strip()[-200:] if p.returncode else "", secs=s)
 else:
-    skip("컨텍스트 주입 대상 대조", "context-inject.py 가 없다")
+    skip("compare context injection targets", "context-inject.py is missing")
 
-# (e) 옛 이름이 추적 파일에 남아 있지 않은가 -------------------------------
-# v1 의 이름이 하나라도 남으면 오케스트레이터가 없는 에이전트를 부르거나 없는
-# 파일을 기다린다. 둘 다 실패가 아니라 정지로 나타난다.
-# 이름을 조각으로 이어 붙인다. 이 파일도 추적되므로, 목록을 리터럴로 적으면
-# **검사가 자기 자신을 잡는다** — 그러면 이 파일을 예외로 두게 되고, 예외가
-# 생기는 순간 검사에 사각이 생긴다. `selftest_phpseam.py` 가 콘텐츠 가드에 대해
-# 한 것과 같은 거래다.
+# (e) are old names absent from tracked files -------------------------------
+# One surviving v1 name makes the orchestrator call an agent that does not exist or wait for a
+# file that does not exist. Both appear as a stall, not as a failure.
+# The names are assembled from fragments. This file is tracked too, so writing the list as
+# literals would make **the check catch itself** - then this file becomes an exception, and the
+# moment an exception exists the check has a blind spot. The same trade `selftest_phpmove.py`
+# made for the content guard.
+# v1 names, then the ones the v3 vocabulary rename retired. Extending this list is part of
+# renaming: a guard that only knows the previous rename is green for every later one, which is
+# exactly how this check stayed green across 75 changed files while old names survived in 20.
+# NOTE: these fragments are data, not prose. A bulk rename that rewrites a word inside one
+# of them silently empties that slot - `00-` + `ledger.md` was turned into `00-` + `rules.md`
+# once, and the name it guarded went unguarded while the check stayed green.
 OLD_NAMES = ["e2e-baseline" + "-author", "00-" + "ledger.md",
              "01-" + "design.md", "02-" + "swap.md",
-             "03-" + "audit.md", "04-" + "domain-doc.md"]
-# 당시 기록은 제외한다. 지난 일을 지금 이름으로 고쳐 적는 것은 기록이 아니다.
+             "03-" + "audit.md", "04-" + "domain-doc.md",
+             # agents
+             "php-" + "seam-extractor", "php-rule-" + "redteam",
+             "equivalence-" + "corpus-author", "backend-" + "slice-designer",
+             "backend-" + "slice-builder", "domain-boundary-" + "auditor",
+             # Two names the guard never covered, found in a measurement table in
+             # docs/context-system.md. The second is worse than a leftover: a bulk rename
+             # rewrote the word inside an already-stale name and produced a third name that
+             # was never any agent, so no fragment of an old name could ever have caught it.
+             "php-swap-" + "engineer", "backend-slice-" + "implementer",
+             "backend-page-" + "implementer",
+             "goal-" + "gauge-author",
+             # skills
+             "legacy-" + "slice", "slice-" + "scout", "golden-" + "master",
+             "boundary-" + "audit",
+             # context and references
+             "ledger-" + "contract", "equivalence-" + "oracles", "seam-" + "shape",
+             "equivalence-" + "observation",
+             "ledger-" + "format", "journal-" + "format",
+             # tools
+             "php" + "seam", "slice" + "check",
+             # artifacts and config keys
+             "00-" + "seam.md", "01-" + "ledger.jsonl", "02-" + "design-delta.md",
+             "04-" + "audit.md", "corpus" + ".json", "pins" + ".json",
+             "legacy." + "seam.", "slices" + "Dir", "journal" + "Dir",
+             "poison" + "EnvVar",
+             # The Korean metaphors this rename removed. They survive longest in the skills'
+             # trigger phrases, where nothing reads them and no check ever looked.
+             "이음" + "새", "골든 " + "마스터", "저" + "널", "델" + "타",
+             "코퍼" + "스", "게이" + "지", "원" + "장", "슬라이" + "스"]
+# Records of the time are excluded. Rewriting yesterday under today's names is not a record.
 EXCLUDE_FILES = {"docs/first-run-retrospective.md"}
+EXCLUDE_PREFIXES = ("docs/retrospectives/", "docs/handoffs/", "docs/reviews/",
+                    "docs/lecture-notes/")
 EXCLUDE_RANGES = {"docs/legacy-migration-os.md": [("## 9.", "## 10."),
                                                  ("## 변경 이력", None)]}
-# `--others --exclude-standard` 를 붙인다. 아직 `git add` 되지 않은 새 파일도
-# 곧 추적될 파일이고, 그 파일에 남은 옛 이름은 커밋 뒤에야 보이기 시작한다.
+# Add `--others --exclude-standard`. A new file not yet `git add`ed is a file that will be
+# tracked, and an old name left in it only becomes visible after the commit.
 tracked = subprocess.run(
     ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
     cwd=PROJECT, capture_output=True, text=True, timeout=60).stdout
 hits = []
 for rel in tracked.splitlines():
-    if not rel or rel in EXCLUDE_FILES:
+    if not rel or rel in EXCLUDE_FILES or rel.startswith(EXCLUDE_PREFIXES):
         continue
     if os.path.splitext(rel)[1] not in (".md", ".json", ".py", ".sh", ".php",
                                         ".ts", ".yml", ".yaml", ""):
@@ -590,15 +662,15 @@ for rel in tracked.splitlines():
         for name in OLD_NAMES:
             if name in line:
                 hits.append(f"{rel}:{i}: {name}")
-check("v1 의 옛 이름이 추적 파일에 없다", not hits,
-      "; ".join(hits[:4]) + (f" (외 {len(hits) - 4}건)" if len(hits) > 4 else ""))
+check("no retired name remains in a tracked file", not hits,
+      "; ".join(hits[:4]) + (f" (and {len(hits) - 4} more)" if len(hits) > 4 else ""))
 
-# (f) 도구 이름 목록 셋이 갈리지 않았는가 --------------------------------
-# `phpstats` 가 스스로 "훅의 `OUR_TOOLS` 와 같은 목록이어야 한다"고 적어 두었는데
-# 아무도 대지 않았고, 그래서 이미 갈려 있었다 — 한쪽에만 있는 이름은 훅이 기록
-# 하지만 리포트가 전용 호출로 세지 않아 사용률이 낮은 쪽으로 기운다. 목록을 여기
-# 리터럴로 적으면 **넷째 사본**이 되므로, 세 파일에서 뽑아 서로 댄다. 뽑지 못한
-# 것은 통과가 아니다.
+# (f) have the three tool-name lists drifted --------------------------------
+# `phpstats` had written down that it "must be the same list as the hook's `OUR_TOOLS`" and
+# nobody compared them, so they had already drifted - a name present on one side only is
+# recorded by the hook but not counted by the report as a dedicated call, which tips the usage
+# ratio downward. Writing the list here as a literal would make a **fourth copy**, so it is
+# extracted from the three files and compared. Failing to extract is not a pass.
 def _str_seq(node):
     if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
         names = {e.value for e in node.elts
@@ -608,7 +680,7 @@ def _str_seq(node):
 
 
 def tool_names(rel, want):
-    """`want` 라는 이름의 대입, 없으면 `for want in (...)` 의 반복 대상."""
+    """An assignment named `want`, or failing that the iterable of `for want in (...)`."""
     try:
         tree = ast.parse(read(PROJECT, rel))
     except (SyntaxError, ValueError):
@@ -632,8 +704,8 @@ LISTS = [(".claude/scripts/phpstats", "OURS"),
 got = [(rel, tool_names(rel, want)) for rel, want in LISTS]
 missing = [rel for rel, names in got if not names]
 if missing:
-    check("도구 이름 목록 셋이 일치", False,
-          "목록을 뽑지 못했다: " + ", ".join(os.path.basename(m) for m in missing))
+    check("the three tool-name lists match", False,
+          "could not extract the lists: " + ", ".join(os.path.basename(m) for m in missing))
 else:
     base = got[0][1]
     diffs = []
@@ -643,15 +715,53 @@ else:
             diffs.append(f"{os.path.basename(got[0][0])}↔{os.path.basename(rel)}: "
                          + " ".join(sorted(f"-{n}" for n in only_a)
                                     + sorted(f"+{n}" for n in only_b)))
-    check(f"도구 이름 목록 셋이 일치 ({len(base)}개)", not diffs, " · ".join(diffs))
+    check(f"the three tool-name lists match ({len(base)} names)", not diffs, " · ".join(diffs))
 
-# ------------------------------------------------------------------ 정리
+# (g) do the lists cover the tools that actually exist ----------------------
+# Comparing the three lists only to each other cannot see a name missing from all three, and
+# that is what happened: `pagecheck` was in none of them, so every call to the v3 pipeline's
+# central tool was recorded as neither dedicated use nor detour and dropped out of the
+# measurement. A dropped record reads as "the tool was not used".
+_sdir = os.path.join(PROJECT, ".claude", "scripts")
+on_disk = {n for n in os.listdir(_sdir)
+           if not n.startswith(("selftest", "_", ".")) and "." not in n
+           and os.access(os.path.join(_sdir, n), os.X_OK)}
+if missing:
+    check("the tool lists name every tool in .claude/scripts", False,
+          "the lists could not be extracted")
+else:
+    union = set().union(*(names for _, names in got))
+    gap = on_disk - union
+    check(f"the tool lists name every tool in .claude/scripts ({len(on_disk)} on disk)",
+          not gap, "not named anywhere: " + " ".join(sorted(gap)) if gap else "")
+
+# (h) is every hook actually registered -------------------------------------
+# Every hook case runs the hook file directly, so a hook that lost its settings.json entry
+# stays green here while nothing ever calls it. For `guard-company-content.py` that is the
+# difference between this repository staying publishable and not.
+_hdir = os.path.join(PROJECT, ".claude", "hooks")
+hook_files = {n for n in os.listdir(_hdir) if n.endswith(".py")}
+try:
+    with open(os.path.join(PROJECT, ".claude", "settings.json"), encoding="utf-8") as fh:
+        _settings = json.load(fh)
+    registered = {os.path.basename(h.get("command", "").strip('"').split("/")[-1].strip('"'))
+                  for groups in (_settings.get("hooks") or {}).values()
+                  for g in groups for h in g.get("hooks", [])}
+    unregistered = {n for n in hook_files if n not in registered}
+    check(f"every hook is registered in settings.json ({len(hook_files)} hooks)",
+          not unregistered, "not registered: " + " ".join(sorted(unregistered))
+          if unregistered else "")
+except (OSError, ValueError) as exc:
+    check("every hook is registered in settings.json", False,
+          f"settings.json could not be read: {exc}")
+
+# ------------------------------------------------------------------ wrap-up
 shutil.rmtree(SCRATCH, ignore_errors=True)
 print("\n" + "=" * 64)
 bad = [n for n, ok, _ in results if not ok]
-print(f"{len(results) - len(bad)}/{len(results)} 통과"
-      + ("" if not bad else "   실패: " + ", ".join(bad)))
+print(f"{len(results) - len(bad)}/{len(results)} pass"
+      + ("" if not bad else "   failed: " + ", ".join(bad)))
 if skipped:
-    print(f"건너뜀 {len(skipped)}개 — " + ", ".join(n for n, _ in skipped))
-    print("  건너뛴 검사는 통과가 아니다. --quick 없이 한 번은 돌려야 한다.")
+    print(f"skipped {len(skipped)} - " + ", ".join(n for n, _ in skipped))
+    print("  a skipped check is not a pass. Run it once without --quick.")
 sys.exit(1 if bad else 0)

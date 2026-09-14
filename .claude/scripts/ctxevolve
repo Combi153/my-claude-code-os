@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""저널 → 컨텍스트 파일 개정 제안. 적용하지 않는다.
+"""Round records → proposed context-file revisions. It applies nothing.
 
-이 도구가 하는 일은 셋뿐이다.
+This tool does three things and no more.
 
-1. `--propose` : 역할 저널에서 **근거를 인용한** `global` 항목을 모아, 어느 컨텍스트
-   파일에 무엇을 더할지 제안을 찍는다. 파일을 고치지 않는다.
-2. `--stale`   : 저널 항목이 인용한 파일·심볼·설정 키가 아직 있는지 확인하고, 사라진
-   항목을 만료 후보로 표시한다. 축적된 산문은 방치하면 썩는다.
-3. `--check`   : 저널 항목의 형식을 검사한다. `evidence` 없는 항목은 항목이 아니다.
+1. `--propose` : gather `global` entries **that cite evidence** from the role records and print
+   which context file to add what to. It edits no file.
+2. `--stale`   : check whether the files, symbols and config keys an entry cites still exist, and
+   mark the vanished ones as expiry candidates. Accumulated prose rots when left alone.
+3. `--check`   : check the form of the record entries. An entry without `evidence` is not an entry.
 
-**왜 적용하지 않는가.** 에이전트가 스스로 만든 반성으로 하네스를 고치면 고치지 않은
-것보다 나빠진다는 측정이 있다. 그래서 근거 있는 항목만 후보가 되고, 그 후보를 실제
-문장으로 옮기는 것과 무엇을 지울지 정하는 것은 사람이 한다. 승인은 `git diff` 다.
+**Why it applies nothing.** There is a measurement showing that fixing a harness from an agent's
+own self-generated reflection comes out worse than not fixing it. So only evidenced entries become
+candidates, and turning a candidate into an actual sentence, and deciding what to delete, is done by a person. The approval is `git diff`.
 
-그리고 통째로 다시 쓰지 않는다. 증분으로만 댄다 — 전체를 재생성하면 세부가 붕괴한다.
+And it never rewrites wholesale. It proposes only increments - regenerating everything collapses the detail.
 
-설정 키를 못 읽으면 좁은 답을 조용히 내지 않고 멈춘다.
+When a config key cannot be read it stops rather than quietly giving a narrowed answer.
 """
 import argparse
 import json
@@ -29,56 +29,56 @@ ROOT = os.environ.get("CLAUDE_PROJECT_DIR") or os.path.dirname(
 NEEDED = ("lesson", "trigger", "evidence", "scope")
 SCOPES = ("surface", "area", "global")
 
-# 역할이 내는 교훈이 어느 컨텍스트 파일의 관할인지. 제안일 뿐이고 사람이 옮긴다.
+# Which context file a role's lesson belongs to. It is only a proposal; a person moves it.
 ROLE_HOME = {
-    "php-seam-extractor": "seam-shape",
-    "php-behavior-analyst": "ledger-contract",
-    "php-rule-redteam": "silent-failure-catalog",
-    "equivalence-corpus-author": "equivalence-oracles",
-    "backend-slice-designer": "backend-architecture",
-    "backend-slice-builder": "equivalence-oracles",
-    "domain-boundary-auditor": "silent-failure-catalog",
-    "domain-scribe": "ledger-contract",
+    "php-swap-extractor": "swap-point-shape",
+    "php-behavior-analyst": "rules-contract",
+    "php-rule-recheck": "silent-failure-catalog",
+    "observation-author": "equivalence-checks",
+    "backend-designer": "backend-architecture",
+    "backend-builder": "equivalence-checks",
+    "domain-placement-checker": "silent-failure-catalog",
+    "domain-scribe": "rules-contract",
 }
 
 
 def where(p, ln):
-    """저장소 안이면 상대경로, 밖이면 절대경로. `../../..` 는 아무에게도 쓸모없다."""
+    """Relative inside the repository, absolute outside. `../../..` is useless to everyone."""
     rp = os.path.relpath(p, ROOT)
     return f"{p if rp.startswith('..') else rp}:{ln}"
 
 
 def die(msg, code=3):
-    print(f"멈춤: {msg}", file=sys.stderr)
+    print(f"stopping: {msg}", file=sys.stderr)
     sys.exit(code)
 
 
 def config():
     p = os.path.join(ROOT, ".claude", "config", "workspace.json")
     if not os.path.isfile(p):
-        die(f"{p} 없음 — workspace.example.json 을 복사해 채우세요")
+        die(f"{p} is missing - copy workspace.example.json and fill it in")
     try:
         return json.load(open(p, encoding="utf-8"))
     except Exception as exc:
-        die(f"workspace.json 을 읽을 수 없다: {exc}")
+        die(f"workspace.json could not be read: {exc}")
 
 
-def journal_dir(cfg, override):
+def record_dir(cfg, override):
     if override:
         return override
     docs = cfg.get("docs") or {}
-    root, sub = docs.get("root"), docs.get("journalDir")
+    root, sub = docs.get("root"), docs.get("recordDir")
     if not root:
-        die("설정 키 docs.root 가 없다")
+        die("the config key docs.root is missing")
     if not sub:
-        die("설정 키 docs.journalDir 가 없다 — 저널이 갈 곳을 정해야 한다")
+        die("the config key docs.recordDir is missing - the records need somewhere to go")
     return os.path.join(root, sub)
 
 
 def load(jdir):
-    """(항목, 파일, 줄번호, 오류) 목록. 한 줄이 깨져도 나머지는 산다."""
+    """A list of (entry, file, line number, error). One broken line leaves the rest alive."""
     if not os.path.isdir(jdir):
-        die(f"저널 디렉터리가 없다 ({jdir}) — 아직 아무 회차도 항목을 남기지 않았다")
+        die(f"no record directory ({jdir}) - no round has left an entry yet")
     out = []
     for dirpath, _, files in os.walk(jdir):
         for fn in sorted(files):
@@ -92,9 +92,9 @@ def load(jdir):
                 try:
                     out.append((json.loads(line), p, i, None))
                 except json.JSONDecodeError as exc:
-                    out.append((None, p, i, f"JSON 이 아니다: {exc}"))
+                    out.append((None, p, i, f"not JSON: {exc}"))
     if not out:
-        print(f"저널에 항목이 없다 ({jdir})")
+        print(f"no entry in the records ({jdir})")
     return out
 
 
@@ -108,25 +108,25 @@ def check(items):
             continue
         missing = [k for k in NEEDED if not str(it.get(k) or "").strip()]
         if missing:
-            print(f"  FAIL  {w}  빠진 열: {', '.join(missing)}"
-                  + ("  ← evidence 없는 항목은 항목이 아니다" if "evidence" in missing else ""))
+            print(f"  FAIL  {w}  missing fields: {', '.join(missing)}"
+                  + ("  ← an entry without evidence is not an entry" if "evidence" in missing else ""))
             bad += 1
         elif it.get("scope") not in SCOPES:
-            print(f"  FAIL  {w}  scope 가 {SCOPES} 밖이다: {it.get('scope')!r}")
+            print(f"  FAIL  {w}  scope is outside {SCOPES}: {it.get('scope')!r}")
             bad += 1
         elif not it.get("role"):
-            print(f"  FAIL  {w}  role 이 없다 — 어느 역할이 읽어야 하는지 알 수 없다")
+            print(f"  FAIL  {w}  no role - there is no way to know which role should read it")
             bad += 1
     return bad
 
 
 def evidence_paths(ev):
-    """근거 문자열에서 이 저장소 기준으로 확인 가능한 경로를 뽑는다."""
+    """Extract the paths verifiable against this repository from the evidence string."""
     return [m for m in re.findall(r"[\w./-]+\.(?:php|kt|kts|json|jsonl|md|py|sh|sql)(?::\d+(?:-\d+)?)?", ev or "")]
 
 
 def missing_refs(it):
-    """인용한 경로 중 지금 존재하지 않는 것."""
+    """Cited paths that do not exist now."""
     gone = []
     for ref in evidence_paths(it.get("evidence", "")):
         path = ref.split(":")[0]
@@ -141,82 +141,82 @@ def stale(items):
         if err or not it:
             continue
         for path in missing_refs(it):
-            print(f"  만료 후보  {where(p, ln)}  인용한 경로가 없다: {path}")
+            print(f"  expiry candidate  {where(p, ln)}  the cited path is gone: {path}")
             print(f"             lesson: {str(it.get('lesson',''))[:90]}")
             n += 1
     return n
 
 
 def propose(items):
-    """근거 있는 global 항목만 후보다. 파일을 고치지 않는다."""
+    """Only evidenced global entries are candidates. It edits no file."""
     eligible, stale_out = [], []
     for it, p, ln, err in items:
         if err or not it or it.get("scope") != "global":
             continue
         if not all(str(it.get(k) or "").strip() for k in NEEDED):
             continue
-        # 인용한 근거가 사라진 항목은 후보가 아니다. 그것을 컨텍스트로 올리면
-        # 확인할 수 없는 규칙을 결정적으로 주입하게 되고, 그게 부패의 경로다.
+        # An entry whose cited evidence is gone is not a candidate. Promoting it to context would
+        # deterministically inject a rule nobody can verify, and that is the path to rot.
         gone = missing_refs(it)
         (stale_out if gone else eligible).append((it, p, ln, gone))
     cands = [(it, p, ln) for it, p, ln, _ in eligible]
     if stale_out:
-        print(f"제외: 근거가 사라진 {len(stale_out)} 항목은 후보에서 뺐다 (`--stale` 로 본다).")
+        print(f"excluded: {len(stale_out)} entries whose evidence is gone were dropped (see `--stale`).")
         for it, p, ln, gone in stale_out:
-            print(f"  {where(p, ln)}  없는 경로 {', '.join(gone)}")
+            print(f"  {where(p, ln)}  missing paths {', '.join(gone)}")
         print()
     if not cands:
-        print("후보 없음. `global` 이고 근거를 인용한 항목만 컨텍스트 개정의 후보가 된다.")
-        print("`surface` 나 `area` 항목은 그 저널에 남아 같은 역할이 읽는다 — 컨텍스트로 올리면")
-        print("다른 표면에서 틀린 규칙을 결정적으로 주입하게 된다.")
+        print("no candidate. Only entries that are `global` and cite evidence become candidates.")
+        print("A `surface` or `area` entry stays in that record for the same role to read - promoting it")
+        print("would deterministically inject a rule that is wrong on another surface.")
         return 0
     by_home = {}
     for it, p, ln in cands:
-        home = ROLE_HOME.get(it.get("role"), "(관할 미정 — 사람이 정한다)")
+        home = ROLE_HOME.get(it.get("role"), "(owner undecided - a person decides)")
         by_home.setdefault(home, []).append((it, p, ln))
     for home, group in sorted(by_home.items()):
         target = os.path.join(".claude", "context", f"{home}.md")
         exists = os.path.isfile(os.path.join(ROOT, target))
-        print(f"\n## {target}{'' if exists else '   ← 그런 파일이 없다'}")
+        print(f"\n## {target}{'' if exists else '   ← no such file'}")
         for it, p, ln in group:
             print(f"\n  Add  ({it.get('role')}, {where(p, ln)})")
             print(f"    lesson   : {it['lesson']}")
             print(f"    trigger  : {it['trigger']}")
             print(f"    evidence : {it['evidence']}")
-    print(f"\n{len(cands)} 후보. **적용하지 않았다.**")
-    print("사람이 할 일 둘. (1) 이 문장을 컨텍스트 파일의 어느 절에 증분으로 넣을지 정한다 —")
-    print("통째로 다시 쓰지 않는다. (2) **그 장치가 대체하는 산문을 같은 변경에서 지운다.**")
-    print("장치를 만들고 그것이 대체한 문장을 남겨 두면 유지할 표면만 늘어난다.")
-    print("그리고 예산을 확인한다: python3 .claude/scripts/selftest_budget.py")
+    print(f"\n{len(cands)} candidates. **Nothing was applied.**")
+    print("Two things for a person. (1) Decide which section of the context file this sentence goes")
+    print("into, as an increment - never rewrite wholesale. (2) **Delete the prose that mechanism")
+    print("replaces, in the same change.** Building a mechanism and leaving the sentence it replaced")
+    print("only grows the surface to maintain. Then check the budget: python3 .claude/scripts/selftest_budget.py")
     return 0
 
 
 def main():
     ap = argparse.ArgumentParser(add_help=True)
-    ap.add_argument("--propose", action="store_true", help="근거 있는 global 항목에서 컨텍스트 개정을 제안한다 (고치지 않는다)")
-    ap.add_argument("--stale", action="store_true", help="인용한 경로가 사라진 항목을 만료 후보로 표시한다")
-    ap.add_argument("--check", action="store_true", help="저널 항목의 형식을 검사한다")
-    ap.add_argument("--journal-dir", help="설정 대신 이 디렉터리를 쓴다")
+    ap.add_argument("--propose", action="store_true", help="propose context revisions from evidenced global entries (it edits nothing)")
+    ap.add_argument("--stale", action="store_true", help="mark entries whose cited paths are gone as expiry candidates")
+    ap.add_argument("--check", action="store_true", help="check the form of the record entries")
+    ap.add_argument("--record-dir", help="use this directory instead of the config")
     a = ap.parse_args()
     if not (a.propose or a.stale or a.check):
         ap.print_help()
         return 2
 
-    jdir = a.journal_dir or journal_dir(config(), None)
+    jdir = a.record_dir or record_dir(config(), None)
     items = load(jdir)
     rc = 0
     if a.check:
-        print("## 저널 형식")
+        print("## record format")
         bad = check(items)
         good = len([1 for it, _, _, e in items if not e])
-        print(f"  {good - bad}/{len(items)} 통과" if items else "  항목 없음")
+        print(f"  {good - bad}/{len(items)} pass" if items else "  no entry")
         rc = max(rc, 1 if bad else 0)
     if a.stale:
-        print("## 만료 후보")
+        print("## expiry candidates")
         n = stale(items)
-        print(f"  {n} 건" if n else "  없음")
+        print(f"  {n} candidates" if n else "  none")
     if a.propose:
-        print("## 컨텍스트 개정 제안")
+        print("## proposed context revisions")
         propose(items)
     return rc
 

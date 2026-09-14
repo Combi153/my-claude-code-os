@@ -1,36 +1,37 @@
 #!/usr/bin/env python3
-"""phpseam - is anything left in this page that the seam was supposed to take?
+"""phpmove - is anything left in this page that the swap was supposed to take?
 
-    phpseam lint <page.php> [--json]                 허용된 문장 종류만 남았는가
-    phpseam lint --template <tpl.php> [--strict]     템플릿 안 제어 구조 보고
-    phpseam pin <file.php> <function|Class::method> [--pins <pins.json>]
-    phpseam check [--pins <pins.json>]                핀 걸린 본문이 그대로인가
-    phpseam callers <symbol> [--allow-file <f>]... [--scope <dir>]
-    phpseam fields [--schema <dir>] --adapter <file>... [--ledger <ledger>]
-                                                      어댑터가 그 필드를 묻는가
+    phpmove lint <page.php> [--json]                 only the allowed statement kinds remain?
+    phpmove lint --template <tpl.php> [--strict]     report control structures in a template
+    phpmove hash <file.php> <function|Class::method> [--hashes <body-hashes.json>]
+    phpmove check [--hashes <body-hashes.json>]                are the recorded bodies unchanged?
+    phpmove callers <symbol> [--allow-file <f>]... [--scope <dir>]
+    phpmove fields [--schema <dir>] --adapter <file>... [--rules <rules>]
+                                                      does the adapter ask for that field?
 
-    공통: [--config <workspace.json>]  [-h | --help]
+    common: [--config <workspace.json>]  [-h | --help]
 
-이 도구가 답하는 질문은 e2e 가 답하지 못하는 쪽이다. PHP 가 규칙을 계속 계산해도
-화면에 나오는 값은 같으므로 스위트는 전부 초록으로 남는다. 그래서 "옮겨갔는가"는
-관찰이 아니라 **모양**으로 묻는다 — 페이지 스크립트에 include·가드·파싱·이음새
-호출·바인딩·템플릿 말고 다른 문장이 있으면 규칙이 아직 화면에 있다.
+The question this tool answers is the one e2e cannot. PHP can keep computing a rule and
+the value on screen stays the same, so the whole suite remains green. So "did it move?"
+is asked as a matter of **shape**, not observation - if the page script holds any statement
+other than include, guard, parse, the swap-point call, bind and template, a rule is still on the screen.
 
-판정은 토큰으로 한다. 정규식으로 `if` 를 세면 문자열과 주석 안의 `if` 까지 세고,
-그 숫자는 틀렸다는 표시 없이 도착한다. 토큰화는 `php -d short_open_tag=1` 로 부른다.
-이 트리의 템플릿은 `<?` 를 쓰는데 CLI 기본값(`short_open_tag=0`)에서는 토크나이저가
-그것을 PHP 로 보지 않고 HTML 문자열에 통째로 삼킨다. 결과는 에러가 아니라 **더 적은
-토큰**이고, 린터는 "제어 구조가 없다"고 보고한다. 실측으로 116 대 252 였다. 그래서
-토큰화 뒤 `T_INLINE_HTML` 안에 `<?` 가 남아 있으면 검사하지 않고 exit 2 로 멈춘다.
+The verdict is made from tokens. Counting `if` with a regex counts the `if` inside strings and
+comments too, and that number arrives with no sign that it is wrong. Tokenizing calls
+`php -d short_open_tag=1`. This tree's templates use `<?`, and under the CLI default
+(`short_open_tag=0`) the tokenizer does not see that as PHP and swallows it whole into an HTML
+string. The result is not an error but **fewer tokens**, and the linter reports "no control
+structures". Measured, it was 116 against 252. So if `<?` remains inside `T_INLINE_HTML` after
+tokenizing, it stops with exit 2 instead of judging.
 
-파일은 바이트로 읽고 바이트로 해시한다. 이 트리는 파일마다 CP949 와 UTF-8 이 섞여
-있고, 한글 리터럴은 토큰 안에 원래 바이트 그대로 남는다. 디코딩은 사람에게 보여줄
-때만 한다.
+Files are read as bytes and hashed as bytes. This tree mixes CP949 and UTF-8 per file, and a
+Korean literal stays in the token as its original bytes. Decoding happens only when showing
+something to a person.
 
-환경값은 하나도 이 파일에 없다. 전부 `.claude/config/workspace.json` 의 `legacy.seam`
-절에서 읽고, 필요한 키가 없으면 **좁은 답을 내지 않고 멈춘다**. 이 도구가 막으려는
-실패가 정확히 "못 본 것을 없는 것으로 읽는" 것이므로, 설정 부재가 "위반 0건"으로
-위장하는 경로를 열어두면 도구가 자기 목적을 배반한다.
+Not one environment value lives in this file. They all come from the `legacy.swap` section of
+`.claude/config/workspace.json`, and when a required key is missing it **stops instead of
+returning a narrowed answer**. The failure this tool exists to prevent is exactly "reading what
+was not seen as what is not there", so leaving a path where a missing config masquerades as "zero violations" would make the tool betray its own purpose.
 """
 import base64
 import datetime
@@ -53,10 +54,10 @@ from _phpenc import project_dir  # noqa: E402
 HERE = os.path.dirname(os.path.abspath(__file__))
 PHPGREP = os.path.join(HERE, "phpgrep")
 
-# 토큰을 base64 로 실어 나른다. CP949 리터럴이 든 파일을 json_encode 에 그대로
-# 넣으면 PHP 가 false 를 돌려주고, 그 false 는 빈 출력으로 도착한다 — 또 하나의
-# 조용한 실패다. token_name() 을 PHP 쪽에서 부르는 것도 같은 이유다. T_* 상수의
-# 숫자는 PHP 버전마다 다르므로 숫자를 넘기면 8.3 과 8.5 가 다른 답을 낸다.
+# Tokens travel base64-encoded. Feeding a file holding CP949 literals straight into
+# json_encode makes PHP return false, and that false arrives as empty output - another
+# silent failure. Calling token_name() on the PHP side is for the same reason: the numeric
+# values of the T_* constants differ per PHP version, so passing numbers makes 8.3 and 8.5 disagree.
 TOKEN_PHP = (
     "$s=file_get_contents($argv[1]);"
     "if($s===false){fwrite(STDERR,'unreadable');exit(3);}"
@@ -95,33 +96,33 @@ SQL_WORDS = re.compile(rb"\b(select|insert|update|delete|where|join)\b", re.I)
 
 
 def die(msg, code=2):
-    print(f"phpseam: {msg}", file=sys.stderr)
+    print(f"phpmove: {msg}", file=sys.stderr)
     sys.exit(code)
 
 
 # ------------------------------------------------------------------ config
 
 def load_cfg(path):
-    """(legacy 절, 표시용 경로, 프로젝트 디렉터리 또는 None).
+    """(the legacy section, a display path, the project directory or None).
 
-    `--config` 는 selftest 가 실제 workspace.json 없이 돌기 위한 것이 아니라,
-    이 도구가 어느 체크아웃을 향하는지 호출자가 명시할 수 있게 하기 위한 것이다.
-    합성 설정으로 자기검사가 도는 것은 그 성질의 결과다.
+    `--config` is not there so that the selftest can run without a real workspace.json; it is
+    there so a caller can state which checkout this tool is aimed at. Self-testing against a
+    synthetic config is a consequence of that property.
     """
     if path:
         if not os.path.isfile(path):
-            die(f"--config {path} 가 없다.")
+            die(f"--config {path} does not exist.")
         try:
             with open(path, encoding="utf-8") as fh:
                 raw = json.load(fh)
         except (OSError, ValueError) as exc:
-            die(f"--config {path} 를 읽을 수 없다: {exc}")
+            die(f"--config {path} could not be read: {exc}")
         lg = raw.get("legacy")
         if not isinstance(lg, dict) or not lg:
-            die(f"{path} 에 legacy 절이 없다. workspace.example.json 을 보고 채워라.")
+            die(f"{path} has no legacy section. Fill it in from workspace.example.json.")
         proj = None
-        # `<proj>/.claude/config/*.json` 모양이면 프로젝트를 알아낼 수 있다.
-        # 하위 도구(phpgrep)가 같은 설정을 보게 하려면 이것이 필요하다.
+        # A `<proj>/.claude/config/*.json` shape lets us work out the project.
+        # This is needed so the sub-tool (phpgrep) sees the same config.
         head = os.path.dirname(os.path.abspath(path))
         if os.path.basename(head) == "config":
             head2 = os.path.dirname(head)
@@ -130,19 +131,19 @@ def load_cfg(path):
         return lg, path, proj
     lg = config()
     if not lg:
-        die(config_problem() or "설정을 읽지 못했다.")
+        die(config_problem() or "could not read the config.")
     root = project_dir()
     return lg, os.path.join(root or "", CONFIG_REL), root
 
 
 def need(cfg, dotted, where):
-    """설정값, 없으면 멈춘다. 기본값으로 조용히 넘어가지 않는다."""
+    """The config value, or stop. Never falls through to a default in silence."""
     cur = cfg
     for part in dotted.split("."):
         if not isinstance(cur, dict) or part not in cur or cur[part] in (None, "", [], {}):
-            die(f"{where} 의 legacy.{dotted} 가 없다. "
-                "workspace.example.json 의 legacy.seam 절을 보고 채워라. "
-                "이 값 없이 내는 답은 좁은 답이라 위반 0건과 구별되지 않는다.")
+            die(f"{where} has no legacy.{dotted}. "
+                "Fill it in from the legacy.swap section of workspace.example.json. "
+                "An answer given without this value is a narrowed answer, indistinguishable from zero violations.")
         cur = cur[part]
     return cur
 
@@ -160,7 +161,7 @@ def compile_one(pattern, label):
     try:
         return re.compile(pattern)
     except re.error as exc:
-        die(f"{label} 의 정규식을 컴파일하지 못했다: {exc}")
+        die(f"could not compile the regex for {label}: {exc}")
 
 
 def compile_many(patterns, label):
@@ -176,8 +177,8 @@ def tree_root_of(cfg, where):
     if cfg.get("root") and cfg.get("treeMarker"):
         return os.path.join(os.path.abspath(os.path.expanduser(cfg["root"])),
                             cfg["treeMarker"])
-    die(f"{where} 에 legacy.treeRoot 도 legacy.root+treeMarker 도 없다. "
-        "호출자 경로를 절대경로로 되돌릴 수 없다.")
+    die(f"{where} has neither legacy.treeRoot nor legacy.root+treeMarker. "
+        "Caller paths cannot be resolved back to absolute.")
 
 
 # ---------------------------------------------------------------- tokenize
@@ -188,33 +189,33 @@ class Tok:
     def __init__(self, name, text, off, line):
         self.name, self.text, self.off, self.line = name, text, off, line
 
-    def __repr__(self):                                   # 디버깅용
+    def __repr__(self):                                   # for debugging
         return f"<{self.name} {self.text[:16]!r} L{self.line}>"
 
 
 def tokenize(path, php_bin):
-    """(원본 바이트, 토큰들). 답할 수 없으면 exit 2 — 빈손을 돌려주지 않는다."""
+    """(raw bytes, tokens). Exits 2 when it cannot answer - it never returns empty-handed."""
     try:
         with open(path, "rb") as fh:
             raw = fh.read()
     except OSError as exc:
-        die(f"{path} 를 읽을 수 없다: {exc}")
+        die(f"{path} could not be read: {exc}")
     cmd = [php_bin, "-d", "short_open_tag=1", "-d", "display_errors=0",
            "-r", TOKEN_PHP, os.path.abspath(path)]
     try:
         p = subprocess.run(cmd, capture_output=True, timeout=60)
     except FileNotFoundError:
-        die(f"php 바이너리 {php_bin!r} 를 찾지 못했다 "
-            "(legacy.tooling.phpBinary). 토큰 없이는 아무것도 판정하지 않는다.")
+        die(f"php binary {php_bin!r} not found "
+            "(legacy.tooling.phpBinary). Nothing is judged without tokens.")
     except subprocess.TimeoutExpired:
-        die(f"{php_bin} 토큰화가 60초를 넘겼다: {path} — 검사 못 함(시간 초과)")
+        die(f"{php_bin} tokenizing took over 60s: {path} - could not check (timeout)")
     if p.returncode != 0:
         err = p.stderr.decode("utf-8", "replace").strip()[:200]
-        die(f"{php_bin} 토큰화 실패 (exit {p.returncode}) {path}: {err}")
+        die(f"{php_bin} tokenizing failed (exit {p.returncode}) {path}: {err}")
     try:
         data = json.loads(p.stdout.decode("ascii"))
     except (ValueError, UnicodeDecodeError) as exc:
-        die(f"토큰 JSON 을 읽지 못했다 ({path}): {exc}")
+        die(f"could not read the token JSON ({path}): {exc}")
     toks, off, line = [], 0, 1
     for name, b64 in data:
         text = base64.b64decode(b64)
@@ -222,19 +223,19 @@ def tokenize(path, php_bin):
         line += text.count(b"\n")
         off += len(text)
     if off != len(raw) or b"".join(t.text for t in toks) != raw:
-        die(f"토큰이 {path} 의 바이트를 그대로 재구성하지 못했다 "
-            f"({off} vs {len(raw)}바이트). 토크나이저 출력을 믿을 수 없다.")
+        die(f"the tokens did not reconstruct {path} byte for byte "
+            f"({off} vs {len(raw)} bytes). The tokenizer output cannot be trusted.")
     for t in toks:
         if t.name == "T_INLINE_HTML" and b"<?" in t.text:
-            die(f"{path}:{t.line} 의 HTML 안에 `<?` 가 남아 있다 — "
-                "short_open_tag 가 적용되지 않았다. 이 상태로 세면 제어 구조가 "
-                "통째로 빠지고 그 누락이 '위반 0건'과 같은 모양으로 나온다. "
-                f"{php_bin} 이 -d short_open_tag=1 을 무시하지 않는지 확인하라.")
+            die(f"`<?` remains inside HTML at {path}:{t.line} - "
+                "short_open_tag did not take effect. Counting in this state drops control "
+                "structures entirely, and that omission looks exactly like 'zero violations'. "
+                f"Check that {php_bin} is not ignoring -d short_open_tag=1.")
     return raw, toks
 
 
 def sig(toks):
-    """의미 있는 토큰만. 공백·주석·태그는 판정에 쓰지 않는다."""
+    """Meaningful tokens only. Whitespace, comments and tags take no part in the verdict."""
     out = []
     for t in toks:
         if t.name in NOISE:
@@ -246,7 +247,7 @@ def sig(toks):
 
 
 def statements(toks):
-    """최상위 문장으로 자른다. 순서는 강제하지 않고 종류만 본다."""
+    """Cut into top-level statements. Order is not enforced; only the kind is read."""
     out, cur = [], []
     curly = paren = square = 0
     for t in toks:
@@ -301,7 +302,7 @@ def one_line(data, enc, width=78):
 
 
 def call_names(stmt):
-    """(이름, 토큰) 목록. `f(`, `$o->m(`, `C::m(`, `new C(` 를 모두 센다."""
+    """A list of (name, token). Counts `f(`, `$o->m(`, `C::m(` and `new C(` alike."""
     s = sig(stmt)
     out = []
     for i, t in enumerate(s):
@@ -319,7 +320,7 @@ def call_names(stmt):
 
 
 def split_assign(s):
-    """최상위 `=` 를 기준으로 (좌변, 우변). 대입이 아니면 None."""
+    """(left, right) around the top-level `=`. None when it is not an assignment."""
     depth = 0
     for i, t in enumerate(s):
         if t.name in OPEN_CURLY:
@@ -350,45 +351,45 @@ def arithmetic_in(s):
     return False
 
 
-def seam_names(text, seam_re):
-    """이음새 호출 자체가 쓰는 이름들. 그것을 '허용되지 않은 호출'로 세면
-    이음새가 있는 페이지가 이음새 때문에 위반이 된다."""
+def swap_names(text, swap_re):
+    """Names the swap-point call itself uses. Counting those as 'a call outside the allow
+    list' would make a page violate because of the very swap point it has."""
     out = set()
-    for m in seam_re.finditer(text):
+    for m in swap_re.finditer(text):
         out |= {w.lower() for w in re.findall(r"\w+", m.group(0))}
     return out
 
 
 def hard_reasons(stmt, allowed, in_include, exempt=()):
-    """문장 종류와 무관하게 이음새 밖인 것들. 첫 번째 이유만 쓴다."""
+    """Things outside the swap point regardless of statement kind. Only the first reason is written."""
     reasons = []
     s = sig(stmt)
     for t in s:
         if t.name in CONTROL:
-            reasons.append(f"제어 구조 ({t.name})")
+            reasons.append(f"control structure ({t.name})")
             break
     for t in s:
         if t.name in STRINGS and SQL_WORDS.search(t.text):
             kw = SQL_WORDS.search(t.text).group(1).decode()
-            reasons.append(f"문자열 안 SQL 키워드 ({kw})")
+            reasons.append(f"SQL keyword inside a string ({kw})")
             break
     for t in s:
         if t.name == "T_GLOBAL" or (t.name == "T_VARIABLE" and t.text == b"$GLOBALS"):
-            reasons.append("전역 변수 쓰기")
+            reasons.append("writes to a global")
             break
     if not in_include and arithmetic_in(s):
-        reasons.append("산술·비교 연산 (계산은 이음새 안으로 간다)")
+        reasons.append("arithmetic or comparison (computation goes inside the swap point)")
     if not in_include:
         for name, t in call_names(stmt):
             bare = name.lower().replace("new ", "")
             if bare not in allowed and bare not in exempt:
-                reasons.append(f"허용되지 않은 호출: {name}()")
+                reasons.append(f"call outside the allow list: {name}()")
                 break
     return reasons
 
 
 def is_parse(lhs, rhs, allowed):
-    """우변이 요청 입력을 읽는 것 + 그 캐스팅·기본값 뿐인가."""
+    """Is the right side only a read of request input plus its cast or default?"""
     if not lhs or not rhs or lhs[0].name != "T_VARIABLE":
         return False
     has_super = any(t.name == "T_VARIABLE"
@@ -403,22 +404,22 @@ def is_parse(lhs, rhs, allowed):
                 or any(t.name in CASTS or t.name in FREE_CALLS for t in rhs))
 
 
-def is_bind(lhs, rhs, seam_var):
-    if not seam_var or not lhs or lhs[0].name != "T_VARIABLE":
+def is_bind(lhs, rhs, swap_var):
+    if not swap_var or not lhs or lhs[0].name != "T_VARIABLE":
         return False
     return any(t.name == "T_VARIABLE"
-               and t.text.decode("ascii", "replace") == seam_var for t in rhs)
+               and t.text.decode("ascii", "replace") == swap_var for t in rhs)
 
 
 def is_view_bind(lhs, view_re):
-    """이음새와 무관한 화면 배선 대입. **좌변 변수 이름으로만** 판정한다.
+    """A screen-wiring assignment unrelated to the swap point, judged **only by the name on the left**.
 
-    우변 모양으로 받지 않는 이유가 이 함수의 전부다. `$navSelected = 'notice'` 와
-    `$aParam['limit'] = 10` 은 토큰으로 구별되지 않는데, 앞의 것은 include 된 헤더가
-    읽는 화면 상수라 이음새가 가져갈 것이 없고 뒤의 것은 이음새로 가야 할 도메인
-    값이다. 리터럴 대입을 모양으로 허용하면 뒤의 것이 조용히 통과하고, 그것이 바로
-    이 린터가 잡으려고 있는 위반이다. 그래서 넓히는 것은 모양이 아니라 이름이고,
-    이름은 설정에 명시된 것만 받는다.
+    Why the shape of the right-hand side is not accepted instead is the whole point of this
+    function. `$navSelected = 'notice'` and `$aParam['limit'] = 10` are indistinguishable as
+    tokens, yet the first is a screen constant read by an included header, with nothing for the
+    swap point to take, while the second is a domain value that must go into it. Allowing literal
+    assignments by shape lets the second through in silence, and that is exactly the violation
+    this linter exists to catch. So what is widened is the name, not the shape, and only names stated in the config are accepted.
     """
     if view_re is None or not lhs or lhs[0].name != "T_VARIABLE":
         return False
@@ -427,32 +428,32 @@ def is_view_bind(lhs, view_re):
 
 
 def classify(raw_file, stmts, cfg, where):
-    guards = compile_many(need(cfg, "seam.guardIdioms", where), "seam.guardIdioms")
-    seam_re = compile_one(need(cfg, "seam.serviceCallPattern", where),
-                          "seam.serviceCallPattern")
-    tpl_re = compile_one(need(cfg, "seam.templateIncludePattern", where),
-                         "seam.templateIncludePattern")
-    # 선택 키. 이 트리의 실제 바인딩은 include 가 아니라 템플릿 **객체**다
-    # (`new Template` → `set()` → `fetch()`). include 만 보는 동안 그 세 줄은
-    # 전부 violation 으로 잡혔고, 위반 목록이 진짜 위반과 섞여 못 읽게 된다.
-    # 없으면 include 기반 판정만 남는다 — 조용히 좁아지는 것이 아니라, 그
-    # 트리에 템플릿 객체가 없다는 뜻이다.
-    render_pat = opt(cfg, "seam.templateRenderPattern", None)
-    render_re = (compile_one(render_pat, "seam.templateRenderPattern")
+    guards = compile_many(need(cfg, "swap.guardIdioms", where), "swap.guardIdioms")
+    swap_re = compile_one(need(cfg, "swap.callPattern", where),
+                          "swap.callPattern")
+    tpl_re = compile_one(need(cfg, "swap.templateIncludePattern", where),
+                         "swap.templateIncludePattern")
+    # Optional key. The real binding in this tree is not an include but a template **object**
+    # (`new Template` -> `set()` -> `fetch()`). While only includes were considered, those three
+    # lines were all caught as violations, and a violation list mixed with real violations is unreadable.
+    # Without it only the include-based verdict remains - not a silent narrowing, but a statement
+    # that the tree has no template object.
+    render_pat = opt(cfg, "swap.templateRenderPattern", None)
+    render_re = (compile_one(render_pat, "swap.templateRenderPattern")
                  if render_pat else None)
-    # 선택 키. 화면 배선 변수의 이름들이다 — include 된 헤더나 템플릿이 읽는
-    # 값이라 이음새가 가져갈 것이 없고, 그래서 추출을 해도 페이지에서 사라지지
-    # 않는다. 받지 않으면 "위반 0" 이 도달 불가능한 종료 조건이 되고, 그러면
-    # 사람이 "원래 있던 것 9건"을 손으로 세는 더 약한 조건으로 물러나게 된다.
-    # 없으면 이 판정 자체가 없다 — 좁아지는 쪽이 기본값이다.
-    view_pat = opt(cfg, "seam.viewVarPattern", None)
-    view_re = (compile_one(view_pat, "seam.viewVarPattern")
+    # Optional key. The names of screen-wiring variables - values read by an included header or
+    # template, with nothing for the swap point to take, so they do not disappear from the page
+    # even after extraction. Not accepting them makes "zero violations" an unreachable exit
+    # condition, and a person then retreats to the weaker condition of counting "nine that were
+    # already there" by hand. Without it this verdict does not exist at all - narrowing is the default.
+    view_pat = opt(cfg, "swap.viewVarPattern", None)
+    view_re = (compile_one(view_pat, "swap.viewVarPattern")
                if view_pat else None)
-    allowed = {str(c).lower() for c in need(cfg, "seam.allowedCalls", where)}
+    allowed = {str(c).lower() for c in need(cfg, "swap.allowedCalls", where)}
 
-    rows, seam_var, prev_kind = [], None, None
+    rows, swap_var, prev_kind = [], None, None
 
-    # 1차: 이음새 호출을 먼저 찾는다. 바인딩 판정이 그 결과 변수를 필요로 한다.
+    # Pass 1: find the swap-point call first. The bind verdict needs its result variable.
     texts = [text_of(s) for s in stmts]
     shown = []
     for st in stmts:
@@ -460,11 +461,11 @@ def classify(raw_file, stmts, cfg, where):
         shown.append(raw_file[v[0].off:v[-1].off + len(v[-1].text)] if v
                      else text_of(st))
     for stmt, raw in zip(stmts, texts):
-        if seam_re.search(raw.decode("utf-8", "replace")) or seam_re.search(
+        if swap_re.search(raw.decode("utf-8", "replace")) or swap_re.search(
                 raw.decode("cp949", "replace")):
             parts = split_assign(sig(stmt))
             if parts:
-                seam_var = base_var(parts[0])
+                swap_var = base_var(parts[0])
             break
 
     for stmt, raw, disp in zip(stmts, texts, shown):
@@ -475,29 +476,29 @@ def classify(raw_file, stmts, cfg, where):
         as_legacy = raw.decode("cp949", "replace")
 
         if all(t.name == "T_INLINE_HTML" for t in s):
-            rows.append((line, "violation", disp, "페이지가 HTML 을 직접 출력한다"))
+            rows.append((line, "violation", disp, "the page emits HTML directly"))
             prev_kind = "violation"
             continue
 
         if any(g.search(as_text) or g.search(as_legacy) for g in guards):
             kind = "guard"
         elif prev_kind == "guard" and len(s) <= 2 and s[0].name == "T_EXIT":
-            kind = "guard"                       # 가드 뒤에 홀로 선 exit
+            kind = "guard"                       # a bare exit after a guard
         else:
             in_include = any(t.name in INCLUDES for t in s)
-            exempt = (seam_names(as_text, seam_re)
-                      | seam_names(as_legacy, seam_re))
+            exempt = (swap_names(as_text, swap_re)
+                      | swap_names(as_legacy, swap_re))
             hard = hard_reasons(stmt, allowed, in_include, exempt)
             if in_include and not hard:
                 kind = "template" if (tpl_re.search(as_text)
                                       or tpl_re.search(as_legacy)) else "include"
-            elif not hard and (seam_re.search(as_text) or seam_re.search(as_legacy)):
-                kind = "seam-call"
+            elif not hard and (swap_re.search(as_text) or swap_re.search(as_legacy)):
+                kind = "call"
             elif render_re is not None and (render_re.search(as_text)
                                             or render_re.search(as_legacy)):
-                # 이음새 호출 판정 **뒤**에 온다. 앞에 두면 렌더 정규식이 조금만
-                # 넓어도 이음새 호출이 template 으로 삼켜지고, 그때 lint 는
-                # "이음새 호출 0개"라고 말한다 — 위반이 아니라 부재로.
+                # This comes **after** the swap-point call verdict. Put it before and a render
+                # regex that is even slightly wide swallows the swap-point call as a template,
+                # and lint then says "zero swap-point calls" - as an absence, not a violation.
                 kind = "template"
             elif hard:
                 kind, reason = "violation", hard[0]
@@ -506,20 +507,20 @@ def classify(raw_file, stmts, cfg, where):
                 lhs, rhs = parts if parts else (None, None)
                 if parts and is_parse(lhs, rhs, allowed):
                     kind = "parse"
-                elif parts and is_bind(lhs, rhs, seam_var):
+                elif parts and is_bind(lhs, rhs, swap_var):
                     kind = "bind"
                 elif parts and is_view_bind(lhs, view_re):
                     kind = "bind"
                 elif len(s) >= 2 and s[0].name == "T_STRING" \
-                        and s[0].text == b"extract" and seam_var \
+                        and s[0].text == b"extract" and swap_var \
                         and any(t.name == "T_VARIABLE"
-                                and t.text.decode("ascii", "replace") == seam_var
+                                and t.text.decode("ascii", "replace") == swap_var
                                 for t in s):
                     kind = "bind"
                 else:
                     kind = "violation"
-                    reason = ("허용된 모양이 아니다 "
-                              "(include·guard·parse·seam-call·bind·template 밖)")
+                    reason = ("not one of the allowed shapes "
+                              "(outside include, guard, parse, call, bind, template)")
         rows.append((line, kind, disp, reason))
         prev_kind = kind
     return rows
@@ -530,33 +531,33 @@ def cmd_lint(path, cfg, where, as_json):
     raw, toks = tokenize(path, php_bin)
     enc = detect(raw) or "unknown"
     rows = classify(raw, statements(toks), cfg, where)
-    seam = sum(1 for _, k, _, _ in rows if k == "seam-call")
+    swap = sum(1 for _, k, _, _ in rows if k == "call")
     bad = [r for r in rows if r[1] == "violation"]
-    if seam != 1:
+    if swap != 1:
         bad.append((0, "violation", b"",
-                    f"이음새 호출이 {seam}개다 — 정확히 하나여야 한다"))
+                    f"there are {swap} swap-point calls - there must be exactly one"))
     nlines = raw.count(b"\n") + 1
 
     if as_json:
         json.dump({
             "file": os.path.abspath(path), "encoding": enc, "lines": nlines,
-            "seamCalls": seam, "violations": len(bad),
+            "swapCalls": swap, "violations": len(bad),
             "statements": [{"line": l, "kind": k,
                             "text": one_line(t, enc, 200), "reason": r}
                            for l, k, t, r in rows],
         }, sys.stdout, ensure_ascii=False, indent=2)
         print()
     else:
-        print(f"# {path}  [{enc}, {nlines}줄 · 문장 {len(rows)}개] "
-              f" seam-call {seam} · 위반 {len(bad)}")
+        print(f"# {path}  [{enc}, {nlines} lines · {len(rows)} statements] "
+              f" call {swap} · violations {len(bad)}")
         for l, k, t, r in rows:
             head = f"{l:>5}  {k:<10} {one_line(t, enc)}"
             print(head + (f"\n{'':>7}└ {r}" if r else ""))
         for l, k, t, r in bad:
             if l == 0:
-                print(f"{'':>5}  {k:<10} (파일 전체)\n{'':>7}└ {r}")
+                print(f"{'':>5}  {k:<10} (whole file)\n{'':>7}└ {r}")
     sys.stdout.flush()
-    print(f"# 위반 {len(bad)} / 문장 {len(rows)} — 위반은 이음새 밖 문장이다",
+    print(f"# violations {len(bad)} / statements {len(rows)} - a violation is a statement outside the swap point",
           file=sys.stderr)
     return 1 if bad else 0
 
@@ -569,7 +570,7 @@ def cmd_lint_template(path, cfg, strict):
     enc = detect(raw) or "unknown"
     s = sig(toks)
     counts = {"if": 0, "else": 0, "foreach": 0, "for": 0, "while": 0,
-              "switch": 0, "삼항": 0}
+              "switch": 0, "ternary": 0}
     rows = []
     for i, t in enumerate(s):
         if t.name == "T_IF" or t.name == "T_ELSEIF":
@@ -589,7 +590,7 @@ def cmd_lint_template(path, cfg, strict):
                     cond.append(u)
             suspect = arithmetic_in(cond)
             rows.append((t.line, t.name.lower()[2:],
-                         "규칙 의심" if suspect else ""))
+                         "suspected rule" if suspect else ""))
         elif t.name in ("T_ELSE",):
             counts["else"] += 1
             rows.append((t.line, "else", ""))
@@ -597,28 +598,28 @@ def cmd_lint_template(path, cfg, strict):
             counts[t.name.lower()[2:]] += 1
             rows.append((t.line, t.name.lower()[2:], ""))
         elif t.name == "CHAR" and t.text == b"?":
-            counts["삼항"] += 1
-            rows.append((t.line, "삼항", "규칙 의심"))
+            counts["ternary"] += 1
+            rows.append((t.line, "ternary", "suspected rule"))
         elif t.name in TERNARY:
-            counts["삼항"] += 1
+            counts["ternary"] += 1
             rows.append((t.line, "??", ""))
     suspects = [r for r in rows if r[2]]
-    print(f"# {path}  [{enc}, {raw.count(b"\n") + 1}줄 · 토큰 {len(toks)}개]"
-          f"  제어구조 {len(rows)} · 규칙 의심 {len(suspects)}")
+    print(f"# {path}  [{enc}, {raw.count(b"\n") + 1} lines · {len(toks)} tokens]"
+          f"  control structures {len(rows)} · suspected rules {len(suspects)}")
     for line, kind, note in rows:
         print(f"{line:>5}  {kind:<8} {note}")
     sys.stdout.flush()
     print("# " + " · ".join(f"{k} {v}" for k, v in counts.items() if v),
           file=sys.stderr)
-    print("# 규칙 의심 = 조건에 비교·산술이 있다. 감사자가 읽는 줄이다.",
+    print("# suspected rule = the condition carries a comparison or arithmetic. This is the line the checker reads.",
           file=sys.stderr)
     return 1 if (strict and suspects) else 0
 
 
-# ----------------------------------------------------------------- pin/check
+# ----------------------------------------------------------------- hash/check
 
 def find_bodies(toks, symbol):
-    """[(class, name, start_off, end_off, start_line, end_line)] — 이름이 맞는 것."""
+    """[(class, name, start_off, end_off, start_line, end_line)] - the ones whose name matches."""
     want_cls, _, want_fn = symbol.rpartition("::")
     s = sig(toks)
     out = []
@@ -651,7 +652,7 @@ def find_bodies(toks, symbol):
                         open_tok = u
                         break
                     elif d == 0 and u.name == "CHAR" and u.text == b";":
-                        break            # 추상 메서드 — 본문이 없다
+                        break            # abstract method - no body
                     j += 1
                 if open_tok is not None:
                     k, bd = j, 0
@@ -684,108 +685,117 @@ def find_bodies(toks, symbol):
     return out
 
 
+# The first clause of a body_digest() failure is what the `check` report prints in its
+# one-line column. Both the writer and the reader of that clause use this literal.
+SEPARATOR = " - "
+
+
 def body_digest(path, symbol, php_bin):
-    """(sha256, 바이트수, [시작줄, 끝줄], 클래스) — 못 찾으면 (None, 이유)."""
+    """(sha256, byte count, [start line, end line], class) - (None, reason) when not found."""
     raw, toks = tokenize(path, php_bin)
     found = find_bodies(toks, symbol)
     if not found:
-        return None, f"{path} 에서 {symbol} 의 본문을 찾지 못했다"
+        return None, f"could not find the body of {symbol} in {path}"
     if len(found) > 1:
-        names = ", ".join(f"{c or '(전역)'}::{n}@{a}" for c, n, _, _, a, _ in found)
-        return None, (f"{path} 에 {symbol} 이 {len(found)}개 있다 — {names}. "
-                      "Class::method 로 좁혀라.")
+        names = ", ".join(f"{c or '(global)'}::{n}@{a}" for c, n, _, _, a, _ in found)
+        return None, (f"{path} has {len(found)} of {symbol}{SEPARATOR}{names}. "
+                      "Narrow it with Class::method.")
     cls, name, a, b, la, lb = found[0]
     body = raw[a:b]
     return {"sha256": hashlib.sha256(body).hexdigest(), "bytes": len(body),
             "lines": [la, lb], "class": cls}, None
 
 
-def pins_path(cfg, given, where):
+def hashes_path(cfg, given, where):
     if given:
         return os.path.abspath(given)
-    name = opt(cfg, "seam.pinsFile", None)
+    name = opt(cfg, "swap.hashesFile", None)
     if not name:
-        die(f"{where} 의 legacy.seam.pinsFile 이 없고 --pins 도 없다. "
-            "어디에 핀을 적어야 하는지 알 수 없다.")
+        die(f"{where} has no legacy.swap.hashesFile and no --hashes either. "
+            "There is no way to know where to record the hash.")
     return os.path.abspath(name)
 
 
-def load_pins(path):
+def load_hashes(path):
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError) as exc:
-        die(f"{path} 를 읽을 수 없다: {exc}")
-    if not isinstance(data.get("pins"), dict):
-        die(f"{path} 에 pins 객체가 없다.")
+        die(f"{path} could not be read: {exc}")
+    if not isinstance(data.get("hashes"), dict):
+        die(f"{path} has no hashes object.")
     return data
 
 
-def cmd_pin(path, symbol, cfg, where, given):
+def cmd_hash(path, symbol, cfg, where, given):
     php_bin = opt(cfg, "tooling.phpBinary", "php")
     if not os.path.isfile(path):
-        die(f"{path} 가 파일이 아니다")
+        die(f"{path} is not a file")
     info, err = body_digest(path, symbol, php_bin)
     if err:
         die(err)
-    pf = pins_path(cfg, given, where)
-    data = {"pins": {}}
+    pf = hashes_path(cfg, given, where)
+    data = {"hashes": {}}
     if os.path.isfile(pf):
-        data = load_pins(pf)
+        data = load_hashes(pf)
     key = f"{os.path.abspath(path)}::{symbol}"
-    old = data["pins"].get(key)
-    data["pins"][key] = {
+    old = data["hashes"].get(key)
+    data["hashes"][key] = {
         "file": os.path.abspath(path), "symbol": symbol,
         "sha256": info["sha256"], "bytes": info["bytes"],
         "lines": info["lines"],
-        "pinned": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "recorded": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
     }
     os.makedirs(os.path.dirname(pf) or ".", exist_ok=True)
     with open(pf, "w", encoding="utf-8") as fh:
         json.dump(data, fh, ensure_ascii=False, indent=2, sort_keys=True)
         fh.write("\n")
-    verb = "갱신" if old else "기록"
-    print(f"{symbol}  {info['sha256'][:16]}…  {info['bytes']}바이트  "
-          f"{info['lines'][0]}–{info['lines'][1]}줄  → {pf} ({verb})")
+    verb = "updated" if old else "recorded"
+    print(f"{symbol}  {info['sha256'][:16]}…  {info['bytes']} bytes  "
+          f"lines {info['lines'][0]}–{info['lines'][1]}  → {pf} ({verb})")
     if old and old.get("sha256") != info["sha256"]:
-        print(f"# 이전 해시 {old['sha256'][:16]}… 와 다르다. 본문이 바뀐 뒤 다시 "
-              "고정하는 것인지 확인하라.", file=sys.stderr)
+        print(f"# differs from the previous hash {old['sha256'][:16]}…. Confirm this is a "
+              "re-record after the body legitimately changed.", file=sys.stderr)
     return 0
 
 
 def cmd_check(cfg, where, given):
     php_bin = opt(cfg, "tooling.phpBinary", "php")
-    pf = pins_path(cfg, given, where)
+    pf = hashes_path(cfg, given, where)
     if not os.path.isfile(pf):
-        die(f"{pf} 가 없다. 먼저 phpseam pin 으로 본문을 고정하라.")
-    data = load_pins(pf)
-    pins = data["pins"]
-    if not pins:
-        die(f"{pf} 에 핀이 하나도 없다 — 검사할 것이 없는 것과 통과는 다르다.")
+        die(f"{pf} does not exist. Record the body first with phpmove hash.")
+    data = load_hashes(pf)
+    hashes = data["hashes"]
+    if not hashes:
+        die(f"{pf} holds no recorded body - having nothing to check is not the same as passing.")
     changed, ok = [], 0
-    for key, pin in sorted(pins.items()):
-        path, symbol = pin.get("file"), pin.get("symbol")
+    for key, entry in sorted(hashes.items()):
+        path, symbol = entry.get("file"), entry.get("symbol")
         if not path or not symbol:
-            die(f"{pf} 의 {key} 에 file/symbol 이 없다.")
+            die(f"{key} in {pf} has no file/symbol.")
         if not os.path.isfile(path):
-            changed.append((symbol, path, "파일이 없다"))
+            changed.append((symbol, path, "the file does not exist"))
             continue
         info, err = body_digest(path, symbol, php_bin)
         if err:
-            changed.append((symbol, path, err.split(" — ")[0]))
+            # SEPARATOR is the literal body_digest() builds that message with. Writing it
+            # twice is how this broke once: the message was reworded to a different dash and
+            # this split quietly became a no-op, so the whole multi-sentence error landed in
+            # a one-line column instead of its first clause.
+            changed.append((symbol, path, err.split(SEPARATOR)[0]))
             continue
-        if info["sha256"] != pin.get("sha256"):
+        if info["sha256"] != entry.get("sha256"):
             changed.append((symbol, path,
-                            f"본문이 바뀌었다 ({pin.get('bytes')}→{info['bytes']}바이트, "
-                            f"{pin.get('sha256', '')[:12]}… → {info['sha256'][:12]}…)"))
+                            f"the body changed ({entry.get('bytes')}→{info['bytes']} bytes, "
+                            f"{entry.get('sha256', '')[:12]}… → {info['sha256'][:12]}…)"))
         else:
             ok += 1
-    print(f"# {pf}  핀 {len(pins)}개 · 그대로 {ok} · 바뀜 {len(changed)}")
+    print(f"# {pf}  {len(hashes)} recorded · unchanged {ok} · changed {len(changed)}")
     for symbol, path, why in changed:
         print(f"  {symbol}  {path}\n      └ {why}")
     if changed:
-        print("# 레거시 본문은 0바이트도 바뀌면 안 된다. 이중 실행의 control 이 "
-              "그 본문이기 때문이다.", file=sys.stderr)
+        print("# the legacy body must not change by even one byte. It is the control side "
+              "of the dual run.", file=sys.stderr)
     return 1 if changed else 0
 
 
@@ -805,38 +815,38 @@ def run_phpgrep(args, proj, label):
         p = subprocess.run([sys.executable, PHPGREP] + args,
                            capture_output=True, timeout=300, env=env)
     except FileNotFoundError:
-        die(f"{PHPGREP} 가 없다. phpseam callers 는 phpgrep 을 통해서만 검색한다.")
+        die(f"{PHPGREP} not found. phpmove callers searches only through phpgrep.")
     except subprocess.TimeoutExpired:
-        die(f"phpgrep 이 300초를 넘겼다 ({label}) — 검색 못 함(시간 초과)")
+        die(f"phpgrep took over 300s ({label}) - could not search (timeout)")
     out = p.stdout.decode("utf-8", "replace")
     err = p.stderr.decode("utf-8", "replace")
     secs = time.time() - t0
     if p.returncode == 2:
-        die(f"phpgrep 이 검색하지 못했다 ({label}):\n{err.strip()}")
-    if p.returncode == 1 and "없음" not in err:
-        # phpgrep 은 0건일 때 반드시 "없음" 을 찍는다. 그것이 없는 exit 1 은
-        # 검색이 끝나지 못한 것이다. 0건으로 읽으면 "호출자 없음"이 되고,
-        # 그것은 이 도구가 막으려는 바로 그 답이다.
-        die(f"phpgrep 이 0건을 확인해 주지 않았다 ({label}) — "
-            f"검색 실패와 0건을 구분할 수 없다:\n{(err or out).strip()[:300]}")
-    print(f"# phpgrep {label}: exit {p.returncode} · {secs:.1f}초", file=sys.stderr)
+        die(f"phpgrep could not search ({label}):\n{err.strip()}")
+    if p.returncode == 1 and "no hits" not in err:
+        # phpgrep always prints "no hits" when the count is zero. An exit 1 without it
+        # means the search never finished. Reading that as zero produces "no callers",
+        # which is precisely the answer this tool exists to prevent.
+        die(f"phpgrep did not confirm zero ({label}) — "
+            f"a failed search cannot be told from zero hits:\n{(err or out).strip()[:300]}")
+    print(f"# phpgrep {label}: exit {p.returncode} · {secs:.1f}s", file=sys.stderr)
     return p.returncode, out, err
 
 
 def phpgrep_project(cfg_path, proj):
-    """phpgrep 이 phpseam 과 **같은** 설정을 보게 만든다. (프로젝트 디렉터리, 임시본).
+    """Make phpgrep see the **same** config as phpmove. (project directory, temp copy).
 
-    phpgrep 은 `<proj>/.claude/config/workspace.json` 만 읽는다. `--config` 가 그
-    파일이 아니면 두 도구가 서로 다른 설정을 보게 되고, 그때 나오는 호출자 목록은
-    "이 설정 기준의 답"이 아니라 **다른 트리의 답**이다. 그런 답은 0건이든 3건이든
-    믿을 수 없으므로, 설정을 복사한 임시 프로젝트를 만들어 넘긴다.
+    phpgrep reads only `<proj>/.claude/config/workspace.json`. When `--config` is not that file,
+    the two tools see different configs, and the caller list that comes back is not "the answer
+    under this config" but **the answer for a different tree**. Such an answer cannot be trusted
+    whether it is zero or three, so a temp project holding a copy of the config is built and passed.
     """
     if not cfg_path:
         return proj, None
     canonical = os.path.join(proj, CONFIG_REL) if proj else None
     if canonical and os.path.abspath(canonical) == os.path.abspath(cfg_path):
         return proj, None
-    tmp = tempfile.mkdtemp(prefix="phpseam-cfg-")
+    tmp = tempfile.mkdtemp(prefix="phpmove-cfg-")
     d = os.path.join(tmp, ".claude", "config")
     os.makedirs(d, exist_ok=True)
     shutil.copyfile(cfg_path, os.path.join(d, "workspace.json"))
@@ -845,7 +855,7 @@ def phpgrep_project(cfg_path, proj):
 
 def cmd_callers(symbol, cfg, where, allow_files, scope, proj, cfg_path=None):
     if not re.match(r"^\w+$", symbol):
-        die(f"심볼 이름이 이상하다: {symbol!r}")
+        die(f"the symbol name looks wrong: {symbol!r}")
     root = tree_root_of(cfg, where)
     allow = {os.path.abspath(a) for a in allow_files}
     scope_args = ["--scope", scope] if scope else []
@@ -876,40 +886,40 @@ def cmd_callers(symbol, cfg, where, allow_files, scope, proj, cfg_path=None):
 
     outside = [h for h in hits
                if os.path.abspath(h[0]) not in allow and h[0] not in defs]
-    print(f"# 심볼 {symbol} · 허용 파일 {len(allow)}개 · 정의 파일 {len(defs)}개"
-          + (f" · 범위 {scope}" if scope else ""))
+    print(f"# symbol {symbol} · allowed files {len(allow)} · defining files {len(defs)}"
+          + (f" · scope {scope}" if scope else ""))
     for path, line, text in sorted(outside):
         print(f"   {os.path.relpath(path, root)}:{line}: {text}")
     if tmp:
         shutil.rmtree(tmp, ignore_errors=True)
     sys.stdout.flush()
     if not outside:
-        print(f"# 검색은 끝났다. 전체 {len(hits)}건 중 이음새 밖 호출자 0건 "
-              "— '못 찾았다'가 아니라 '없다'.", file=sys.stderr)
+        print(f"# the search finished. Of {len(hits)} hits, 0 callers outside the swap point "
+              "- not 'could not find' but 'there are none'.", file=sys.stderr)
         return 0
-    print(f"# 이음새 밖 호출자 {len(outside)}건 / "
-          f"{len({h[0] for h in outside})}파일. 이 호출자들은 스왑을 따라오지 "
-          "않는다 — 이음새를 만들거나 범위에서 제외한다고 적어라.", file=sys.stderr)
+    print(f"# callers outside the swap point: {len(outside)} / "
+          f"{len({h[0] for h in outside})} files. These callers do not follow the swap "
+          "- create a swap point for them, or record them as excluded from scope.", file=sys.stderr)
     return 1
 
 
 # ------------------------------------------------------------------- fields
-# 이 검사가 막는 실패는 하나다 — 백엔드에 규칙이 있고, 스키마에 필드가 있고, 단위
-# 테스트가 그 필드를 고정하고, 원장이 `이관됨` 이라고 적혀 있는데, **어댑터가 그
-# 필드를 아예 요청하지 않아서 아무도 읽지 않는** 상태. 구조 린트는 페이지 모양을
-# 보고, 본문 해시는 불변을 보고, 호출자 전수는 이음새 밖 호출을 보는데, 어느 것도
-# "어댑터가 백엔드의 어느 필드를 요청하는가"를 보지 않는다. 두 번째 슬라이스가
-# 정확히 그 사각에서 감사 FAIL 했고, 감사자가 찾아낸 것은 두 파일 목록의 차집합
-# 이었다 — 곧 계산이다. 계산을 사람에게 맡기면 발견이 Phase 7 까지 미뤄진다.
+# This check prevents one failure - the rule is in the backend, the field is in the schema, a
+# unit test pins that field, and the rule list says `이관됨`, yet **the adapter never requests
+# that field, so nobody reads it**. The shape lint looks at the page shape, the body hash looks
+# at immutability, the caller sweep looks at calls outside the swap point, and none of them looks
+# at "which of the backend's fields does the adapter request". The second page failed its
+# completeness pass in exactly that blind spot, and what the checker found was the set difference
+# of two file lists - which is to say, a computation. Leaving computation to a person defers the finding to Phase 7.
 #
-# 범위 판정은 두 갈래다. `요청했으나 스키마에 없음` 은 범위와 무관하게 위반이다 —
-# 그 요청은 서버에서 실패하거나 빈 값으로 돌아온다. `노출되었으나 요청 안 됨` 은
-# 다르다. 스키마는 영역 단위이고 어댑터는 페이지 하나이므로, 다른 페이지가 쓰는
-# 필드가 노출되어 있는 것은 정상이다. 그래서 이쪽은 **어댑터가 실제로 선택해 들어간
-# 타입**(루트 타입 제외 — 스키마의 `Query` 에는 모든 슬라이스의 진입점이 있다)의
-# 필드만 보고, 원장이 있으면 그보다 좁게 `이관됨` 행이 인용한 필드만 위반으로
-# 올린다. 거짓 위반을 많이 내는 검사는 꺼지고, 꺼진 검사는 없는 검사보다 나쁘다.
-# 좁힌 만큼은 숨기지 않고 `판정 보류` 로 세어 출력한다.
+# The scope verdict forks. `requested but absent from the schema` is a violation regardless of
+# scope - that request fails on the server or comes back empty. `exposed but not requested` is
+# different. The schema is per area and the adapter is one page, so a field another page uses
+# being exposed is normal. So this side looks only at fields of **types the adapter actually
+# selected into** (excluding root types - the schema's `Query` holds the entry point of every
+# page), and when a rule list is given it narrows further to fields cited by `이관됨` rows.
+# A check that produces many false violations gets switched off, and a switched-off check is
+# worse than no check. What was narrowed away is not hidden but counted and printed as held.
 
 SCHEMA_EXT = (".graphqls", ".graphql", ".gql", ".sdl")
 BUILTIN_SCALARS = {"Int", "Float", "String", "Boolean", "ID"}
@@ -929,7 +939,7 @@ MD_RULE = re.compile(r"^\s*\|[\s:|-]+\|\s*$")
 
 
 def _match_brace(s, i):
-    """s[i] 가 `{` 일 때 짝이 되는 `}` 의 위치. 없으면 -1."""
+    """The position of the `}` matching s[i] when it is `{`. -1 when there is none."""
     depth = 0
     while i < len(s):
         if s[i] == "{":
@@ -943,7 +953,7 @@ def _match_brace(s, i):
 
 
 def _drop_spans(s, opener, closer):
-    """짝이 맞는 구간을 통째로 지운다. 인자 괄호를 필드로 오인하지 않으려면 필요하다."""
+    """Delete a balanced span whole. Needed so an argument parenthesis is not mistaken for a field."""
     out, depth = [], 0
     for ch in s:
         if ch == opener:
@@ -956,14 +966,14 @@ def _drop_spans(s, opener, closer):
 
 
 def _strip_sdl(text):
-    """설명 문자열과 `#` 주석을 지운다. 주석 안의 필드를 세면 없는 필드가 생긴다."""
+    """Strip description strings and `#` comments. Counting a field inside a comment invents a field."""
     text = re.sub(r'"""(?:.|\n)*?"""', " ", text)
     text = re.sub(r'"(?:\\.|[^"\n])*"', " ", text)
     return re.sub(r"(?m)#.*$", "", text)
 
 
 def _sdl_fields(body):
-    """`{...}` 본문에서 (필드 이름 → 감싼 것을 벗긴 타입 이름)."""
+    """From a `{...}` body: (field name -> type name with its wrappers stripped)."""
     out = {}
     for line in _drop_spans(body, "(", ")").splitlines():
         line = line.split("@")[0].split("=")[0]
@@ -977,8 +987,8 @@ def _sdl_fields(body):
 
 class Schema:
     def __init__(self):
-        self.fields = {}        # 타입 → {필드: 타입}
-        self.kinds = {}         # 타입 → object|interface|input|enum|union|scalar
+        self.fields = {}        # type -> {field: type}
+        self.kinds = {}         # type -> object|interface|input|enum|union|scalar
         self.roots = {"query": "Query", "mutation": "Mutation",
                       "subscription": "Subscription"}
         self.files = []
@@ -990,18 +1000,18 @@ class Schema:
 
 
 def parse_schema_dir(d):
-    """(Schema, None) 또는 (None, 못 찾은 이유). 이유가 있으면 그것은 exit 3 이다."""
+    """(Schema, None), or (None, why it could not be found). A reason means exit 3."""
     if not os.path.isdir(d):
-        return None, (f"스키마 디렉터리가 없다: {d} — 이것은 '어긋남 없음'이 "
-                      "아니라 검사 못 함이다.")
+        return None, (f"no schema directory: {d} - this is not 'no mismatch' "
+                      "but could-not-check.")
     files = []
     for root, _dirs, names in os.walk(d):
         for n in sorted(names):
             if n.lower().endswith(SCHEMA_EXT):
                 files.append(os.path.join(root, n))
     if not files:
-        return None, (f"{d} 에 스키마 파일이 없다 ({' '.join(SCHEMA_EXT)}). "
-                      "타입 0개는 위반 0건과 같은 답이 될 수 없다.")
+        return None, (f"{d} holds no schema file ({' '.join(SCHEMA_EXT)}). "
+                      "Zero types cannot be the same answer as zero violations.")
     sc = Schema()
     sc.files = sorted(files)
     for path in sc.files:
@@ -1009,7 +1019,7 @@ def parse_schema_dir(d):
             with open(path, "rb") as fh:
                 raw = fh.read()
         except OSError as exc:
-            return None, f"{path} 를 읽을 수 없다: {exc}"
+            return None, f"{path} could not be read: {exc}"
         text = _strip_sdl(raw.decode("utf-8", "replace"))
         for m in DEF_HEAD.finditer(text):
             kw, name = m.group(1), m.group(2)
@@ -1019,8 +1029,8 @@ def parse_schema_dir(d):
             if b != -1 and (nxt is None or b < nxt.start()):
                 e = _match_brace(text, b)
                 if e == -1:
-                    return None, (f"{path} 의 {kw} {name or ''} 본문에서 닫는 "
-                                  "괄호를 찾지 못했다 — 파싱 실패다.")
+                    return None, (f"could not find the closing brace in the body of "
+                                  f"{kw} {name or ''} in {path} - this is a parse failure.")
                 body = text[b + 1:e]
             if kw == "schema":
                 for k, v in re.findall(
@@ -1037,8 +1047,8 @@ def parse_schema_dir(d):
             else:
                 sc.kinds.setdefault(name, kw)
     if not sc.fields:
-        return None, (f"{d} 의 스키마 파일 {len(sc.files)}개에서 타입을 하나도 "
-                      "뽑지 못했다 — 파싱 실패이지 '필드 없음'이 아니다.")
+        return None, (f"not a single type could be extracted from the {len(sc.files)} schema "
+                      f"files in {d} - a parse failure, not 'no fields'.")
     return sc, None
 
 
@@ -1049,13 +1059,13 @@ def _line_of(text, pos):
 
 
 def _mask(text, a, b):
-    """[a,b) 를 줄 수를 보존하며 지운다. 히어독 본문을 문자열로 두 번 읽지 않으려면 필요하다."""
+    """Delete [a,b) while preserving the line count. Needed so a heredoc body is not read as a string twice."""
     span = "".join("\n" if c == "\n" else " " for c in text[a:b])
     return text[:a] + span + text[b:]
 
 
 def _php_strings(text):
-    """(시작, 끝, 본문, 인용부호) 목록. 주석 안의 문자열은 세지 않는다."""
+    """A list of (start, end, body, quote). Strings inside comments are not counted."""
     out = []
     i, n = 0, len(text)
     while i < n:
@@ -1089,9 +1099,9 @@ def _php_strings(text):
 
 
 def adapter_candidates(path):
-    """(후보 목록, 인코딩). 후보는 (줄, 본문, 모양). 디코딩은 `_phpenc` 가 한다 —
-    이 트리는 파일마다 CP949 와 UTF-8 이 섞여 있고, utf-8 로 고정해 읽으면 한글이
-    든 어댑터에서 질의가 조용히 사라진다."""
+    """(candidate list, encoding). A candidate is (line, body, shape). Decoding is done by `_phpenc`
+    - this tree mixes CP949 and UTF-8 per file, and reading it as fixed utf-8 makes a query in an
+    adapter containing Korean disappear in silence."""
     text, enc = read_text(path)
     cands = []
     for m in HEREDOC.finditer(text):
@@ -1111,9 +1121,9 @@ def adapter_candidates(path):
             if "." not in gap or ";" in gap:
                 break
             if re.search(r"[$(]", gap):
-                # 문자열 사이에 변수나 호출이 끼어 있다. 필드 집합이 정적이지
-                # 않다는 신호를 남겨 파서가 잡게 한다 — 조용히 이어붙이면 없는
-                # 필드 목록이 만들어진다.
+                # A variable or a call sits between the strings. Leave a signal that the field
+                # set is not static so the parser catches it - concatenating in silence builds
+                # a field list that does not exist.
                 parts.append(" $dyn ")
             j += 1
             parts.append(strs[j][2])
@@ -1127,44 +1137,44 @@ def looks_gql(body):
     if not m:
         return False
     if m.group(1):
-        return True     # `query`·`mutation` 이라고 적혀 있으면 답할 의무가 있다
-    # 키워드가 없으면 중첩 선택이 있고 **선택 집합처럼 깨끗할** 때만 질의로 본다.
-    # 중첩 `{` 를 가진 JSON 문자열까지 질의로 보면 `다루지 못하는 모양`이 쏟아지고,
-    # exit 3 이 흔해지면 아무도 그 코드를 믿지 않는다. 보간 표시(`$`·`%`)는 남겨
-    # 둔다 — 그것은 파서가 이유를 붙여 보고해야 하는 모양이다.
+        return True     # if it says `query` or `mutation`, there is an obligation to answer
+    # With no keyword, treat it as a query only when it has a nested selection and is **as clean
+    # as a selection set**. Treating a JSON string with nested `{` as a query floods the output
+    # with `unsupported shape`, and once exit 3 is common nobody trusts that code. Interpolation
+    # markers (`$`, `%`) are left in - those are a shape the parser must report with a reason.
     sel = re.sub(r"@\w+", " ", _drop_spans(body[m.end() - 1:], "(", ")"))
     return body.count("{") >= 2 and SEL_CLEAN.match(sel) is not None
 
 
 def parse_gql(body):
-    """(연산, 트리) 또는 (None, 다루지 못하는 이유). 노드는 {'name','children'}."""
+    """(operation, tree), or (None, why it is unsupported). A node is {'name','children'}."""
     m = GQL_HEAD.match(body)
     if not m:
-        return None, "질의 머리를 알아볼 수 없다"
+        return None, "the query head is unrecognizable"
     op = m.group(1) or "query"
     sel = _drop_spans(body[m.end() - 1:], "(", ")")
     sel = re.sub(r"@\w+", " ", sel)
     if "$" in sel or "%" in sel:
-        return None, ("선택 필드 자리에 변수 보간이나 치환자가 있다 — 필드 집합이 "
-                      "정적으로 정해지지 않는다")
+        return None, ("a variable interpolation or placeholder sits where a selected field goes "
+                      "- the field set is not statically determined")
     root, last, depth = [], None, 0
     stack = [root]
     for tok in (t.group(0) for t in SEL_TOKEN.finditer(sel)):
         if tok == "...":
-            return None, "프래그먼트(`...`)를 쓴 질의는 다루지 않는다"
+            return None, "a query using a fragment (`...`) is not handled"
         if tok == "{":
             depth += 1
             if depth == 1:
                 continue
             if last is None:
-                return None, "선택 집합이 필드에 붙어 있지 않다"
+                return None, "the selection set is not attached to a field"
             stack.append(last["children"])
             last = None
             continue
         if tok == "}":
             depth -= 1
             if depth < 0:
-                return None, "닫는 괄호가 더 많다"
+                return None, "there are more closing braces than opening ones"
             if depth >= 1:
                 stack.pop()
             last = None
@@ -1172,31 +1182,31 @@ def parse_gql(body):
         if tok == ",":
             continue
         if tok == ":":
-            # 별칭이다. 앞서 만든 노드는 별칭 이름이므로 버리고 다음 이름을 받는다.
+            # It is an alias. The node just built carries the alias name, so drop it and take the next name.
             if last is None or not stack[-1]:
-                return None, "별칭 뒤에 필드 이름이 없다"
+                return None, "no field name after the alias"
             stack[-1].pop()
             last = None
             continue
         if re.fullmatch(r"[A-Za-z_]\w*", tok):
             if depth == 0:
-                        return None, f"선택 집합 밖에 이름이 있다: {tok}"
+                        return None, f"a name outside a selection set: {tok}"
             node = {"name": tok, "children": []}
             stack[-1].append(node)
             last = node
             continue
-        return None, f"다루지 못하는 토큰 {tok!r}"
+        return None, f"unsupported token {tok!r}"
     if depth != 0:
-        return None, "괄호가 닫히지 않았다"
+        return None, "the braces were never closed"
     if not root:
-        return None, "선택 필드가 하나도 없다"
+        return None, "not a single field was selected"
     return op, root
 
 
-# ------------------------------------------------------------------- ledger
+# ------------------------------------------------------------------- rules
 
-def _md_ledger(text):
-    """Markdown 표 원장 → (ID, 이관, 비고) 목록. 표를 못 찾으면 None."""
+def _md_rules(text):
+    """A Markdown-table rule list -> a list of (ID, migration state, note). None when no table is found."""
     lines = text.splitlines()
     for i, line in enumerate(lines):
         if not line.lstrip().startswith("|"):
@@ -1226,10 +1236,10 @@ def _md_ledger(text):
     return None
 
 
-def read_ledger(path):
-    """(행 목록, 형식). 행은 (id, 이관 상태, 비고). 못 읽으면 exit 3 으로 멈춘다."""
+def read_rules(path):
+    """(rows, format). A row is (id, migration state, note). Stops with exit 3 when unreadable."""
     if not os.path.isfile(path):
-        die(f"원장 {path} 가 없다 — 인용 필드를 확인하지 못했다.", 3)
+        die(f"the rule list {path} does not exist - the cited fields could not be checked.", 3)
     text, _enc = read_text(path)
     first = next((l for l in text.splitlines() if l.strip()), "")
     if first.lstrip().startswith("{"):
@@ -1240,28 +1250,28 @@ def read_ledger(path):
             try:
                 doc = json.loads(line)
             except ValueError as exc:
-                die(f"{path}:{i} 를 JSONL 한 줄로 읽지 못했다: {exc}", 3)
+                die(f"could not read {path}:{i} as one JSONL line: {exc}", 3)
             if not isinstance(doc, dict):
-                die(f"{path}:{i} 이 객체가 아니다 — 원장 한 줄은 규칙 하나다.", 3)
-            rows.append((str(doc.get("id") or f"{i}줄"),
+                die(f"{path}:{i} is not an object - one line of the rule list is one rule.", 3)
+            rows.append((str(doc.get("id") or f"line {i}"),
                          str(doc.get("state") or ""),
                          str(doc.get("note") or "")))
         if not rows:
-            die(f"{path} 에서 원장 행을 하나도 읽지 못했다.", 3)
+            die(f"not a single rule row could be read from {path}.", 3)
         return rows, "jsonl"
-    rows = _md_ledger(text)
+    rows = _md_rules(text)
     if rows is None:
-        die(f"{path} 에서 원장을 알아보지 못했다 — JSONL 도 아니고 `ID`·`이관` 열을 "
-            "가진 Markdown 표도 없다. 인용 필드 0건과 구별할 수 없으므로 멈춘다.", 3)
+        die(f"could not recognize a rule list in {path} - it is neither JSONL nor a Markdown "
+            "table with `ID` and `이관` columns. This cannot be told from zero cited fields, so it stops.", 3)
     return rows, "markdown"
 
 
 def cited_names(state, note, pool):
-    """`이관됨` 행이 인용한 이름 중 **스키마의 필드 이름인 것만**.
+    """Of the names cited by `이관됨` rows, **only those that are schema field names**.
 
-    원장의 `이관됨:<심볼>` 은 백엔드 심볼이고 `비고` 는 산문이다. 그 안의 모든
-    식별자를 위반 후보로 삼으면 거짓 위반이 쏟아진다. 스키마 필드 이름과 교차한
-    것만 남기면, 남은 것은 전부 "스키마가 노출하는 필드를 원장이 인용했다"이다.
+    The rule list's `이관됨:<symbol>` is a backend symbol and the note column is prose. Treating
+    every identifier inside them as a violation candidate floods the output with false violations.
+    Intersecting with schema field names leaves only "the rule list cited a field the schema exposes".
     """
     out = set()
     tail = state.split(":", 1)[1] if ":" in state else ""
@@ -1272,40 +1282,40 @@ def cited_names(state, note, pool):
     return out
 
 
-# ------------------------------------------------------------ fields 명령
+# ------------------------------------------------------------ the fields command
 
 def backend_schema_dir(cfg_path, proj, where):
-    """`backend.graphqlSchemaDir` 의 소비처. 없으면 어느 키가 없는지 말하고 멈춘다."""
+    """The consumer of `backend.graphqlSchemaDir`. Without it, say which key is missing and stop."""
     path = cfg_path or (os.path.join(proj, CONFIG_REL) if proj else None)
     if not path or not os.path.isfile(path):
-        die("--schema 도 없고 설정 파일도 찾지 못했다. "
-            "`backend.graphqlSchemaDir` 을 읽을 수 없다.")
+        die("there is no --schema and no config file either. "
+            "`backend.graphqlSchemaDir` cannot be read.")
     try:
         with open(path, encoding="utf-8") as fh:
             raw = json.load(fh)
     except (OSError, ValueError) as exc:
-        die(f"{path} 를 읽을 수 없다: {exc}")
+        die(f"{path} could not be read: {exc}")
     be = raw.get("backend") or {}
     rel, root = be.get("graphqlSchemaDir"), be.get("root")
     if not rel:
-        die(f"{where} 에 backend.graphqlSchemaDir 이 없고 --schema 도 없다. "
-            "workspace.example.json 의 backend 절을 보고 채워라 — 이 값 없이 내는 "
-            "답은 좁은 답이라 위반 0건과 구별되지 않는다.")
+        die(f"{where} has no backend.graphqlSchemaDir and no --schema either. "
+            "Fill it in from the backend section of workspace.example.json - an answer given "
+            "without this value is a narrowed answer, indistinguishable from zero violations.")
     if os.path.isabs(os.path.expanduser(rel)):
         return os.path.expanduser(rel)
     if not root:
-        die(f"{where} 의 backend.graphqlSchemaDir 이 상대경로인데 backend.root 가 "
-            "없다. 스키마 디렉터리를 절대경로로 되돌릴 수 없다.")
+        die(f"backend.graphqlSchemaDir in {where} is relative but there is no backend.root. "
+            "The schema directory cannot be resolved to an absolute path.")
     return os.path.join(os.path.abspath(os.path.expanduser(root)), rel)
 
 
-def cmd_fields(schema_dir, adapters, ledger, where, cfg_path, proj):
+def cmd_fields(schema_dir, adapters, rules, where, cfg_path, proj):
     if not adapters:
-        die("사용법: phpseam fields [--schema <dir>] --adapter <파일…> "
-            "[--ledger <원장>]")
+        die("usage: phpmove fields [--schema <dir>] --adapter <file…> "
+            "[--rules <rule list>]")
     for a in adapters:
         if not os.path.isfile(a):
-            die(f"--adapter {a} 가 파일이 아니다")
+            die(f"--adapter {a} is not a file")
     schema_dir = (os.path.abspath(os.path.expanduser(schema_dir)) if schema_dir
                   else backend_schema_dir(cfg_path, proj, where))
     sc, why = parse_schema_dir(schema_dir)
@@ -1331,12 +1341,12 @@ def cmd_fields(schema_dir, adapters, ledger, where, cfg_path, proj):
     def walk(nodes, tname, path, line):
         for nd in nodes:
             name = nd["name"]
-            if name.startswith("__"):           # __typename 따위 메타 필드
+            if name.startswith("__"):           # meta fields such as __typename
                 continue
             fields = sc.fields.get(tname) or {}
             if name not in fields:
                 missing.append((f"{tname}.{name}", path, line,
-                                "어댑터가 요청하는데 스키마에 없다"))
+                                "requested by the adapter but absent from the schema"))
                 continue
             requested.setdefault(tname, set()).add(name)
             child = fields[name]
@@ -1346,15 +1356,15 @@ def cmd_fields(schema_dir, adapters, ledger, where, cfg_path, proj):
                     walk(nd["children"], child, path, line)
                 elif kind == "union":
                     unsupported.append((path, line, "union",
-                                        f"{tname}.{name} 은 union 이라 인라인 "
-                                        "프래그먼트가 필요하다 — 다루지 않는다"))
+                                        f"{tname}.{name} is a union, so an inline "
+                                        "fragment is required - not handled"))
                 else:
                     missing.append((f"{tname}.{name}", path, line,
-                                    f"하위 선택이 있는데 {child} 은 잎이다"))
+                                    f"there is a sub-selection but {child} is a leaf"))
             else:
                 if kind in ("object", "interface"):
                     missing.append((f"{tname}.{name}", path, line,
-                                    f"객체 타입 {child} 인데 하위 선택이 없다"))
+                                    f"object type {child} with no sub-selection"))
                 elif kind == "unknown":
                     unknown_t.append(f"{tname}.{name}: {child}")
 
@@ -1362,15 +1372,15 @@ def cmd_fields(schema_dir, adapters, ledger, where, cfg_path, proj):
     for path, line, shape, enc, op, tree in docs:
         rootname = sc.roots.get(op) or op.capitalize()
         if rootname not in sc.fields:
-            die(f"스키마에 {op} 루트 타입 {rootname} 이 없다 — "
-                f"{path}:{line} 의 질의를 스키마에 붙일 수 없다.", 3)
+            die(f"the schema has no {op} root type {rootname} - "
+                f"the query at {path}:{line} cannot be attached to the schema.", 3)
         roots_used.add(rootname)
         walk(tree, rootname, path, line)
 
-    # 어댑터가 선택해 들어간 타입 (루트 제외). `노출되었으나 요청 안 됨` 의 범위다.
+    # Types the adapter selected into (root excluded). This is the scope of `exposed but not requested`.
     sel_types = {t for t in requested if t not in roots_used}
-    # 그 타입들에서 객체 필드를 따라간 닫힘. 원장 인용의 후보 이름 풀이다 —
-    # 어댑터가 부모를 요청하지 않아 하위 타입에 아예 들어가지 못한 경우도 잡는다.
+    # The closure following object fields from those types. This is the candidate name pool for
+    # rule-list citations - it also catches a sub-type never entered because the adapter did not request the parent.
     pool_types, seen = set(), set()
     stack = list(sel_types)
     while stack:
@@ -1391,80 +1401,80 @@ def cmd_fields(schema_dir, adapters, ledger, where, cfg_path, proj):
     req_all = {f for s in requested.values() for f in s}
 
     rows, lfmt = ([], None)
-    if ledger:
-        rows, lfmt = read_ledger(ledger)
+    if rules:
+        rows, lfmt = read_rules(rules)
     migrated = [r for r in rows if r[1].startswith("이관됨")]
-    ledger_bad = []
+    rules_bad = []
     for rid, state, note in migrated:
         for name in sorted(cited_names(state, note, pool)):
             if name not in req_all:
-                ledger_bad.append((rid, name, ",".join(pool[name])))
+                rules_bad.append((rid, name, ",".join(pool[name])))
 
     exposed, held = [], 0
     for t in sorted(sel_types):
         for f in sorted(set(sc.fields.get(t, {})) - requested.get(t, set())):
-            if ledger and f not in {n for _r, n, _o in ledger_bad} \
+            if rules and f not in {n for _r, n, _o in rules_bad} \
                     and not any(f in cited_names(s, nt, pool)
                                 for _i, s, nt in migrated):
                 held += 1
                 continue
             exposed.append(f"{t}.{f}")
 
-    # ------------------------------------------------------------- 출력
-    print(f"# 스키마 {schema_dir}  [파일 {len(sc.files)}개 · 타입 "
-          f"{len(sc.fields)}개 · 루트 {'·'.join(sorted(roots_used)) or '없음'}]")
+    # ------------------------------------------------------------- output
+    print(f"# schema {schema_dir}  [{len(sc.files)} files · "
+          f"{len(sc.fields)} types · roots {'·'.join(sorted(roots_used)) or 'none'}]")
     for path, line, shape, enc, op, tree in docs:
-        print(f"# 질의 {path}:{line}  [{shape}, {enc}]  {op}")
+        print(f"# query {path}:{line}  [{shape}, {enc}]  {op}")
     for t in sorted(requested):
-        print(f"   요청  {t}: " + ", ".join(sorted(requested[t])))
-    if ledger:
-        print(f"# 원장 {ledger}  [{lfmt} · 행 {len(rows)} · 이관됨 "
+        print(f"   requested  {t}: " + ", ".join(sorted(requested[t])))
+    if rules:
+        print(f"# rule list {rules}  [{lfmt} · {len(rows)} rows · 이관됨 "
               f"{len(migrated)}]")
     if unknown_t:
-        print("# 참고 — 스키마 디렉터리에 정의가 없는 타입을 가진 필드: "
+        print("# note - fields whose type has no definition in the schema directory: "
               + ", ".join(sorted(set(unknown_t))[:8]))
 
     if exposed:
-        print("# 위반 · 노출되었으나 요청 안 됨 — 어댑터가 이 필드를 묻지 않는다")
+        print("# violation · exposed but not requested - the adapter does not ask for this field")
         for name in exposed:
             print(f"   {name}")
     if missing:
-        print("# 위반 · 요청했으나 스키마에 없음 — 이 요청은 값을 받지 못한다")
+        print("# violation · requested but absent from the schema - this request receives no value")
         for name, path, line, why2 in missing:
             print(f"   {name}\n       └ {os.path.basename(path)}:{line} · {why2}")
-    if ledger_bad:
-        print("# 위반 · `이관됨` 행이 인용한 필드가 요청 안 됨 — 규칙은 옮겨갔고 "
-              "아무도 그 값을 읽지 않는다")
-        for rid, name, owner in ledger_bad:
-            print(f"   {rid}  {name}  ({owner} 의 필드)")
+    if rules_bad:
+        print("# violation · a field cited by an `이관됨` row is not requested - the rule moved and "
+              "nobody reads that value")
+        for rid, name, owner in rules_bad:
+            print(f"   {rid}  {name}  (a field of {owner})")
     if nofind:
-        print("# 못 찾음 · 어댑터에서 질의를 찾지 못함")
+        print("# not found · no query found in the adapter")
         for path, enc, n in nofind:
-            print(f"   {path}  [{enc}, 문자열 후보 {n}개]")
+            print(f"   {path}  [{enc}, {n} string candidates]")
     if unsupported:
-        print("# 못 찾음 · 다루지 못하는 질의 모양")
+        print("# not found · unsupported query shape")
         for path, line, shape, why2 in unsupported:
             print(f"   {os.path.basename(path)}:{line} [{shape}]\n       └ {why2}")
     sys.stdout.flush()
 
     if held:
-        print(f"# 원장 범위로 좁혀 판정 보류 {held}건 — 원장이 인용하지 않은 필드는 "
-              "다른 페이지의 것일 수 있다.", file=sys.stderr)
+        print(f"# {held} held, narrowed by rule-list scope - a field the rule list does not cite "
+              "may belong to another page.", file=sys.stderr)
     if nofind or unsupported:
-        print(f"# 못 찾았다 — 질의 없음 {len(nofind)} · 다루지 못하는 모양 "
-              f"{len(unsupported)}. 이 답은 불완전하므로 '어긋남 없음'이 아니다.",
+        print(f"# could not find - no query {len(nofind)} · unsupported shape "
+              f"{len(unsupported)}. This answer is incomplete, so it is not 'no mismatch'.",
               file=sys.stderr)
         return 3
-    bad = len(exposed) + len(missing) + len(ledger_bad)
+    bad = len(exposed) + len(missing) + len(rules_bad)
     if bad:
-        print(f"# 위반 {bad}건 — 노출-요청안됨 {len(exposed)} · 요청-스키마없음 "
-              f"{len(missing)} · 원장인용-요청안됨 {len(ledger_bad)}", file=sys.stderr)
+        print(f"# {bad} violations - exposed-not-requested {len(exposed)} · requested-absent "
+              f"{len(missing)} · rule-cited-not-requested {len(rules_bad)}", file=sys.stderr)
         return 1
-    print(f"# 질의 {len(docs)}개에서 필드 {len(req_all)}개를 요청했고 어긋남 0건 "
-          "— '못 찾았다'가 아니라 '없다'.", file=sys.stderr)
-    if not ledger:
-        print("# 원장 없이 돈 판정이다. `이관됨` 행이 인용한 필드 검사는 "
-              "--ledger 가 있어야 돈다.", file=sys.stderr)
+    print(f"# {len(docs)} queries requested {len(req_all)} fields with 0 mismatches "
+          "- not 'could not find' but 'there are none'.", file=sys.stderr)
+    if not rules:
+        print("# this verdict ran without a rule list. The check on fields cited by `이관됨` "
+              "rows needs --rules.", file=sys.stderr)
     return 0
 
 
@@ -1483,7 +1493,7 @@ def main(argv):
         if a == "--config":
             i += 1
             if i >= len(argv):
-                die("--config 뒤에 경로가 없다")
+                die("--config has no path after it")
             cfg_path = argv[i]
         elif a in ("-h", "--help"):
             print(__doc__.strip())
@@ -1493,7 +1503,7 @@ def main(argv):
         i += 1
 
     if not rest:
-        die("하위 명령이 없다. lint · pin · check · callers · fields 중 하나여야 한다.")
+        die("no subcommand. It must be one of lint · hash · check · callers · fields.")
     cmd, args = rest[0], rest[1:]
     cfg, where, proj = load_cfg(cfg_path)
 
@@ -1503,39 +1513,39 @@ def main(argv):
         tpl = "--template" in args
         files = [a for a in args if not a.startswith("-")]
         if len(files) != 1:
-            die(f"lint 은 파일 하나를 받는다 ({len(files)}개를 받았다)")
+            die(f"lint takes one file (got {len(files)})")
         if not os.path.isfile(files[0]):
-            die(f"{files[0]} 가 파일이 아니다")
+            die(f"{files[0]} is not a file")
         if tpl:
             return cmd_lint_template(files[0], cfg, strict)
         return cmd_lint(files[0], cfg, where, as_json)
 
-    if cmd == "pin":
+    if cmd == "hash":
         given = None
         pos = []
         j = 0
         while j < len(args):
-            if args[j] == "--pins":
+            if args[j] == "--hashes":
                 j += 1
-                given = args[j] if j < len(args) else die("--pins 뒤에 경로가 없다")
+                given = args[j] if j < len(args) else die("--hashes has no path after it")
             elif args[j].startswith("-"):
-                die(f"모르는 옵션 {args[j]}")
+                die(f"unknown option {args[j]}")
             else:
                 pos.append(args[j])
             j += 1
         if len(pos) != 2:
-            die("사용법: phpseam pin <file.php> <function|Class::method>")
-        return cmd_pin(pos[0], pos[1], cfg, where, given)
+            die("usage: phpmove hash <file.php> <function|Class::method>")
+        return cmd_hash(pos[0], pos[1], cfg, where, given)
 
     if cmd == "check":
         given = None
         j = 0
         while j < len(args):
-            if args[j] == "--pins":
+            if args[j] == "--hashes":
                 j += 1
-                given = args[j] if j < len(args) else die("--pins 뒤에 경로가 없다")
+                given = args[j] if j < len(args) else die("--hashes has no path after it")
             else:
-                die(f"모르는 옵션 {args[j]}")
+                die(f"unknown option {args[j]}")
             j += 1
         return cmd_check(cfg, where, given)
 
@@ -1545,49 +1555,49 @@ def main(argv):
         while j < len(args):
             if args[j] == "--allow-file":
                 j += 1
-                allow.append(args[j] if j < len(args) else die("--allow-file 뒤가 비었다"))
+                allow.append(args[j] if j < len(args) else die("--allow-file has no value after it"))
             elif args[j] == "--scope":
                 j += 1
-                scope = args[j] if j < len(args) else die("--scope 뒤가 비었다")
+                scope = args[j] if j < len(args) else die("--scope has no value after it")
             elif args[j].startswith("-"):
-                die(f"모르는 옵션 {args[j]}")
+                die(f"unknown option {args[j]}")
             else:
                 pos.append(args[j])
             j += 1
         if len(pos) != 1:
-            die("사용법: phpseam callers <symbol> [--allow-file f]... [--scope dir]")
+            die("usage: phpmove callers <symbol> [--allow-file f]... [--scope dir]")
         return cmd_callers(pos[0], cfg, where, allow, scope, proj, cfg_path)
 
     if cmd == "fields":
-        schema, ledger, adapters = None, None, []
+        schema, rules, adapters = None, None, []
         j = 0
         while j < len(args):
             a = args[j]
-            if a in ("--schema", "--ledger"):
+            if a in ("--schema", "--rules"):
                 j += 1
                 if j >= len(args):
-                    die(f"{a} 뒤에 경로가 없다")
+                    die(f"{a} has no path after it")
                 if a == "--schema":
                     schema = args[j]
                 else:
-                    ledger = args[j]
+                    rules = args[j]
             elif a == "--adapter":
-                # 파일 여럿을 받는다. 다음 플래그를 만나면 멈춘다.
+                # Takes several files. Stops at the next flag.
                 j += 1
                 if j >= len(args) or args[j].startswith("-"):
-                    die("--adapter 뒤에 파일이 없다")
+                    die("--adapter has no file after it")
                 while j < len(args) and not args[j].startswith("-"):
                     adapters.append(args[j])
                     j += 1
                 continue
             elif a.startswith("-"):
-                die(f"모르는 옵션 {a}")
+                die(f"unknown option {a}")
             else:
-                die(f"위치 인자를 받지 않는다: {a} — 파일은 --adapter 뒤에 온다")
+                die(f"positional arguments are not accepted: {a} - files come after --adapter")
             j += 1
-        return cmd_fields(schema, adapters, ledger, where, cfg_path, proj)
+        return cmd_fields(schema, adapters, rules, where, cfg_path, proj)
 
-    die(f"모르는 하위 명령 {cmd!r}. lint · pin · check · callers · fields 중 하나여야 한다.")
+    die(f"unknown subcommand {cmd!r}. It must be one of lint · hash · check · callers · fields.")
 
 
 if __name__ == "__main__":
