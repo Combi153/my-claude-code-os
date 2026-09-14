@@ -23,8 +23,10 @@ That single constraint is what makes the resulting document trustworthy, and the
    area usually spans several pages, and the document is per *area*, not per page.
 3. If a document for the area already exists, read it. You are revising in place.
    Two documents about one area is how a single source of truth dies.
-4. `Agent(subagent_type: "domain-scribe")` with the rule lists, the completeness report
-   (`04-completeness.md`), and the existing document.
+4. `Agent(subagent_type: "domain-scribe")` with `mode: revise`, the rule lists, any
+   completeness report (`04-completeness.md`), and the existing document. **The mode is not
+   optional** — the agent's other mode also drafts a page's question list and shrinks the
+   document's unverified section, and neither belongs in a run made outside a migration.
 5. Review before reporting: every claim must trace to a rule ID, and the body must be
    free of code, SQL, class names, and file paths.
 

@@ -1,16 +1,33 @@
 ---
 name: page-picker
 description: |
-  레거시 서비스에서 다음에 옮길 페이지를 고른다. 소유한 데이터인지, 외부 의존이 얼마인지,
-  읽기 위주인지, 실패했을 때 피해 범위가 얼마인지를 실제 코드에서 확인해 후보를 순위 매긴다.
-  "뭐부터 옮기지", "다음 페이지", "마이그레이션 대상 고르기", "어디부터 시작",
-  "이관 후보" 등에 트리거. 페이지가 정해진 뒤의 실제 이관은 legacy-migrate 가 한다.
+  레거시 서비스에서 다음에 옮길 페이지를 고른다. 두 걸음이다 — 소유한 데이터인지, 외부 의존이
+  얼마인지, 읽기 위주인지, 실패했을 때 피해 범위가 얼마인지를 코드에서 확인해 후보를 순위 매기고,
+  사람이 지목한 한둘에 대해서만 그것이 무엇을 해 주는 기능인지 설명서를 만든다. 사람은 그 설명을
+  읽고 고른다.
+  "뭐부터 옮기지", "다음 페이지", "마이그레이션 대상 고르기", "어디부터 시작", "이관 후보",
+  "이 페이지 뭐 하는 기능이야" 등에 트리거.
+  페이지가 정해진 뒤의 실제 이관은 legacy-migrate 가 한다.
 ---
 
 # Page picker
 
 Pick what to migrate next, from evidence in the code rather than from intuition about
 which feature matters most.
+
+## Two steps, with a stop between them
+
+**Step 1 ranks. Step 2 explains. The person stops the run at both.**
+
+All nine criteria below answer cost and risk — do we own the data, how many callers, how dense
+are the templates. Not one of them says what the feature *is* or whom it serves. So a person who
+did not build this legacy service can read the whole ranking and still be unable to choose, because
+nothing in it tells them what they would be moving. That was observed on 2026-09-14 and it is why
+this skill has a second step (D-35).
+
+The explanation is the expensive half, and explaining every candidate throws most of it away. It is
+written **only for the one or two candidates the person names** after reading the ranking. That is
+what the stop between the steps is for: rank, hand over, wait.
 
 ## The first page is not chosen for its domain value
 
@@ -91,7 +108,7 @@ Density is not disqualifying; it is a prediction. Those conditions are where the
 
 **One tokenizer flag inverts this number.** These templates use the short open tag, and a tokenizer run without it swallows those blocks into HTML text — reporting *fewer* control structures, which reads as a clean, cheap candidate. Use the tool rather than counting by hand or with grep: it sets the flag, and it refuses to answer when the flag did not take.
 
-## Procedure
+## Step 1 — rank the candidates, then stop
 
 0. Read `.claude/context/legacy-tree.md`. Most of the criteria above turn on
    a count or a reachability check — external dependencies, surface count, shared tables,
@@ -117,6 +134,9 @@ Density is not disqualifying; it is a prediction. Those conditions are where the
    against it. A recommendation with no counter-argument has not been thought about.
 6. Propose a `depth` for the recommended candidate (below), and the two or three
    candidates after it, so the user can see the intended sequence.
+7. **Name the area each candidate belongs to.** Step 2 writes that candidate's explanation into
+   the area's domain document, and the path is resolved from the area name — an unnamed area
+   stalls step 2 or, worse, starts a second document about an area that already has one.
 
 ## Suggesting a depth
 
@@ -132,12 +152,36 @@ asks for one at Phase 0, and an unargued default is how a risky page ends up wit
 Say which criterion drove the suggestion. A depth with no reason attached is the first thing
 someone in a hurry overrides.
 
-## Output
+### What step 1 writes
 
 Write to `<docs.root>/page-candidates.md` and report the ranking. For the recommended
-candidate include the caller list and the suggested depth with its reason. Include a
+candidate include the caller list, the area, and the suggested depth with its reason. Include a
 "excluded" section for candidates that are federated or dead, with the evidence — that
 section prevents the same candidate being re-evaluated every quarter.
 
+Then **stop and ask which one or two the person wants explained.** Do not run step 2 over the
+whole ranking, and do not skip step 2 because your own recommendation looks obvious.
+
+## Step 2 — explain what was named, then choose
+
+The person has read the ranking and named one or two candidates. For **each** of them:
+
+`Agent(subagent_type: "php-feature-explainer")`. Pass: the candidate's entry pages and target
+methods as absolute paths · the caller list you already took · the area name, the candidate's
+label, and the surfaces it lives on.
+
+**The explanation is written to no file — the agent's final response is the explanation** (D-37),
+and it is the one role in this OS whose response is not capped at 300 words. Put it in front of
+the person as it came back. Do not summarise it into a table: a summary of an explanation written
+to be read is just the ranking again, which is the thing that was not enough.
+
+**Nothing keeps it.** Storing it would mean putting prose no rule row backs inside the area domain
+document, and then owing a later phase the job of deleting it. Every sentence of that document
+comes from a rule row instead. The cost lands here: a candidate the person does not pick is
+explained again next round, which is one agent run.
+
+Let the person choose. **Do not choose for them here** — your judgment was step 1's ranking and it
+is already delivered; this step exists because that ranking was not enough to decide on.
+
 **Do not start the migration.** Choosing is the whole job here. Hand off to
-`legacy-migrate` once the user confirms.
+`legacy-migrate` once the user has named the page.

@@ -2,7 +2,7 @@
 name: silent-failure-catalog
 kind: expertise
 inject:
-  agents: [php-rule-recheck, backend-designer, domain-placement-checker, php-behavior-analyst, php-swap-extractor]
+  agents: [php-feature-explainer, php-rule-recheck, backend-designer, domain-placement-checker, php-behavior-analyst, php-swap-extractor]
   skills: [page-picker, local-stack]
   paths: []
 token: CTX-SILENT-FAIL-8b73

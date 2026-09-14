@@ -2,7 +2,7 @@
 name: legacy-tree
 kind: expertise
 inject:
-  agents: [php-swap-extractor, php-behavior-analyst, php-rule-recheck, backend-builder, domain-placement-checker]
+  agents: [php-feature-explainer, php-swap-extractor, php-behavior-analyst, php-rule-recheck, backend-builder, domain-placement-checker]
   skills: [php-legacy-io, php-legacy-trace, php-legacy-map, page-picker, domain-leftover]
   paths: ["${legacy.root}/**"]
 token: CTX-LEGACY-TREE-7f3a

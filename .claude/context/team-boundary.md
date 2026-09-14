@@ -2,7 +2,7 @@
 name: team-boundary
 kind: team
 inject:
-  agents: [php-swap-extractor, php-behavior-analyst, php-rule-recheck, observation-author, backend-designer, backend-test-author, backend-builder, domain-placement-checker, domain-scribe, goal-loop-worker, goal-criteria-author]
+  agents: [php-feature-explainer, php-swap-extractor, php-behavior-analyst, php-rule-recheck, observation-author, backend-designer, backend-test-author, backend-builder, domain-placement-checker, domain-scribe, goal-loop-worker, goal-criteria-author]
   skills: []
   paths: ["${project.root}/**"]
   tools: [Write, Edit]

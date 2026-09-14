@@ -35,8 +35,8 @@ Both checks point at the same **behavior rules**: 페이지가 지키는 규칙�
 
 | 스킬 | |
 |---|---|
-| `legacy-migrate` | 오케스트레이터. Phase 0–7, 루프 5개, 사람이 멈추는 곳 3개(묻는 단계 · 추출 계획 승인 · 설계 승인), 자동 검사 2개 |
-| `page-picker` | 다음에 옮길 페이지 선정 (호출자 전수는 영역 API 설계의 입력이다) |
+| `legacy-migrate` | 오케스트레이터. Phase 0–7, 루프 5개, 사람이 멈추는 곳 3개(추출 계획 승인 · **묻는 단계 2.5** · 설계 승인), 자동 검사 2개 |
+| `page-picker` | 다음에 옮길 페이지 선정. **두 걸음** — 아홉 기준으로 순위를 내고 멈춘 뒤, 사람이 지목한 한둘에만 기능 설명서 (호출자 전수는 영역 API 설계의 입력이다) |
 | `page-baseline` | 화면 HTML 기준 캡처·비교 |
 | `dual-run` | 교체 지점 이중 실행 배선과 불일치 보고 |
 | `domain-leftover` | 도메인 로직이 화면에 남아있는지 완전성 판정 (페이지별 / 표면 훑기) |
@@ -49,16 +49,18 @@ Both checks point at the same **behavior rules**: 페이지가 지키는 규칙�
 
 | 서브에이전트 | Phase |
 |---|---|
+| `php-feature-explainer` | 선정 — 지목된 후보 하나의 기능 설명서. 문장마다 출처와 확인·추론 표시. **파일을 만들지 않는다** — 최종 응답이 곧 설명서이고, 그래서 300단어 상한에서 벗어나는 유일한 역할이다 |
 | `php-swap-extractor` | 1 — 교체 지점 추출 (계획 / 추출 두 모드) |
 | `php-behavior-analyst` | 2 — 규칙 목록(JSONL). 커버리지는 행의 `range` 열이다 |
 | `php-rule-recheck` | 2 — 규칙 목록 반증. **v3 에서 기본 0 라운드**이고 근거가 있을 때 켠다 |
 | `observation-author` | 2 — 행의 `fixture` → 기준 관찰 목록, 규칙 목록 `obs` 열 |
+| `domain-scribe` | 2.5 · 7 — 규칙 목록을 도메인 문서로 옮긴다(**문장마다 규칙 행 하나, 예외 없음**). 질문 목록 초안도 여기서 나온다. 7 의 호출은 완전성 판정이 행을 실제로 고쳤을 때만 |
 | `backend-designer` | 3 — 영역 설계에 대한 **변경분**. 규칙 배치·부재 점검·교정표 |
-| `backend-builder` | 4 — Kotlin/Spring 구현 + 실험 스위치·페이지 어댑터 배선 (v3 에서 둘을 합쳤다) |
+| `backend-test-author` | 4a — 승인된 행과 교정표만 보고 실패하는 테스트를 먼저 쓴다. 구현은 하지 않는다 |
+| `backend-builder` | 4b — Kotlin/Spring 구현 + 실험 스위치·페이지 어댑터 배선 (v3 에서 둘을 합쳤다) |
 | `domain-placement-checker` | 6 — 분류·배치 판정 (판정 어휘 여섯의 정본) |
-| `domain-scribe` | 7 — 영역 단위 도메인 문서. **N 페이지마다** 부른다 |
 
-Models are assigned by role: judgment-heavy roles (분석·반증·설계·완전성 판정·구현) run on opus, pattern-following roles (관찰 목록·문서) on sonnet. 오케스트레이터는 에이전트에게 산출물 파일명을 외우게 하지 않는다 — 절대경로를 프롬프트로 넘긴다.
+Models are assigned by role: judgment-heavy roles (기능 설명·분석·반증·설계·완전성 판정·구현) run on opus, pattern-following roles (관찰 목록·문서) on sonnet. 오케스트레이터는 에이전트에게 산출물 파일명을 외우게 하지 않는다 — 절대경로를 프롬프트로 넘긴다.
 
 **성장 규칙(v3).** 장치 하나는 관찰된 실패 하나에 대응하고, 설계 정본에 먼저 적히며, **그 장치가 대체하는 산문은 같은 변경에서 지운다.** 구속력 있는 상한은 주입 예산이고(`selftest_budget.py` 가 어떤 소비처도 90% 를 넘지 않는지 본다), 줄 수는 승인 지점이 아니라 냄새다. 상한을 조용히 넘기는 것은 제약을 풀어 green 을 만드는 것과 같으므로, 지울 것이 없으면 규칙을 정본에서 고친다.
 

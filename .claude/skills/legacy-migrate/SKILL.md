@@ -50,25 +50,21 @@ The canonical list is `references/artifacts.json`. **Do not make agents memorise
 
 **The caps are values in `state.json` and `pagecheck` increments them. On reaching one, stop and report to a person — this is a different device from an approval point and it is never delegated.**
 
-There are three places a person stops the run, each one page long: **the asking phase** (0.5) · **the plan approval** (Phase 1, before any edit) · **the design approval** (after Phase 3). Do not proceed on silence at any of them. A re-entry that does not change the plan does not pass the plan approval again; a re-entry through Phase 3 passes the design approval again.
+There are three places a person stops the run, each one page long, in this order: **the plan approval** (Phase 1, before any edit) · **the asking phase** (2.5, right after the rule list) · **the design approval** (after Phase 3). Do not proceed on silence at any of them. A re-entry that does not change the plan does not pass the plan approval again; a re-entry through Phase 3 passes the design approval again.
+
+A fourth stop sits **outside** this pipeline: before the page was chosen, a person read a feature explanation of it (D-35). That is `page-picker`'s second step, and **it left no file** (D-37) — so if you need something from it, ask the person, do not go looking for it.
 
 ---
 
 ## Phase 0 — preparation
 
 1. Read `workspace.json`. If it is missing, say to copy the example and stop.
-2. Pick the page. If the user named one, use it; otherwise call `page-picker` — do not pick one yourself.
+2. Pick the page. If the user named one, use it; otherwise call `page-picker` — do not pick one yourself. **Its second step puts a feature explanation in front of the person before they choose** (D-35). A page named without one still starts, but say that the explanation is missing rather than starting silently.
 3. Take the **caller sweep** with `phpmove callers <symbol>`. Callers you are not moving this time go in the `Swap risk` section of `00-swap-point.md` — a caller using the same method under the exact opposite contract has actually occurred.
 4. Create the page directory and `state.json` (the format is in section 1.6 of the design document). If they exist already, **resume**.
 5. `pagecheck <page-dir> --stage 1,2` — four environment checks and the **run-to-run difference measurement**. Exit 3 means "the check could not run" and is not a pass.
 
 **`ignore.json` starts from that run-to-run difference.** A list guessed before anyone knows the real diff paths hides real defects. Entries added later **must point at an approved rule ID**.
-
-## Phase 0.5 — asking (★ human)
-
-The design needs information the code does not contain. Pull the open questions out of the page into `questions.md` and get answers from a person. Ask three things: **who uses this feature and why · which of the observed behaviours is intent versus defect, where only a person knows · which rules may stay on the screen.** Answers accumulate per area, so the second page in the same area asks fewer questions.
-
-Write anything unanswered explicitly as `모른다` and **do not enter Phase 3 in that state.** Without that block, a guess goes in, and a guess is written into the rule list as fact.
 
 ## Phase 1 — swap-point extraction (★ plan approval · L0)
 
@@ -92,6 +88,16 @@ One JSONL line is one rule and each column has one owner. The analyst writes `ru
 
 **Classification and ID assignment are the orchestrator's job** (append-only). The rubric is the canonical format, and in particular a rule enforced only on the screen is not `경계` but `도메인` that has not moved. Fill `obs` after the observation list is settled — anything whose required input can be planted becomes `이중실행:` or `기준캡처:`, and only what cannot be planted becomes `불가:<kind>`. **Writing `불가` early stops inputs being planted that could have been.**
 
+## Phase 2.5 — the rules in plain words, then asking (★ human)
+
+`Agent(subagent_type: "domain-scribe")`, `mode: questions`. Pass: the absolute paths of the rule list, **the area domain document**, `questions.md`, the page directory and the round record · `page-id` · area · depth.
+
+**The scribe does two things in one pass.** It renders this page's rules into the area domain document as sentences a planner can read, and it drafts the question list. Both come from the rule list and from nothing else — **every sentence in that document traces to a rule row, with no exception** (D-37). The feature explanation the pick was made on was never stored, so there is nothing here to reconcile it against and nothing to delete.
+
+Then a person answers three things, and **all three point at something in front of them**: are the scribe's sentences right · which of the observed behaviours is intent versus defect, where only a person knows · which rules may stay on the screen. Name the rule ID and ask whether an observed behaviour is intended — do not ask what the intent was, which is a question about memory. Answers accumulate per area, so the second page in the same area asks fewer questions.
+
+Write anything unanswered explicitly as `모른다` and **do not enter Phase 3 in that state.** Without that block a guess goes in, and a guess is written into the rule list as fact.
+
 ## Phase 3 — the design change set → ★ design approval
 
 `Agent(subagent_type: "backend-designer")`. Pass: the absolute paths of the rule list, `02-design-changes.md`, `00-swap-point.md`, `questions.md`, **the area design** and the round record · depth.
@@ -108,7 +114,7 @@ For every approved correction, prepare an `ignore.json` entry and change `obs` t
 
 `Agent(subagent_type: "backend-test-author")`. Pass: the absolute paths of the approved design change set, the rule list, the backend repository root and the round record · `page-id` · depth. It writes no production code.
 
-**The agent that writes an assertion is never the agent that makes it pass** (D-32). **Keep two things from the return**: the unresolved references it names, which is how 4b's red is told apart from red the builder caused, and the **test file paths**, on which 4b's closing condition is measured. A row it could not turn into an assertion goes back to Phase 2 or to the asking phase, not into 4b.
+**The agent that writes an assertion is never the agent that makes it pass** (D-32). **Keep two things from the return**: the unresolved references it names, which is how 4b's red is told apart from red the builder caused, and the **test file paths**, on which 4b's closing condition is measured. A row it could not turn into an assertion goes back to Phase 2 or to Phase 2.5, not into 4b.
 
 ## Phase 4b — implementation and wiring (L1 · automatic checks)
 
@@ -151,7 +157,7 @@ There are six verdict words and **the canonical list is the checker's file alone
 1. **Round records.** Confirm each agent left `{lesson, trigger, evidence, scope}` in its role's record. An entry without `evidence` is not an entry — there is a measurement showing that unevidenced self-reflection makes the harness worse. **Do not read the contents.** Only check that the file appeared.
 2. **Context change set.** From the evidenced entries, propose a change set against `.claude/context/*.md` as `{Add, Merge, Revise, Skip}`, and **a person approves it via `git diff`.** Do not rewrite wholesale. Prose that a mechanism replaces is deleted in the same change set.
 3. **Zero unresolved OS defects.** Do not carry a tool or hook defect found this round into the next unit. A defect the checks caught becomes a regression input; an OS defect becomes a selftest case. Carrying one forward postpones the learning that makes rounds shorter.
-4. Call the scribe **every N pages**. Pass `Agent(subagent_type: "domain-scribe")` the rule list, the completeness report and **the absolute path of the area domain document**, and have it revise that document in place — the moment two documents describe the same area, the single source of truth is dead.
+4. **Call the scribe again only if the completeness pass changed the rule list.** Phase 2.5 already wrote this page into the area domain document, so a second pass with nothing to correct rewrites a document that was right. When rows did change, call `Agent(subagent_type: "domain-scribe")` with `mode: revise` and pass the rule list, the completeness report and **the absolute path of the area domain document** — it revises in place, because the moment two documents describe one area the single source of truth is dead.
 5. Report to the user: row counts by classification and by migration state · the results of both checks, equivalence and completeness, with **the commands that produced them** · the six axes in `state.json` · the regression input path · open product decisions from the domain document · **the toggle's final state and the command to revert it**.
 
 **End with the toggle on `legacy`.** Leaving an unreviewed code path live at the end of a session is not the orchestrator's decision to make.
