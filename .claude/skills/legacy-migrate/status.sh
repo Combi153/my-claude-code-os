@@ -89,7 +89,8 @@ while IFS=$'\t' read -r kind a b; do
         printf 'docker   : cannot determine the compose directory (%s)\n' "${a:-path unset}"
       else
         up=$(bounded 8 docker compose --project-directory "$a" ps --services --status running)
-        case $? in
+        up_rc=$?
+        case $up_rc in
           124) printf 'docker   : cannot determine (compose ps timed out after 8s)\n' ;;
           *)   if [ -z "$up" ]; then
                  printf 'docker   : (no service running under this compose)\n'
@@ -98,27 +99,35 @@ while IFS=$'\t' read -r kind a b; do
                fi ;;
         esac
 
-        # Leftover containers - where the configured name and the running name diverge.
-        # A tool finding the stack by name goes quietly empty here, and empty reads as "not up".
-        live=$(bounded 8 docker ps --format '{{.Names}}')
-        if [ $? -eq 124 ]; then
-          printf 'container: cannot determine (docker ps timed out after 8s)\n'
+        # Two axes carry a name and they are not the same string: the compose **service**
+        # (`php8.3-fpm`) and the **container** it runs as (`os-php8.3-fpm`). The configured value
+        # is a service name, because that is what every consumer does with it - `pagecheck` passes
+        # it to `up --force-recreate`, `exec` and `ps`. This block used to compare it against
+        # container names, so the same config read as "up" here and as "absent" there. One fact,
+        # two sources, two answers. Compare against services, and when the value lands on the
+        # container axis instead, name the axis - "absent" alone sends the reader to docker when
+        # the fix is one line of config.
+        names=$(bounded 8 docker ps --format '{{.Names}}')
+        if [ "$up_rc" -eq 124 ]; then
+          printf 'service  : cannot determine (compose ps timed out after 8s)\n'
         elif [ -z "$b" ]; then
-          printf 'container: no container name under surfaces, cannot compare\n'
+          printf 'service  : no service name under surfaces, cannot compare\n'
         else
           # '%s\n', not '%s'. Without a trailing newline, read drops the last line quietly and
-          # one container falls out of the check while it looks like "all fine".
+          # one service falls out of the check while it looks like "all fine".
           printf '%s\n' "$b" | tr ',' '\n' | while IFS= read -r want; do
             [ -z "$want" ] && continue
-            if printf '%s\n' "$live" | grep -qx -- "$want"; then
-              printf 'container: %-24s up\n' "$want"
+            if printf '%s\n' "$up" | grep -qx -- "$want"; then
+              printf 'service  : %-24s up\n' "$want"
+            elif printf '%s\n' "$names" | grep -qx -- "$want"; then
+              printf 'service  : %-24s is a container name, not a compose service - fix legacy.surfaces.*.container\n' "$want"
             else
-              near=$(printf '%s\n' "$live" | awk -v w="$want" \
+              near=$(printf '%s\n' "$up" | awk -v w="$want" \
                      'length($0) && (index(w,$0) || index($0,w)) {printf "%s ", $0}')
               if [ -n "$near" ]; then
-                printf 'container: %-24s absent - a similar name is up: %s(suspect a leftover from another compose)\n' "$want" "$near"
+                printf 'service  : %-24s absent - a similar name is up: %s(suspect a leftover from another compose)\n' "$want" "$near"
               else
-                printf 'container: %-24s absent\n' "$want"
+                printf 'service  : %-24s absent\n' "$want"
               fi
             fi
           done

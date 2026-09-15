@@ -202,7 +202,16 @@ for i, a in enumerate(args):
     if a == "--env-file" and i + 1 < len(args):
         env_file = args[i + 1]
 if "ps" in args:
-    print("{CONTAINER}\\trunning" if not has("container_gone") else "other\\trunning")
+    # Three fields, because two axes carry a name here: the compose **service** and the
+    # **container** it runs as. A fixture that prints only the service can never reproduce the
+    # state where the config names the wrong axis - which is exactly how this shipped, and the
+    # real stack then read as "this project has no such container" while it was running.
+    if has("container_gone"):
+        print("other\\trunning\\tos-other")
+    elif has("wrong_axis"):
+        print("svc-{CONTAINER}\\trunning\\t{CONTAINER}")
+    else:
+        print("{CONTAINER}\\trunning\\tos-{CONTAINER}")
     sys.exit(0)
 if "up" in args:
     if has("nodeliver"):          # the state where the container could not be recreated
@@ -502,6 +511,17 @@ p, _ = run([d, "--stage", "1", "--config", CONFIG])
 set_flag("container_gone", False)
 check("a container absent from the compose project is exit 3 (not 0)",
       p.returncode == 3 and "container comparison X" in p.stdout, f"exit={p.returncode}")
+
+# The state this check shipped blind to: the value is a real name on the **other** axis. Reported
+# as a bare "absent" it reads as a broken environment and sends the next person to docker, when
+# the fix is one line of config. Failing is not enough - it has to say which axis.
+set_flag("wrong_axis")
+p, _ = run([d, "--stage", "1", "--config", CONFIG])
+set_flag("wrong_axis", False)
+check("a container name where a compose service is expected names the axis, not just 'absent'",
+      p.returncode == 3 and "container comparison X" in p.stdout
+      and "is a container name, not a compose service" in p.stderr,   # note() writes to stderr
+      f"exit={p.returncode}")
 
 # ------------------------------------------------------------ 5. toggle read-back
 print("\n### 5. the toggle - a differing read-back means no capture")

@@ -710,18 +710,34 @@ def stage_environment(env, ctx):
         checks.append(("read-back config", code == 0,
                        out.strip() if code == 0 else (err or out).strip()[-200:]))
 
-    container = env.surface_get("container", "the name to compare against the running containers.")
-    code, out, _err = docker(env, ["ps", "--format", "{{.Service}}\t{{.State}}"])
-    running = {}
+    # Two axes carry a name here and they are not the same string: the compose **service**
+    # (`php8.3-fpm`) and the **container** it runs as (`os-php8.3-fpm`). Every use this file makes
+    # of the value is a compose subcommand - `up --force-recreate`, `exec`, `ps` - so the value is
+    # a service name. Reading only one axis turns a running stack into "this project has no such
+    # container", which reads as a broken environment and sends the next person to docker instead
+    # of to one line of config. So read both and, when the value lands on the wrong axis, say so.
+    container = env.surface_get("container", "the compose **service** name to compare against "
+                                             "the running services.")
+    code, out, _err = docker(env, ["ps", "--format", "{{.Service}}\t{{.State}}\t{{.Name}}"])
+    running, as_container = {}, {}
     for line in (out or "").splitlines():
-        if "\t" in line:
-            svc, state = line.split("\t", 1)
-            running[svc.strip()] = state.strip()
+        parts = line.split("\t")
+        if len(parts) >= 2:
+            svc, state = parts[0].strip(), parts[1].strip()
+            running[svc] = state
+            if len(parts) >= 3 and parts[2].strip():
+                as_container[parts[2].strip()] = svc
     state = running.get(container)
-    checks.append(("container comparison", bool(state) and "run" in state.lower(),
-                   f"{container}={state}" if state else
-                   f"this compose project has no {container} (running: "
-                   + (", ".join(sorted(running)) or "none") + ")"))
+    if state:
+        why = f"{container}={state}"
+    elif container in as_container:
+        why = (f"{container!r} is a container name, not a compose service. This value is used as a "
+               f"compose service (up --force-recreate, exec, ps), so set "
+               f"`legacy.surfaces.*.container` to {as_container[container]!r}.")
+    else:
+        why = (f"this compose project has no {container} (services running: "
+               + (", ".join(sorted(running)) or "none") + ")")
+    checks.append(("container comparison", bool(state) and "run" in state.lower(), why))
 
     bad = [c for c in checks if not c[1]]
     line = " · ".join(f"{n} {'OK' if ok else 'X'}" for n, ok, _ in checks)
