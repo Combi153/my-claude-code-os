@@ -740,6 +740,40 @@ if rv.get("dual") and rv.get("migrated") and rlog:
 else:
     skip("compare the real config's toggle values", "workspace.json has no dualRun or dual value yet")
 
+# (c2) does each surface's loggedOutMarker catch every logged-out shape that surface produces ----
+# An auth failure here is not a 302 or a 401 - it is **200 with a script that navigates**, and
+# the marker is the only thing that separates it from a real page. A marker that catches one of
+# the shapes and not the other is worse than none: the pages it misses get a logged-out capture
+# recorded as a valid baseline, and a baseline taken while logged out compares green forever.
+# That happened - `confirm\(` alone missed every mobile page, whose guard emits `location.href`
+# with no confirm. The two samples below were captured from the running help surface on
+# 2026-09-15 (one PC detail page and one mobile list page on that surface), trimmed to
+# the script element. admin has no captured sample yet, so it is skipped by name rather than
+# silently passed.
+LOGGED_OUT_SAMPLES = {
+    "help": {
+        "confirmGoUrl (PC pages)":
+            "<script type=\"text/javascript\">\n\tif ( confirm( '로그인 후 이용해 주십시오.' ) ) {\n"
+            "\tlocation.href = 'https://auth.example.com/login?url=x';\n} else {\nhistory.back();\n}\n</script>",
+        "moveLinkUrl (mobile pages)":
+            "<script type=\"text/javascript\">\n\tlocation.href = "
+            "'https://auth.example.com/login?url=x';\n\t</script>",
+    },
+}
+for _skey, _surface in sorted((real.get("surfaces") or {}).items()):
+    _samples = LOGGED_OUT_SAMPLES.get(_skey)
+    _marker = (_surface or {}).get("loggedOutMarker")
+    if not _samples:
+        skip(f"the {_skey} surface's loggedOutMarker catches its logged-out shapes",
+             f"no captured sample for the {_skey} surface yet")
+    elif not _marker:
+        check(f"the {_skey} surface's loggedOutMarker catches its logged-out shapes", False,
+              "the surface has no loggedOutMarker - every logged-out capture reads as valid")
+    else:
+        _missed = [n for n, body in sorted(_samples.items()) if not re.search(_marker, body)]
+        check(f"the {_skey} surface's loggedOutMarker catches its logged-out shapes",
+              not _missed, "" if not _missed else "misses " + " · ".join(_missed))
+
 # (d) do the context files' injection targets exist ------------------------------
 inject = os.path.join(PROJECT, ".claude", "hooks", "context-inject.py")
 if not os.path.isfile(inject):
