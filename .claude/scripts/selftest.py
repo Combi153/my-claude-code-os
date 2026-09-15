@@ -25,6 +25,17 @@ import tempfile
 import threading
 import time
 
+# The tools this file runs nest the same quote inside an f-string - PEP 701, new in 3.12 -
+# and on an older interpreter that is a **SyntaxError**: `.claude/scripts/phpmove` does not fail
+# a case, it fails to parse, and the message names a quote rather than a version. On macOS
+# `/usr/bin/python3` is still 3.9, so running this file on the wrong interpreter is the likeliest
+# way to get a red run that has nothing to do with the code. Say the version, not the quote.
+if sys.version_info < (3, 12):
+    sys.exit("selftest: needs Python 3.12 or newer (running "
+             f"{sys.version_info.major}.{sys.version_info.minor}). The tools in .claude/scripts/ "
+             "nest the same quote inside an f-string (PEP 701), which older versions cannot parse "
+             "at all - phpmove dies whole, and the error names a quote rather than the version.")
+
 QUICK = "--quick" in sys.argv
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT = os.path.dirname(os.path.dirname(HERE))
@@ -55,23 +66,88 @@ def run(cmd, timeout=180, env=None, **kw):
 
 
 def load_config():
+    """(the `legacy` section, why it cannot be used). `workspace.json` is gitignored.
+
+    A fresh clone has only `workspace.example.json`, so this file has to start without a bound
+    environment. Exiting here put **every** check below out of reach - including the twelve
+    cross-checks that compare this repository against itself and need no environment at all -
+    and it exited on an unhandled traceback rather than naming the key, which is the one thing
+    every tool in `.claude/scripts/` is built not to do. So the absence becomes a reason, and
+    each check that needs a key is skipped **naming that key**.
+    """
     p = os.path.join(PROJECT, ".claude", "config", "workspace.json")
-    with open(p, encoding="utf-8") as fh:
-        return json.load(fh).get("legacy") or {}
+    try:
+        with open(p, encoding="utf-8") as fh:
+            return json.load(fh).get("legacy") or {}, ""
+    except FileNotFoundError:
+        return {}, (".claude/config/workspace.json does not exist"
+                    " - copy workspace.example.json and fill it in")
+    except (OSError, ValueError) as exc:
+        return {}, f".claude/config/workspace.json could not be read: {exc}"
 
 
-LG = load_config()
-if not LG.get("root"):
-    sys.exit("selftest: the legacy section of workspace.json is empty. "
-             "Fill it in from workspace.example.json.")
+LG, CONFIG_PROBLEM = load_config()
 
-TREE = LG.get("treeRoot") or os.path.join(LG["root"], LG["treeMarker"])
-PRIMARY = LG["primaryService"]
+
+def without(*keys):
+    """Why these `legacy.` keys cannot be used, or `""` when every one of them can.
+
+    Every skip below names a key instead of saying "no environment". In a log the difference
+    between a check that could not run and a check somebody deleted is exactly that name, and
+    without it an honest run and an emptied one read the same.
+    """
+    if CONFIG_PROBLEM:
+        return CONFIG_PROBLEM
+    gone = []
+    for k in keys:
+        cur = LG
+        for part in k.split("."):
+            cur = cur.get(part) if isinstance(cur, dict) else None
+            if not cur:
+                gone.append("legacy." + k)
+                break
+    return "workspace.json has no " + ", ".join(gone) if gone else ""
+
+
+def needs(name, why):
+    """False - and the check is recorded as skipped for `why` - when the environment is absent."""
+    if why:
+        skip(name, why)
+    return not why
+
+
+# The tools below find the project by walking up for `workspace.json` and stop when it is not
+# there, so with no config their checks are about the environment, not about this repository.
+NO_ENV = without("root")
+
+TREE = (LG.get("treeRoot")
+        or (os.path.join(LG["root"], LG["treeMarker"])
+            if LG.get("root") and LG.get("treeMarker") else ""))
+PRIMARY = LG.get("primaryService") or ""
 SHARED = LG.get("sharedLibrary") or PRIMARY
+
+# Why there is no file out of the legacy tree to check the tree-reading tools against. Computed
+# once, so every skip gives the same true reason rather than "no CP949 file found" - which is
+# what a tree that *is* present but holds no CP949 file would also say, and two different facts
+# under one sentence is how a missing environment comes to look like a missing file.
+# **It never prints the path.** This repository is public and so is its CI log; a path out of the
+# legacy checkout is company information just as much as the code inside it.
+if CONFIG_PROBLEM:
+    NO_TREE = CONFIG_PROBLEM
+elif not TREE:
+    NO_TREE = "workspace.json has no legacy.treeRoot (nor legacy.root + legacy.treeMarker)"
+elif not os.path.isdir(TREE):
+    NO_TREE = "the tree legacy.treeRoot names is not on this machine"
+elif not PRIMARY:
+    NO_TREE = "workspace.json has no legacy.primaryService"
+else:
+    NO_TREE = ""
 
 
 def sample(prefix, want_encoding=None, limit=400):
     """One .php file from the tree to check against, so no symbol name is written into this file."""
+    if NO_TREE or not prefix:
+        return None
     sys.path.insert(0, HERE)
     from _phpenc import detect
     base = os.path.join(TREE, prefix)
@@ -102,10 +178,14 @@ def sample(prefix, want_encoding=None, limit=400):
     return None
 
 
-print(f"# target tree present: {os.path.isdir(TREE)}"
+print(f"# target tree present: {bool(TREE) and os.path.isdir(TREE)}"
       f" · {len(LG.get('services') or {})} services"
       f" · {len(LG.get('runtimes') or {})} runtimes"
       + ("  [--quick]" if QUICK else ""))
+if CONFIG_PROBLEM or NO_TREE:
+    print(f"# {CONFIG_PROBLEM or NO_TREE}")
+    print("# the checks that need a bound environment are skipped below, each naming what was"
+          " absent; everything else still runs. A skipped check is not a pass.")
 
 # ------------------------------------------- 3–8. start the case modules first
 # Each module builds its own synthetic fixtures and prints `N/M pass` on its last line. Below,
@@ -229,13 +309,15 @@ if cp949:
     check("phpv decodes CP949", p.returncode == 0 and "cp949" in p.stdout,
           secs=s)
 else:
-    skip("phpv CP949 decode", "no CP949 file found")
+    skip("phpv CP949 decode", NO_TREE or "no CP949 file found in the tree")
 
 p, s = run([sys.executable, HERE + "/phpv"])
 check("phpv with no arguments → help, exit 2", p.returncode == 2, secs=s)
 
 if QUICK:
     skip("phpgrep normal search", "it sweeps the whole tree")
+elif NO_TREE:
+    skip("phpgrep normal search", NO_TREE)
 else:
     p, s = run([sys.executable, HERE + "/phpgrep", "-l", "__nosuchsymbol__"])
     check("phpgrep prints its scope and answers zero as zero",
@@ -249,9 +331,10 @@ p, s = run([sys.executable, HERE + "/phpgrep", "a", "b"])
 check("phpgrep rejects two search terms", p.returncode == 2 and "exactly one" in p.stderr,
       secs=s)
 
-p, s = run([sys.executable, HERE + "/phpindex", "--list"])
-check("phpindex --list finds the index",
-      p.returncode == 0 and ".json" in p.stdout, secs=s)
+if needs("phpindex --list finds the index", NO_ENV):
+    p, s = run([sys.executable, HERE + "/phpindex", "--list"])
+    check("phpindex --list finds the index",
+          p.returncode == 0 and ".json" in p.stdout, secs=s)
 
 # The claim in the name is that the index was not rebuilt, and nothing used to observe that.
 # `!= 0` also passed on a traceback. Compare the index directory's mtimes across the call.
@@ -264,23 +347,27 @@ def _index_mtimes():
     return {n: os.path.getmtime(os.path.join(_IDX, n)) for n in os.listdir(_IDX)}
 
 
-_before = _index_mtimes()
-p, s = run([sys.executable, HERE + "/phpindex", "--nosuchopt"])
-_after = _index_mtimes()
-check("phpindex does not rebuild on an unknown option",
-      p.returncode == 1 and "unknown option --nosuchopt" in p.stderr and _after == _before,
-      f"exit={p.returncode}" + ("" if _after == _before else " · the index was rewritten"),
-      secs=s)
+if needs("phpindex does not rebuild on an unknown option", NO_ENV):
+    _before = _index_mtimes()
+    p, s = run([sys.executable, HERE + "/phpindex", "--nosuchopt"])
+    _after = _index_mtimes()
+    check("phpindex does not rebuild on an unknown option",
+          p.returncode == 1 and "unknown option --nosuchopt" in p.stderr and _after == _before,
+          f"exit={p.returncode}" + ("" if _after == _before else " · the index was rewritten"),
+          secs=s)
 
-p, s = run([sys.executable, HERE + "/phpwhere", "--conflicts"])
-check("phpwhere reads the index", p.returncode == 0 and "scope" in p.stdout, secs=s)
+if needs("phpwhere reads the index", NO_ENV):
+    p, s = run([sys.executable, HERE + "/phpwhere", "--conflicts"])
+    check("phpwhere reads the index", p.returncode == 0 and "scope" in p.stdout, secs=s)
 
-p, s = run([sys.executable, HERE + "/phpstats", "--days", "1"])
-check("phpstats", p.returncode == 0 and "last 1 days" in p.stdout, secs=s)
+if needs("phpstats", NO_ENV):
+    p, s = run([sys.executable, HERE + "/phpstats", "--days", "1"])
+    check("phpstats", p.returncode == 0 and "last 1 days" in p.stdout, secs=s)
 
-p, s = run([sys.executable, HERE + "/phped", "status"])
-check("phped status", p.returncode == 0 and "open - run" in p.stderr,
-      "" if "open - run" in p.stderr else (p.stdout + p.stderr).strip()[:70], secs=s)
+if needs("phped status", NO_ENV):
+    p, s = run([sys.executable, HERE + "/phped", "status"])
+    check("phped status", p.returncode == 0 and "open - run" in p.stderr,
+          "" if "open - run" in p.stderr else (p.stdout + p.stderr).strip()[:70], secs=s)
 
 if utf8:
     t0 = time.time()
@@ -297,21 +384,21 @@ if utf8:
     check("phplint broken source → 1", p.returncode == 1 and "FAILS" in p.stderr,
           secs=time.time() - t0)
 else:
-    skip("phplint pass and fail", "no target file found")
+    skip("phplint pass and fail", NO_TREE or "no target file found in the tree")
 
 outside = os.path.join(SCRATCH, "outside.php")
 open(outside, "w").write("<?php echo 1;")
 p, s = run([sys.executable, HERE + "/phplint", outside])
 check("phplint could-not-check → 3 (not a pass)", p.returncode == 3, secs=s)
 
-p, s = run([sys.executable, "-c",
-            f"import sys; sys.path.insert(0, {HERE!r});\n"
-            "from _phpenc import checkout_root, config_problem;\n"
-            "print(config_problem() or checkout_root())"])
-check("the config verdict points at the checkout",
-      p.stdout.strip() == os.path.abspath(os.path.expanduser(LG["root"])),
-      "" if p.stdout.strip() == os.path.abspath(os.path.expanduser(LG["root"]))
-      else p.stdout.strip()[:60], secs=s)
+if needs("the config verdict points at the checkout", NO_ENV):
+    p, s = run([sys.executable, "-c",
+                f"import sys; sys.path.insert(0, {HERE!r});\n"
+                "from _phpenc import checkout_root, config_problem;\n"
+                "print(config_problem() or checkout_root())"])
+    _want = os.path.abspath(os.path.expanduser(LG["root"]))
+    check("the config verdict points at the checkout", p.stdout.strip() == _want,
+          "" if p.stdout.strip() == _want else p.stdout.strip()[:60], secs=s)
 
 # Does it stop rather than give a narrowed answer when the config is missing
 empty = os.path.join(SCRATCH, "emptyproj")
@@ -372,7 +459,7 @@ if cp949:
     check("warns before editing a CP949 file", p.returncode == 0 and "CP949" in hook_text(p),
           "" if "CP949" in hook_text(p) else hook_text(p)[:80], secs=s)
 else:
-    skip("warning before a CP949 edit", "no CP949 file found")
+    skip("warning before a CP949 edit", NO_TREE or "no CP949 file found in the tree")
 
 p, s = guard(os.path.join(SCRATCH, "outside.php"))
 check("a file outside the tree passes silently",
@@ -404,6 +491,14 @@ if utf8:
           "could not find" in _o,
           "" if "could not find" in _o else f"exit={p.returncode} output={_o[:120]!r}",
           secs=time.time() - t0)
+else:
+    # With no `else` these three simply **disappeared** when no sample file was found, and a
+    # count that quietly drops from 42 to 39 cannot be told from three checks that passed.
+    # Naming them here is what makes their absence countable.
+    for _n in ("no syntax-failure warning after a valid PHP edit",
+               "the syntax check really ran (not an unchecked state)",
+               "it says so when the syntax-check tool is missing (no silent pass)"):
+        skip(_n, NO_TREE or "no target file found in the tree")
 
 # ------------------------------------------- 3–8. collect the started case modules
 for (no, title, label, skipname, filename, _args, timeout), h in zip(
@@ -646,13 +741,27 @@ else:
 
 # (d) do the context files' injection targets exist ------------------------------
 inject = os.path.join(PROJECT, ".claude", "hooks", "context-inject.py")
-if os.path.isfile(inject):
-    p, s = run([sys.executable, inject, "--check", "--strict"], timeout=60)
-    check("the context files' inject.agents and inject.skills match real files",
-          p.returncode == 0,
-          (p.stdout + p.stderr).strip()[-200:] if p.returncode else "", secs=s)
-else:
+if not os.path.isfile(inject):
     skip("compare context injection targets", "context-inject.py is missing")
+else:
+    p, s = run([sys.executable, inject, "--check", "--strict"], timeout=60)
+    _out = p.stdout + p.stderr
+    # `--check --strict` answers **two** questions, and only one of them needs an environment:
+    # the agent and skill names are files of this repository, the path globs are `${legacy.root}`
+    # and `${backend.root}` out of the config. Counting the pair as one check meant that in a
+    # clone with no config the *name* half could not run either - and dropping `--strict` to get
+    # past that is not an option, because without it a context file naming an agent that does not
+    # exist exits 0. So the two are counted apart: the names stay verified, the globs skip by name.
+    _bad = [l.strip() for l in _out.splitlines()
+            if l.startswith("error") or (l.startswith("warn") and "path glob" not in l)]
+    _globs = [l.strip() for l in _out.splitlines() if "path glob" in l]
+    check("the context files' inject.agents and inject.skills match real files",
+          p.returncode in (0, 1) and not _bad,
+          "; ".join(_bad)[:200]
+          or ("" if p.returncode in (0, 1) else _out.strip()[-200:]), secs=s)
+    if needs("the context files' path globs resolve to a config key", NO_ENV):
+        check("the context files' path globs resolve to a config key", not _globs,
+              "; ".join(_globs)[:200])
 
 # (e) are old names absent from tracked files -------------------------------
 # One surviving v1 name makes the orchestrator call an agent that does not exist or wait for a
@@ -732,7 +841,12 @@ for rel in tracked.splitlines():
         for name in OLD_NAMES:
             if name in line:
                 hits.append(f"{rel}:{i}: {name}")
-check("no retired name remains in a tracked file", not hits,
+# **Zero files scanned prints exactly like zero hits.** `git ls-files` answers nothing when the
+# working directory is not a git tree - a downloaded tarball, or a CI job whose checkout step did
+# not run - and then this check reports a clean repository having read no file at all.
+check("no retired name remains in a tracked file", bool(tracked.strip()) and not hits,
+      "git listed no file, so nothing was scanned - this is not a git working tree"
+      if not tracked.strip() else
       "; ".join(hits[:4]) + (f" (and {len(hits) - 4} more)" if len(hits) > 4 else ""))
 
 # (f) have the three tool-name lists drifted --------------------------------
@@ -829,9 +943,16 @@ except (OSError, ValueError) as exc:
 shutil.rmtree(SCRATCH, ignore_errors=True)
 print("\n" + "=" * 64)
 bad = [n for n, ok, _ in results if not ok]
+# **Three states, three numbers.** One green light covering all three is the denial this file
+# exists to prevent: a run with no bound environment skips a fifth of what is here, and
+# "42/42 pass" printed over that cannot be told from a run that checked everything.
 print(f"{len(results) - len(bad)}/{len(results)} pass"
+      f" · {len(bad)} fail · {len(skipped)} skipped"
       + ("" if not bad else "   failed: " + ", ".join(bad)))
 if skipped:
-    print(f"skipped {len(skipped)} - " + ", ".join(n for n, _ in skipped))
-    print("  a skipped check is not a pass. Run it once without --quick.")
+    # The reason, not just the name. "no environment" is not actionable; the key or the file is.
+    for _n, _why in skipped:
+        print(f"  skipped  {_n}   ({_why})")
+    print("  a skipped check is not a pass. Each line says which key or file was absent"
+          + (" (--quick drops the tree sweeps)" if QUICK else "") + ".")
 sys.exit(1 if bad else 0)
