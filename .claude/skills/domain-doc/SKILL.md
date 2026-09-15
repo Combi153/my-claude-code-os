@@ -17,15 +17,22 @@ That single constraint is what makes the resulting document trustworthy, and the
 
 ## 절차
 
-1. Read `.claude/config/workspace.json` for the docs root.
-2. Collect the ledgers for the area — a domain area usually spans several slices, and
-   the document is per *area*, not per slice.
+1. Read `.claude/config/workspace.json` for the docs root. Slices live under
+   `<docs.root>/<docs.slicesDir>/<slice-id>/`.
+2. Collect the ledgers for the area — `01-ledger.md` in each slice directory. A domain
+   area usually spans several slices, and the document is per *area*, not per slice.
 3. If a document for the area already exists, read it. You are revising in place.
    Two documents about one area is how a single source of truth dies.
-4. `Agent(subagent_type: "domain-scribe")` with the ledgers, any audit results, and the
-   existing document.
+4. `Agent(subagent_type: "domain-scribe")` with the ledgers, the audit results
+   (`04-audit.md`), and the existing document.
 5. Review before reporting: every claim must trace to a ledger ID, and the body must be
    free of code, SQL, class names, and file paths.
+
+The per-slice document the scribe writes is `05-domain-doc.md`, beside the ledger it came
+from. **The canonical list of artifact names is
+`.claude/skills/legacy-slice/references/artifacts.json`** — this is a copy, and when the two
+disagree that file wins. A skill looking for a numbered artifact by a name it remembers,
+rather than by the name that file gives, is how a phase silently stops being reachable.
 
 ## 원장이 없는 영역을 요청받으면
 

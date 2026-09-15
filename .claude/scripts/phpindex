@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""phpindex - 이름이 어디서 정의되는지 미리 훑어 인덱스로 굳힌다.
+
+    phpindex                    현재 서비스 + 공용 라이브러리
+    phpindex --scope <서비스경로>  특정 서비스
+    phpindex --all              이관 대상 서비스 + 공용 라이브러리
+    phpindex --list             만들어진 인덱스 상태
+
+왜 필요한가. 이 트리에는 선언 문법이 없어서 "정의"가 문법적으로 존재하지 않는다.
+실제 정의가 `$X[상수] = 값` 형태로 여러 줄에 걸쳐 있으면 `$X =` 로 grep 해서 0건이
+나온다. grep 은 "못 찾았다"와 "없다"를 구분하지 못하므로 그 0건이 잘못된 결론으로
+이어진다. 인덱스는 정의 형태를 만들 때 한 번 정규화해서 넣어 두고, 없으면 없다고
+말한다.
+
+범위. phpgrep 과 같다 - 서비스 하나는 자기 자신과 공용 라이브러리 두 트리에만 닿는다.
+공용 라이브러리가 정의의 대부분을 갖고 있어 어느 서비스 인덱스에도 반드시 붙지만,
+복사하지 않고 그것 하나를 따로 만들어 조회 시점에 합친다. 어느 트리가 공용인지는
+workspace.json 의 `legacy.sharedLibrary` 가 답한다.
+
+산출물은 프로젝트의 `.claude/.state/index/<이름>.json` 이고 런타임에 들어가지 않는다.
+틀려도 조회가 틀릴 뿐 화면은 영향을 받지 않는다. 레거시 체크아웃 안이 아니라 여기
+두는 이유는, 체크아웃이 다시 만들어질 때 함께 사라지지 않게 하려는 것이다.
+"""
+import json
+import os
+import re
+import sys
+import time
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _phpenc import (PHPLIB, SERVICES, config, current_service,  # noqa: E402
+                     primary_service, read_text, require_config, state_dir,
+                     tree_root)
+
+# 인덱스를 만들 대상. 이관 대상 서비스 하나이고, 공용 라이브러리는 따로 만들어
+# 조회 시점에 합친다. 값은 workspace.json 의 `legacy.primaryService` 가 준다.
+def ours():
+    p = primary_service()
+    return [p[0]] if p else []
+
+# 어떤 서비스가 자기 자신 외에 함께 훑어야 하는 트리를 갖는 경우를 위한 자리.
+# 지금은 어느 서비스도 공용 라이브러리 하나로 닫히므로 비어 있다.
+SCOPE_EXTRA = {}
+
+
+def short_name(prefix):
+    """설정에 적힌 짧은 이름. 인덱스 파일명이 된다."""
+    return (config().get("services") or {}).get(prefix, prefix.split("/")[-1])
+
+BUNDLE_PARTS = ("/vendor/", "/node_modules/", "/bower_components/", "/phpexcel",
+                "/namo", "/codeigniter", "/adminlte", "/ckeditor", "/sheetjs/",
+                "/external/", "/smarty", "/tcpdf", "/phpmailer", "/xml_rpc",
+                "/pear/", "/third_party/", "/system/")
+CODE_EXT = (".php", ".inc")
+
+# ------------------------------------------------------------------ 톱레벨 분석
+RE_STR1 = re.compile(r"'(?:\\.|[^'\\])*'", re.S)
+RE_STR2 = re.compile(r'"(?:\\.|[^"\\])*"', re.S)
+RE_HEREDOC = re.compile(r"<<<\s*'?(\w+)'?\n.*?\n\s*\1\s*;", re.S)
+RE_BLOCKC = re.compile(r"/\*.*?\*/", re.S)
+RE_LINEC = re.compile(r"//[^\n]*")
+RE_HASHC = re.compile(r"#[^\n]*")
+
+# 문자열을 주석보다 먼저 지운다. 반대로 하면 "http://..." 안의 // 가 주석으로
+# 잘리면서 따옴표 짝이 깨지고 그 뒤 전부가 오염된다.
+def scrub(text):
+    text = RE_HEREDOC.sub("'H'", text)
+    text = RE_STR1.sub("''", text)
+    text = RE_STR2.sub('""', text)
+    text = RE_BLOCKC.sub(" ", text)
+    text = RE_LINEC.sub(" ", text)
+    return RE_HASHC.sub(" ", text)
+
+KW_SKIP = {"declare", "namespace", "use", "abstract", "final", "static", "public",
+           "private", "protected", "readonly", "require_once", "include_once",
+           "require", "include", "else", "elseif", "endif", "endwhile",
+           "endforeach", "endfor", "endswitch", "break", "continue", "return"}
+WORD = re.compile(r"[A-Za-z_]\w*")
+
+
+def top_level(text):
+    """중괄호 깊이 0에서 정의되는 클래스와 함수. 깊이를 실제로 세지 않으면
+    메서드가 톱레벨 함수로 잡히고 클래스명이 부작용으로 잡힌다."""
+    code = scrub(text)
+    blocks = re.findall(r"<\?(?:php|=)?(.*?)(?:\?>|\Z)", code, flags=re.S)
+    if blocks:
+        code = "\n".join(blocks)
+    classes, funcs = [], []
+    depth = pos = 0
+    n = len(code)
+    while pos < n:
+        ch = code[pos]
+        if ch == "{":
+            depth += 1
+            pos += 1
+            continue
+        if ch == "}":
+            depth = max(0, depth - 1)
+            pos += 1
+            continue
+        if depth or ch.isspace() or ch in ";,":
+            pos += 1
+            continue
+        m = WORD.match(code, pos)
+        if not m:
+            pos += 1
+            continue
+        word = m.group(0).lower()
+        pos = m.end()
+        if word in ("class", "interface", "trait", "enum"):
+            nm = WORD.search(code, pos)
+            if nm:
+                classes.append(nm.group(0))
+                pos = nm.end()
+            brace = code.find("{", pos)
+            pos = brace if brace != -1 else n
+        elif word == "function":
+            nm = WORD.match(code, pos) or WORD.search(code, pos)
+            if nm and nm.start() - pos < 4:
+                funcs.append(nm.group(0))
+                pos = nm.end()
+            brace, semi = code.find("{", pos), code.find(";", pos)
+            pos = min(brace if brace != -1 else n, semi if semi != -1 else n)
+        elif word in KW_SKIP:
+            semi = code.find(";", pos)
+            pos = semi + 1 if semi != -1 else n
+        else:
+            semi = code.find(";", pos)
+            pos = semi + 1 if semi != -1 else n
+    return classes, funcs
+
+
+# ------------------------------------------------------------------ 라인 패턴
+RE_DEFINE = re.compile(r"""define(?:_once)?\s*\(\s*['"]([A-Za-z_]\w*)['"]""")
+RE_CONST = re.compile(r"^\s*const\s+([A-Z_]\w*)\s*=")
+# 컬럼 0 대입만 톱레벨로 본다. $X = / $X[..] = / $X .= 를 모두 잡는다.
+RE_GLOBAL_ASSIGN = re.compile(r"^\$([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*\.?=[^=]")
+RE_LIT = re.compile(r"""['\"]([^'\"]*)['\"]""")
+# header('Location: ...') 뒤에 exit 이 오는 형태 = 이 파일을 include 하면
+# 요청이 여기서 끝날 수 있다. 인증 게이트도 이 모양이고 장애 안내 페이지도
+# 이 모양이라, 어느 쪽인지는 판정하지 않고 리다이렉트 대상을 같이 남긴다.
+RE_HALT = re.compile(
+    r"header\s*\(\s*['\"]Location:\s*([^;]*);\s*(?://[^\n]*\n\s*)?(?:exit|die)\b",
+    re.I)
+RE_INCLUDE = re.compile(
+    r"(?<![\w$>])(require_once|include_once|require|include)\b([^;]*);", re.S)
+RE_FETCH = re.compile(r"->\s*fetch\s*\(\s*['\"]([^'\"]+)['\"]")
+RE_SET_LIT = re.compile(r"->\s*set\s*\(\s*['\"](\w+)['\"]")
+RE_SET_VAR = re.compile(r"->\s*set\s*\(\s*\$([A-Za-z_]\w*)\s*\)")
+RE_ARR_KEY = re.compile(r"\$([A-Za-z_]\w*)\s*\[\s*['\"](\w+)['\"]\s*\]\s*=")
+RE_VAR_USE = re.compile(r"\$([A-Za-z_]\w*)")
+RE_VAR_SET = re.compile(r"\$([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*(?:\.|\+|-)?=[^=]")
+RE_FOREACH = re.compile(r"foreach\s*\([^)]*?as\s*(?:\$(\w+)\s*=>\s*)?\$(\w+)")
+SUPERGLOBALS = {"_GET", "_POST", "_REQUEST", "_SERVER", "_SESSION", "_COOKIE",
+                "_FILES", "_ENV", "GLOBALS", "this"}
+
+
+def emits_output(text):
+    """PHP 블록 밖에 내용이 있으면 이 파일은 include 되는 순간 출력한다."""
+    pos = 0
+    n = len(text)
+    while pos < n:
+        open_at = text.find("<?", pos)
+        if open_at == -1:
+            return text[pos:].strip() != ""
+        if text[pos:open_at].strip():
+            return True
+        close_at = text.find("?>", open_at + 2)
+        if close_at == -1:
+            return False
+        pos = close_at + 2
+    return False
+
+
+def string_spans(text):
+    """따옴표 안 구간. define('ROOT_INCLUDE', $p . '/include') 의 문자열 속
+    'include' 가 include 문으로 잡히는 것을 막는다."""
+    spans = []
+    for m in RE_STR1.finditer(text):
+        spans.append(m.span())
+    for m in RE_STR2.finditer(text):
+        spans.append(m.span())
+    spans.sort()
+    return spans
+
+
+def in_span(spans, pos):
+    lo, hi = 0, len(spans)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        a, b = spans[mid]
+        if pos < a:
+            hi = mid
+        elif pos >= b:
+            lo = mid + 1
+        else:
+            return True
+    return False
+
+
+def walk(root, rel):
+    base = os.path.join(root, rel)
+    for dirpath, dirnames, filenames in os.walk(base):
+        low = dirpath.lower().replace("\\", "/") + "/"
+        if any(p in low for p in BUNDLE_PARTS):
+            dirnames[:] = []
+            continue
+        for name in filenames:
+            if not name.lower().endswith(CODE_EXT):
+                continue
+            path = os.path.join(dirpath, name)
+            if any(p in path.lower().replace("\\", "/") for p in BUNDLE_PARTS):
+                continue
+            yield path
+
+
+def build(root, scopes, label):
+    idx = {"classes": {}, "functions": {}, "globals": {}, "constants": {},
+           "templates": {}, "includes": {}, "files": [], "flags": {},
+           "included": []}
+    files = 0
+    for rel in scopes:
+        for path in walk(root, rel):
+            short = os.path.relpath(path, root)
+            try:
+                text, _enc = read_text(path)
+            except OSError:
+                continue
+            files += 1
+            idx["files"].append(short)
+            flags = {}
+            if "Location:" in text:
+                m = RE_HALT.search(text)
+                if m:
+                    tgt = " ".join(m.group(1).split())
+                    flags["halt"] = tgt.rstrip(") '\"")[:60]
+            if emits_output(text):
+                flags["out"] = True
+            if flags:
+                idx["flags"][short] = flags
+            classes, funcs = top_level(text)
+            for name in classes:
+                idx["classes"].setdefault(name, []).append(short)
+            for name in funcs:
+                idx["functions"].setdefault(name, []).append(short)
+            for lineno, line in enumerate(text.splitlines(), 1):
+                for m in RE_DEFINE.finditer(line):
+                    idx["constants"].setdefault(m.group(1), []).append(
+                        [short, lineno, line.strip()[:100]])
+                m = RE_CONST.match(line)
+                if m:
+                    idx["constants"].setdefault(m.group(1), []).append(
+                        [short, lineno, line.strip()[:100]])
+                m = RE_GLOBAL_ASSIGN.match(line)
+                if m and m.group(1) not in SUPERGLOBALS:
+                    idx["globals"].setdefault("$" + m.group(1), []).append(
+                        [short, lineno, line.strip()[:100]])
+            # include 간선
+            edges = []
+            spans = string_spans(text)
+            for m in RE_INCLUDE.finditer(text):
+                if in_span(spans, m.start(1)):
+                    continue
+                expr = " ".join(m.group(2).split())
+                if expr:
+                    edges.append([m.group(1), expr[:120]])
+            if edges:
+                idx["includes"][short] = edges
+            # 템플릿을 렌더하는 쪽: fetch('x.tpl.php') 와 set() 키
+            keys = set(RE_SET_LIT.findall(text))
+            for holder in RE_SET_VAR.findall(text):
+                keys |= {k for v, k in RE_ARR_KEY.findall(text) if v == holder}
+            for tpl in RE_FETCH.findall(text):
+                e = idx["templates"].setdefault(
+                    os.path.basename(tpl), {"rendered_by": [], "keys": []})
+                e["rendered_by"].append(short)
+                e["keys"] = sorted(set(e["keys"]) | keys)
+            # 템플릿 자신: 정의 없이 쓰이는 변수
+            if short.lower().endswith((".tpl.php", ".tpl")):
+                used = set(RE_VAR_USE.findall(text)) - SUPERGLOBALS
+                bound = set(RE_VAR_SET.findall(text))
+                for a, b in RE_FOREACH.findall(text):
+                    bound |= {x for x in (a, b) if x}
+                free = sorted(used - bound)
+                e = idx["templates"].setdefault(
+                    os.path.basename(short), {"rendered_by": [], "keys": []})
+                e["path"] = short
+                e["free_vars"] = free
+    # 어떤 파일이 '남에게 include 되는' 파일인가. 이 구분이 없으면 엔트리포인트의
+    # 컬럼0 대입(그 페이지의 지역 변수)이 공유 전역 정의와 뒤섞여 93%가 잡음이 된다.
+    by_base = {}
+    for f in idx["files"]:
+        by_base.setdefault(f.rsplit("/", 1)[-1].lower(), []).append(f)
+    included = set()
+    for edges in idx["includes"].values():
+        for _kw, expr in edges:
+            lits = [t for t in RE_LIT.findall(expr)
+                    if t.lower().endswith((".php", ".inc"))]
+            if not lits:
+                continue
+            tail = "/" + lits[-1].strip().lstrip("./")
+            hit = [f for f in by_base.get(tail.rsplit("/", 1)[-1].lower(), [])
+                   if f.endswith(tail)]
+            if len(hit) == 1:
+                included.add(hit[0])
+    idx["included"] = sorted(included)
+    idx["meta"] = {"label": label, "scopes": scopes, "files": files,
+                   "built": time.strftime("%Y-%m-%d %H:%M:%S")}
+    return idx
+
+
+def index_dir(root=None):
+    """프로젝트의 gitignore 된 상태 디렉터리. `root` 는 받지만 쓰지 않는다."""
+    d = state_dir("index")
+    if not d:
+        sys.exit("phpindex: 프로젝트의 .claude/.state/ 를 찾지 못했다")
+    return d
+
+
+def write(root, name, idx):
+    out = index_dir(root)
+    os.makedirs(out, exist_ok=True)
+    path = os.path.join(out, name + ".json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(idx, fh, ensure_ascii=False, separators=(",", ":"))
+    size = os.path.getsize(path)
+    dup = sum(1 for v in idx["classes"].values() if len(set(v)) > 1)
+    print(f"  {name+'.json':<22} {idx['meta']['files']:>6} 파일  "
+          f"{size/1024/1024:>5.1f}MB  "
+          f"클래스 {len(idx['classes']):>5}(충돌 {dup})  "
+          f"함수 {len(idx['functions']):>5}  "
+          f"상수 {len(idx['constants']):>5}  "
+          f"전역 {len(idx['globals']):>5}  "
+          f"템플릿 {len(idx['templates']):>4}")
+
+
+def main():
+    require_config("phpindex")
+    root = tree_root()
+    if not root:
+        sys.exit("phpindex: legacy.root 아래에 legacy.treeMarker 가 없다")
+    args = sys.argv[1:]
+    # 모르는 옵션에 기본 동작(인덱스 재생성, 약 10초)을 하지 않는다. 도구를
+    # 처음 만나면 `--help` 를 먼저 쳐 보는 것이 자연스럽고, 거기서 10초를
+    # 쓰고 산출물을 덮는 것은 도움말이 없는 것보다 나쁘다.
+    unknown = [a for a in args
+               if a.startswith("-") and a not in ("--list", "--all", "--scope")]
+    if unknown:
+        print(__doc__.strip())
+        if unknown != ["--help"] and unknown != ["-h"]:
+            sys.exit(f"\nphpindex: 모르는 옵션 {' '.join(unknown)}")
+        return
+    if "--list" in args:
+        out = index_dir(root)
+        if not os.path.isdir(out):
+            sys.exit("인덱스 없음. phpindex 를 먼저 실행하라.")
+        for fn in sorted(os.listdir(out)):
+            if not fn.endswith(".json"):
+                continue
+            meta = json.load(open(os.path.join(out, fn), encoding="utf-8"))["meta"]
+            print(f"  {fn:<22} {meta['files']:>6} 파일  생성 {meta['built']}")
+        return
+    if "--all" in args:
+        wanted = ours()
+    elif "--scope" in args:
+        wanted = [args[args.index("--scope") + 1].strip("/")]
+    else:
+        cur = current_service()
+        if not cur or cur[0] == PHPLIB:
+            wanted = ours()
+            print("# 서비스 밖이라 이관 대상 서비스를 만든다")
+        else:
+            wanted = [cur[0]]
+    known = {p for p, _ in SERVICES}
+    for w in wanted:
+        if w not in known:
+            sys.exit(f"phpindex: 모르는 스코프 '{w}'")
+
+    t0 = time.time()
+    print(f"# 트리 {root}")
+    print(f"# 산출 {index_dir(root)}\n")
+    write(root, short_name(PHPLIB), build(root, [PHPLIB],
+                                         f"{short_name(PHPLIB)} (공용)"))
+    for rel in wanted:
+        scopes = [rel] + SCOPE_EXTRA.get(rel, [])
+        name = short_name(rel)
+        label = name + ("" if len(scopes) == 1
+                        else f" + {short_name(scopes[1])}")
+        write(root, name, build(root, scopes, label))
+    print(f"\n{time.time()-t0:.1f}초. 조회는 phpwhere <이름>.")
+
+
+if __name__ == "__main__":
+    main()

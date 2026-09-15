@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""phpv - print a php_legacy file decoded to UTF-8, with line numbers.
+
+    phpv <file>              whole file
+    phpv <file> 40:120       lines 40..120
+    phpv <file> 80 20        20 lines starting at 80
+
+The Read tool and `cat` decode as UTF-8 and turn every CP949 file's Korean into
+mojibake. Always come through here instead.
+"""
+import os
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _phpenc import read_text  # noqa: E402
+
+
+def main(argv):
+    if not argv:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    path = argv[0]
+    if not os.path.isfile(path):
+        print(f"phpv: not a file: {path}", file=sys.stderr)
+        return 1
+
+    start, end = 1, None
+    if len(argv) >= 2 and ":" in argv[1]:
+        a, _, b = argv[1].partition(":")
+        start = int(a) if a else 1
+        end = int(b) if b else None
+    elif len(argv) >= 2:
+        start = int(argv[1])
+        end = start + (int(argv[2]) if len(argv) >= 3 else 40) - 1
+
+    text, enc = read_text(path)
+    lines = text.split("\n")
+    end = len(lines) if end is None else min(end, len(lines))
+    start = max(1, start)
+
+    note = "" if enc in ("utf-8", "ascii") else f"  <- decoded from {enc}"
+    if enc == "unknown":
+        note = "  <- WARNING: not valid UTF-8 or CP949; shown with replacements"
+    print(f"# {path}  [{enc}, {len(lines)} lines]{note}")
+
+    width = len(str(end))
+    for i in range(start, end + 1):
+        print(f"{i:>{width}}\t{lines[i - 1]}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

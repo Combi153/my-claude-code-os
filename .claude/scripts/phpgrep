@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""phpgrep - search a legacy tree in both encodings, scoped to what you actually use.
+
+    phpgrep <낱말>                  current service + shared library
+    phpgrep <Identifier>            ASCII identifiers too
+    phpgrep --all X                 whole tree, counts per directory
+    phpgrep --scope <서비스경로> X    one named directory
+    phpgrep -l X                    files only
+    phpgrep -i X                    case-insensitive
+
+Scope. A service reaches exactly two trees: itself and the shared library named
+by `legacy.sharedLibrary` in workspace.json. That is measured, not assumed -
+across the tree there is one cross-service include and it is a leftover. So by
+default this searches the service you are standing in plus that library, and
+opens nothing else. Standing at the tree root there is no service to infer, so
+it falls back to counts for the whole tree.
+
+The scope actually used is always printed. A zero result means "not in this
+scope", never "not anywhere" - widen with --all before concluding anything.
+
+Encoding. A UTF-8 pattern misses every CP949 file; a raw CP949 pattern makes rg
+refuse and BSD grep return 0 in silence. Both are searched, the CP949 one as hex
+escapes, and hits are decoded before printing.
+"""
+import os
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _phpenc import (BUNDLE_GLOBS, PHPLIB, SERVICES, SIDE_GLOBS,  # noqa: E402
+                     current_service, tree_root)
+
+EXT = ["*.php", "*.inc", "*.tpl", "*.html", "*.htm", "*.js", "*.css"]
+EXPAND_UNDER = 60
+
+
+def hex_pattern(data):
+    return "(?-u)" + "".join(f"\\x{b:02x}" for b in data)
+
+
+def run_rg(args, paths, side=False):
+    cmd = ["rg", "-a", "--no-heading", "--line-number", "--color", "never",
+           "--no-messages"] + args
+    for e in EXT:
+        cmd += ["-g", e]
+    for g in BUNDLE_GLOBS + ([] if side else SIDE_GLOBS):
+        cmd += ["-g", g]
+    p = subprocess.run(cmd + paths, capture_output=True)
+    if p.returncode not in (0, 1):
+        sys.stderr.write(p.stderr.decode("utf-8", "replace"))
+    return p.stdout
+
+
+def parse(out, codec, root, into):
+    for raw in out.split(b"\n"):
+        if not raw:
+            continue
+        path, _, rest = raw.partition(b":")
+        num, _, text = rest.partition(b":")
+        if not num.isdigit():
+            continue
+        rel = os.path.relpath(os.path.abspath(path.decode("utf-8", "replace")), root)
+        into.append((rel, int(num), text.decode(codec, "replace").strip()))
+
+
+def group_of(rel):
+    for prefix, name in SERVICES:
+        if rel == prefix or rel.startswith(prefix + "/"):
+            return name
+    return "(기타)"
+
+
+def main(argv):
+    files_only = ignore_case = want_all = side = False
+    scope = None
+    rest = []
+    while argv:
+        a = argv.pop(0)
+        if a in ("-l", "--files"):
+            files_only = True
+        elif a in ("-i", "--ignore-case"):
+            ignore_case = True
+        elif a == "--all":
+            want_all = True
+        elif a == "--tests":
+            side = True
+        elif a == "--scope":
+            scope = argv.pop(0) if argv else None
+        elif a in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
+        elif a == "--":
+            rest.extend(argv)
+            del argv[:]
+        elif a.startswith("-") and a != "-":
+            # 모르는 옵션을 검색어로 삼지 않는다. 그렇게 하면 뒤따르는 진짜 패턴이
+            # 조용히 버려지고, 옵션 이름 자체를 찾은 결과가 그럴듯한 건수로
+            # 돌아온다. 0건은 의심이라도 사지만 이쪽은 숫자로 도착한다.
+            print(f"phpgrep: 모르는 옵션 {a}", file=sys.stderr)
+            print("검색어가 - 로 시작한다면 -- 뒤에 두라.  예:  phpgrep -- -->",
+                  file=sys.stderr)
+            print(__doc__.strip(), file=sys.stderr)
+            return 2
+        else:
+            rest.append(a)
+    if not rest:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    if len(rest) > 1:
+        # 남은 인자를 조용히 버리면 검색하지 않은 것을 검색한 것으로 읽게 된다.
+        print("phpgrep: 검색어는 하나여야 한다. "
+              + f"{len(rest)}개를 받았다 — " + " ".join(repr(r) for r in rest),
+              file=sys.stderr)
+        print("여러 낱말을 한 구문으로 찾으려면 따옴표로 묶어라.", file=sys.stderr)
+        return 2
+
+    term = rest[0]
+    root = tree_root()
+    if not root:
+        print("phpgrep: not inside a php_legacy tree", file=sys.stderr)
+        return 2
+
+    here = current_service()
+    if scope:
+        paths, desc = [os.path.join(root, scope)], scope
+        counts_only = False
+    elif want_all or not here:
+        paths, desc = [root], "전체 트리"
+        counts_only = True
+        if not here and not want_all:
+            desc += " (서비스 밖이라 좁힐 수 없음)"
+    else:
+        prefix, name = here
+        dirs = [prefix] if prefix == PHPLIB else [prefix, PHPLIB]
+        paths = [os.path.join(root, d) for d in dirs]
+        desc = " + ".join(dirs)
+        counts_only = False
+
+    flags = ["-i"] if ignore_case else []
+    hits = []
+    utf8 = term.encode("utf-8")
+    parse(run_rg(flags + ["-F", "-e", term], paths, side), "utf-8", root, hits)
+    seen = {(h[0], h[1]) for h in hits}
+    try:
+        legacy = term.encode("cp949")
+    except UnicodeEncodeError:
+        legacy = utf8
+    if legacy != utf8:
+        extra = []
+        parse(run_rg(flags + ["-e", hex_pattern(legacy)], paths, side),
+              "cp949", root, extra)
+        hits += [h for h in extra if (h[0], h[1]) not in seen]
+
+    print(f"# 범위: {desc}{'' if side else ' · 벤더·테스트 제외(--tests)'}",
+          file=sys.stderr)
+    if here and here[0] == PHPLIB and not (scope or want_all):
+        print(f"# 공용 라이브러리는 서비스 {len(SERVICES)}개가 함께 쓴다. "
+              "시그니처를 바꾼다면 --all 로 영향 확인.", file=sys.stderr)
+    if not hits:
+        print(f"# {term!r} 없음 — 이 범위에만 없는 것일 수 있다. --all 로 재확인.",
+              file=sys.stderr)
+        return 1
+
+    groups = {}
+    for rel, num, text in hits:
+        groups.setdefault(group_of(rel), []).append((rel, num, text))
+
+    order = [n for _, n in SERVICES] + ["(기타)"]
+    if here:
+        order.remove(here[1])
+        order.insert(0, here[1])
+
+    if counts_only and len(hits) > EXPAND_UNDER:
+        for name in order:
+            rows = groups.get(name)
+            if rows:
+                print(f"{name:20} {len(rows):>5}건 {len({r[0] for r in rows}):>5}파일"
+                      f"   [--scope {dict((n, p) for p, n in SERVICES)[name]}]"
+                      if name != "(기타)" else f"{name:20} {len(rows):>5}건")
+        print(f"\n# 총 {len(hits)}건 / {len({h[0] for h in hits})}파일. "
+              f"--scope 로 하나만 펼친다.", file=sys.stderr)
+        return 0
+
+    for name in order:
+        rows = groups.get(name)
+        if not rows:
+            continue
+        rows.sort()
+        print(f"## {name}: {len(rows)}건 / {len({r[0] for r in rows})}파일")
+        if files_only:
+            for f in sorted({r[0] for r in rows}):
+                print(f"   {f}")
+        else:
+            for rel, num, text in rows:
+                print(f"   {rel}:{num}: {text}")
+        print()
+    print(f"# 총 {len(hits)}건 / {len({h[0] for h in hits})}파일", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

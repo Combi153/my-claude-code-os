@@ -29,6 +29,17 @@ GIT_PUBLISHING = re.compile(r"\bgit\s+(add|commit|push)\b")
 
 # Directories the repository declares as company checkouts. Derived from .gitignore
 # so the two never drift; anything anchored there must never be staged.
+#
+# .gitignore writes a directory three ways, and reading only one of them is a
+# guard that reports "clean" on the paths it never looked at:
+#
+#   /cs-system/          leading and trailing slash - anchored at the root
+#   handoff/             trailing slash only        - matches at any depth
+#   /docs/lecture-notes  leading slash only         - anchored, no trailing slash
+#
+# The first was the only shape this function read, so the handoff notes and the
+# lecture material - both of which carry company content - passed the path guard
+# silently. Returns [(path, anchored), ...].
 def ignored_company_dirs(root):
     path = os.path.join(root, ".gitignore")
     dirs = []
@@ -36,11 +47,28 @@ def ignored_company_dirs(root):
         with open(path, encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
-                if line.startswith("/") and line.endswith("/"):
-                    dirs.append(line.strip("/"))
+                if not line or line.startswith("#") or line.startswith("!"):
+                    continue
+                if any(c in line for c in "*?["):
+                    continue          # a glob is not a path prefix
+                if not (line.startswith("/") or line.endswith("/")):
+                    continue          # names one file, not a tree
+                dirs.append((line.strip("/"), line.startswith("/")))
     except OSError:
         pass
     return dirs
+
+
+def under(path, d, anchored):
+    """Is `path` inside the ignored entry `d`?
+
+    An anchored entry (`/cs-system/`) only matches from the repository root; an
+    unanchored one (`handoff/`) matches at any depth, which is what gitignore
+    itself means by the two shapes.
+    """
+    if anchored:
+        return path == d or path.startswith(d + "/")
+    return ("/" + path + "/").find("/" + d + "/") >= 0
 
 
 def git(root, *args):
@@ -91,8 +119,8 @@ def main():
     staged = [p for p in git(root, "diff", "--cached", "--name-only").splitlines() if p]
     company = ignored_company_dirs(root)
     for path in staged:
-        for d in company:
-            if path == d or path.startswith(d + "/"):
+        for d, anchored in company:
+            if under(path, d, anchored):
                 problems.append(f"  staged company path: {path}  (under gitignored {d}/)")
 
     # --- 2. content guard ----------------------------------------------------

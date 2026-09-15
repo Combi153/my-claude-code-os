@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""phpstats - 레거시 작업 도구가 실제로 얼마나, 제대로 쓰였는지 본다.
+
+    phpstats              최근 30일
+    phpstats --days 7
+    phpstats --all
+    phpstats --names      자주 조회한 이름만
+
+기록은 `.claude/hooks/php-tooling-hook.py` 가 Bash·Read 호출마다 남긴다
+(`.claude/.state/tooling.jsonl`). 호출 횟수 자체보다 **전용 도구로 갔는가, 범용
+도구로 우회했는가**가 알고 싶은 값이라 그 짝을 나란히 보여준다.
+
+  읽기      phpv    vs  Read 툴 / cat·head·sed
+  검색      phpgrep vs  rg·grep
+  정의 조회  phpwhere vs 정의형 phpgrep (0건이 나오고 '없다'로 오독되는 그 검색)
+
+넛지 발동 수는 잘못된 경로로 갈 뻔한 횟수다. 이 값이 0으로 수렴하면 규칙이
+몸에 붙은 것이고, 줄지 않으면 CLAUDE.md 문구나 도구 쪽을 고쳐야 한다.
+
+**역할별 귀속.** 각 호출이 어느 서브에이전트에서 나왔는지 함께 보여준다. 이것이
+`docs/php-legacy-tooling.md` §5 의 단계별 도구 배정을 실제로 검증하는 유일한 길이다 —
+모든 단계가 서브에이전트이고, `session_id` 는 부모와 서브에이전트가 같은 값을 받는다.
+귀속이 안 된 행에는 이유가 붙는다: 부모 세션에서 직접 부른 것인지, 여러 에이전트가
+동시에 열려 있어 가릴 수 없는 것인지를 나눈다. **모호한 것을 하나로 골라 적지 않는다.**
+"""
+import json
+import os
+import sys
+import time
+from collections import Counter, defaultdict
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _phpenc import state_dir  # noqa: E402
+
+# v2 의 도구 넷을 포함한다. 훅의 `OUR_TOOLS` 와 같은 목록이어야 한다 — 한쪽에만
+# 있는 이름은 기록되지만 전용 호출로 세어지지 않아 비율을 낮은 쪽으로 기울인다.
+OURS = ["phpv", "phpgrep", "phpwhere", "phped", "phplint", "phpindex",
+        "phpseam", "htmlsnap", "dualrun-report", "ctxstats"]
+BYPASS = {"Read": "Read 툴", "raw-read": "cat·head·sed", "raw-grep": "rg·grep",
+          "read-index": "인덱스 직접 읽기"}
+PAIRS = [("읽기", ["phpv"], ["Read", "raw-read"]),
+         ("검색", ["phpgrep"], ["raw-grep"])]
+
+
+def bar(n, total, width=22):
+    if not total:
+        return ""
+    filled = int(round(n / total * width))
+    return "█" * filled + "·" * (width - filled)
+
+
+def log_path():
+    """계측 로그. 레거시 체크아웃이 아니라 프로젝트의 상태 디렉터리에 산다.
+
+    체크아웃 안에 두면 체크아웃이 다시 만들어질 때 함께 사라진다. 계측은 오래 두고
+    값을 재야 의미가 있으므로, 살아남는 쪽에 있어야 한다.
+    """
+    d = state_dir()
+    if not d:
+        sys.exit("phpstats: 프로젝트의 .claude/.state/ 를 찾지 못했다")
+    return os.path.join(d, "tooling.jsonl")
+
+
+def load(root, days):
+    p = root
+    rows = []
+    for path in (p + ".1", p):
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    pass
+    if days:
+        cut = time.time() - days * 86400
+        rows = [r for r in rows if r.get("ts", 0) >= cut]
+    return rows
+
+
+def main():
+    args = sys.argv[1:]
+    days = None if "--all" in args else 30
+    if "--days" in args:
+        days = int(args[args.index("--days") + 1])
+    rows = load(log_path(), days)
+    if not rows:
+        print("기록 없음. 훅이 등록돼 있는지 확인하라 "
+              "(OS 루트의 .claude/settings.json → hooks.PreToolUse, matcher Bash|Read).")
+        return 0
+
+    span = "전체" if days is None else f"최근 {days}일"
+    first = min(r.get("ts", 0) for r in rows)
+    sess = len({r.get("sess") for r in rows if r.get("sess")})
+    print(f"# {span} · 호출 {len(rows):,}건 · 세션 {sess}개 · "
+          f"첫 기록 {time.strftime('%Y-%m-%d', time.localtime(first))}")
+
+    if "--names" in args:
+        names = Counter(r["arg"].strip("'\"") for r in rows
+                        if r.get("tool") == "phpwhere" and r.get("arg")
+                        and not r["arg"].startswith("--"))
+        print(f"\n자주 조회한 이름 (phpwhere {sum(names.values())}건)")
+        for n, c in names.most_common(15):
+            print(f"  {c:>4}  {n[:60]}")
+        return 0
+
+    tools = Counter(r.get("tool") for r in rows)
+    total = sum(tools.values())
+    print("\n도구별")
+    for t, c in tools.most_common():
+        tag = "  ← 우회" if t in BYPASS else ""
+        label = BYPASS.get(t, t)
+        print(f"  {label:<18} {c:>5}  {bar(c, total)}{tag}")
+
+    print("\n전용 도구 vs 우회")
+    for label, good, bad in PAIRS:
+        g = sum(tools[t] for t in good)
+        b = sum(tools[t] for t in bad)
+        if not (g + b):
+            continue
+        pct = g / (g + b) * 100
+        print(f"  {label:<6} 전용 {g:>4} / 우회 {b:>4}   전용 비율 {pct:>5.1f}%")
+    defshaped = sum(1 for r in rows if r.get("mode") == "def-shaped")
+    pw = tools.get("phpwhere", 0)
+    if pw + defshaped:
+        print(f"  {'정의조회':<6} 전용 {pw:>4} / 우회 {defshaped:>4}   "
+              f"전용 비율 {pw/(pw+defshaped)*100:>5.1f}%")
+
+    nudged = sum(1 for r in rows if r.get("nudge"))
+    dedicated = sum(tools.get(t, 0) for t in OURS)
+    print(f"\n넛지 발동 {nudged}건" + ("  (잘못된 경로로 갈 뻔한 횟수)"
+                                     if nudged else "  — 없음"))
+    if not dedicated:
+        # 넛지 0 은 "규칙이 붙었다"로도 "도구가 한 번도 안 쓰였다"로도 읽힌다.
+        # 후자면 그렇다고 말한다. 지표가 두 상태를 같은 숫자로 내놓으면 안 된다.
+        print("  전용 도구 호출이 한 건도 없다 — 이 기간의 기록은 전부 우회다.")
+    if nudged:
+        why = Counter(r.get("tool") for r in rows if r.get("nudge"))
+        for t, c in why.most_common(4):
+            print(f"  {c:>4}  {BYPASS.get(t, t)}")
+
+    modes = Counter(r.get("mode") for r in rows
+                    if r.get("tool") == "phpwhere" and r.get("mode", "").startswith("--"))
+    if modes:
+        plain = pw - sum(modes.values())
+        print("\nphpwhere 모드별")
+        if plain:
+            print(f"  {'이름 조회':<12} {plain:>4}")
+        for m, c in modes.most_common():
+            print(f"  {m:<12} {c:>4}")
+
+    # ---- 역할별 귀속 ---------------------------------------------------
+    # 세 상태를 갈라서 센다. 하나로 뭉치면 "귀속 안 됨"이 두 가지 다른 사실을
+    # 같은 숫자로 덮는다 — 부모가 직접 부른 것과, 병렬이라 가릴 수 없는 것.
+    by_agent = Counter(r["agent"] for r in rows if r.get("agent"))
+    parent = sum(1 for r in rows if not r.get("agent") and r.get("agents") == 0)
+    ambiguous = sum(1 for r in rows
+                    if not r.get("agent") and (r.get("agents") or 0) > 1)
+    unknown = len(rows) - sum(by_agent.values()) - parent - ambiguous
+    if by_agent or parent or ambiguous:
+        print("\n역할별 (어느 서브에이전트가 불렀는가)")
+        for a, c in by_agent.most_common():
+            print(f"  {a:<26} {c:>5}  {bar(c, len(rows))}")
+        if parent:
+            print(f"  {'(부모 세션에서 직접)':<26} {parent:>5}")
+        if ambiguous:
+            print(f"  {'(병렬 실행 중 — 가릴 수 없음)':<26} {ambiguous:>5}")
+        if unknown:
+            print(f"  {'(귀속 기록 이전의 행)':<26} {unknown:>5}")
+        # transcript 축이 실제로 갈리는지도 함께 본다. 두 신호를 같이 기록한
+        # 이유가 이것이다 — 어느 쪽이 작동하는지는 모아 본 로그가 답한다.
+        tps = {r.get("tp") for r in rows if r.get("tp")}
+        if len(tps) > 1:
+            print(f"  transcript 지문 {len(tps)}종 — 이 축으로도 갈린다")
+        elif tps:
+            print("  transcript 지문 1종 — 이 축으로는 갈리지 않는다 "
+                  "(서브에이전트가 부모와 같은 transcript 를 쓴다)")
+    elif rows:
+        print("\n역할별 귀속 기록이 없다 — 훅의 Task 등록을 확인하라 "
+              "(.claude/settings.json → PreToolUse matcher 에 Task, "
+              "PostToolUse 에 matcher Task).")
+
+    svcs = Counter(r.get("svc") for r in rows if r.get("svc"))
+    unattributed = sum(1 for r in rows if not r.get("svc"))
+    if svcs or unattributed:
+        print("\n서비스별")
+        # 귀속되지 않은 건수를 버리지 않는다. 버리면 남은 몇 건이 전체 분포로
+        # 읽히고, 이 표가 조용히 좁혀졌다는 사실 자체가 사라진다.
+        line = " · ".join(f"{s} {c}" for s, c in svcs.most_common())
+        if unattributed:
+            line = (line + " · " if line else "") + f"귀속 안 됨 {unattributed}"
+        print("  " + line)
+
+    byday = defaultdict(int)
+    for r in rows:
+        byday[time.strftime("%m/%d", time.localtime(r.get("ts", 0)))] += 1
+    if len(byday) > 1:
+        recent = sorted(byday.items())[-10:]
+        peak = max(c for _, c in recent)
+        print("\n일자별")
+        for d, c in recent:
+            print(f"  {d}  {c:>4}  {bar(c, peak, 18)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
