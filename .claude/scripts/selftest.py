@@ -130,8 +130,9 @@ SHARED = LG.get("sharedLibrary") or PRIMARY
 # once, so every skip gives the same true reason rather than "no CP949 file found" - which is
 # what a tree that *is* present but holds no CP949 file would also say, and two different facts
 # under one sentence is how a missing environment comes to look like a missing file.
-# **It never prints the path.** This repository is public and so is its CI log; a path out of the
-# legacy checkout is company information just as much as the code inside it.
+# **It never prints the path.** This repository is public, and its selftest output is quoted into
+# tracked documents and pull requests; a path out of the legacy checkout is company information
+# just as much as the code inside it.
 if CONFIG_PROBLEM:
     NO_TREE = CONFIG_PROBLEM
 elif not TREE:

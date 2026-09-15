@@ -298,7 +298,7 @@ PHP 실험 헬퍼(`.claude/templates/MigrationExperiment.php`)가 남긴 JSONL �
 | 위치 | 무엇 |
 |---|---|
 | `.claude/scripts/` | **도구 열넷과 공유 모듈** — 레거시를 읽는 여섯 · 계측 `phpstats` · v2 넷 · v3 셋. 환경 상수가 하나도 없다 |
-| `.claude/scripts/selftest.py` · `selftest_hook.py` | 자기검사. 도구·가드·계측 케이스. 검사마다 소요 시간을 찍는다. **`workspace.json` 없이도 시작하고**, 환경이 필요한 검사는 없는 키나 파일을 이름으로 말하며 건너뛴다 — 건너뜀은 통과가 아니므로 돌아간 수가 줄면 그것이 보인다(CI 는 설계 정본 6장) |
+| `.claude/scripts/selftest.py` · `selftest_hook.py` | 자기검사. 도구·가드·계측 케이스. 검사마다 소요 시간을 찍는다. **`workspace.json` 없이도 시작하고**, 환경이 필요한 검사는 없는 키나 파일을 이름으로 말하며 건너뛴다 — 건너뜀은 통과가 아니므로 돌아간 수가 줄면 그것이 보인다(설계 정본 6장) |
 | `.claude/scripts/selftest_phpmove.py` · `_htmlsnap.py` · `_dualrun.py` · `_context.py` | v2 도구별 케이스 모듈. `selftest.py` 가 부른다 |
 | `.claude/templates/MigrationExperiment.php` | PHP 실험 헬퍼의 원본. PHP 5.6 문법, 환경값 없음 — 교체 담당이 레거시 트리로 복사한다 |
 | `.claude/skills/php-legacy-io` · `-trace` · `-map` | 사용법·추적 절차·지도의 **판독 규칙.** 이름으로 호출된다 |
