@@ -128,7 +128,7 @@ What is *not* a finding: CSS class selection, markup structure, label text, date
 
 ### Output
 
-Write to `<docs.root>/boundary-sweep-<surface>.md` and report the top findings. **This file sitting outside the page artifacts' numbering (`00-`–`05-`) is deliberate** — a surface sweep does not belong to a page, and a numbered file inside a page directory is read by `status.sh` as a completed phase.
+Write to `<docs.root>/boundary-sweep-<surface>.md` and report the top findings. **This file sitting outside the page artifacts' numbering (`00-`–`05-`) is deliberate** — a surface sweep does not belong to a page, and a numbered file inside a page directory is listed by `status.sh` as that page's latest artifact.
 
 For each, say what it would take to move it — most will be small, and a few will reveal
 that a whole page needs planning. Feed those into `page-picker`.

@@ -16,6 +16,10 @@ CFG="$ROOT/.claude/config/workspace.json"
 # artifacts.json is resolved from this script's own location, not from ROOT: the numbering
 # belongs to the skill, and the skill knows where it lives even when ROOT is pointed elsewhere.
 ART="$(dirname "${BASH_SOURCE[0]:-$0}")/references/artifacts.json"
+# Same reasoning for the tool: `pagecheck --show` is the only reader of a page's state.json, and
+# the rounds, the caps and the toggle are in that file and nowhere else. Parsing it here instead
+# would make a second reader of one file, and two readers drift.
+PAGECHECK="$(dirname "${BASH_SOURCE[0]:-$0}")/../../scripts/pagecheck"
 
 if [ ! -f "$CFG" ]; then
   echo "no workspace.json - copy .claude/config/workspace.example.json and fill it in"
@@ -51,6 +55,24 @@ while IFS=$'\t' read -r kind a b; do
   case "$kind" in
     LINE)   printf '%s\n' "$a" ;;
     PROBE)  printf '%s = %s\n' "$a" "$(probe "$b")" ;;
+    SHOW)
+      # The phase guessed from filenames is not the round count. Bounded and fail-soft for the
+      # same reason docker is: this block runs on every load of the skill, so a tool that hangs
+      # or dies here stops the skill from loading at all.
+      if [ ! -x "$PAGECHECK" ]; then
+        printf '           (no pagecheck at %s - rounds, caps and the toggle cannot be shown)\n' "$PAGECHECK"
+      else
+        shown=$(bounded 6 "$PAGECHECK" "$a" --show)
+        if [ $? -eq 124 ]; then
+          printf '           (pagecheck --show timed out after 6s)\n'
+        elif [ -z "$shown" ]; then
+          # Empty is not "no rounds" - it is "could not answer". Name the command that says why
+          # rather than printing a blank where a cap-exceeding loop would have shown.
+          printf '           state.json could not be read - `pagecheck %s --show` says why\n' "$a"
+        else
+          printf '%s\n' "$shown" | sed 's/^/           /'
+        fi
+      fi ;;
     JAVA)
       if [ -z "$b" ]; then
         printf '%s javaHome unset - gradle may run on the default JDK and fail\n' "$a"
@@ -150,10 +172,11 @@ out.append(f"DOCKER\t{(legacy.get('docker') or {}).get('composeDir') or ''}\t{',
 # misreads the parentheses inside the braces as a parameter expansion and destroys the
 # whole heredoc (measured: "bad substitution"). An apostrophe in a comment here breaks it
 # the same way - the parser reads it as an opening quote and never finds the closing paren.
-PHASE = {}
+# Number -> artifact name, and nothing else. The `phase` field in artifacts.json is deliberately
+# not read: see the note on the page loop below.
+ARTNAME = {}
 for _name, _meta in art.items():
-    PHASE[_name[:2]] = [_name, _meta.get("phase")]
-LAST = max([p for _, p in PHASE.values() if isinstance(p, int)] or [0])
+    ARTNAME[_name[:2]] = _name
 # No fallback value here. A missing key quietly replaced by a guess produces "no directory",
 # which reads as "no page has started yet" rather than "the config is wrong" - the narrow
 # answer this OS exists to refuse. Name the key instead.
@@ -162,7 +185,7 @@ LAST = max([p for _, p in PHASE.values() if isinstance(p, int)] or [0])
 root, sub = docs.get("root"), docs.get("pagesDir")
 sdir = os.path.join(root, sub) if root and sub else None
 if not art:
-    line("page     : no references/artifacts.json - the phase cannot be determined")
+    line("page     : no references/artifacts.json - artifact numbers cannot be interpreted")
 elif not root:
     line("page     : docs.root is not set in workspace.json - nothing was looked up")
 elif not sub:
@@ -177,15 +200,27 @@ else:
         nums = sorted(m.group(1) for f in os.listdir(os.path.join(sdir, n))
                       if (m := re.match(r"(\d\d)-", f)))
         head = "page     : " if i == 0 else "           "
+        # **The phase is not judged here.** state.json holds it and `pagecheck --show` prints it
+        # on the next line. A phase guessed from filenames printed beside that value is a second
+        # source for one fact, and the two were seen disagreeing on one screen - the guess said
+        # Phase 1 done while the record said phase 0. This line says only what is on disk.
         if not nums:
-            state = "no artifact       · next Phase 1"
-        elif nums[-1] not in PHASE:
+            state = "no artifact yet"
+        elif nums[-1] not in ARTNAME:
             state = f"{nums[-1]}-* unknown number · compare against artifacts.json"
         else:
-            fname, ph = PHASE[nums[-1]]
-            nxt = "done" if ph >= LAST else f"next Phase {ph + 1}"
-            state = f"{fname:<16} Phase {ph} done · {nxt}"
+            state = f"latest artifact {ARTNAME[nums[-1]]}"
         line(f"{head}{n:<24} {state}")
+        # The numbering above is a guess from filenames; state.json is the record. `pagecheck
+        # --show` reads it - phase, each loop as n/cap, the cap changes, the last rounds with
+        # their causes, the toggle. A page without one says so rather than being skipped: the
+        # silent version of this line is what let a loop run 10/5 unseen.
+        # (No apostrophe in this comment. See the warning above - it ends the heredoc early.)
+        pdir = os.path.join(sdir, n)
+        if os.path.isfile(os.path.join(pdir, "state.json")):
+            out.append(f"SHOW\t{pdir}\t")
+        else:
+            line(" " * 36 + "no state.json - `pagecheck <page-dir> --init --page <id>` places it")
 
 line(f"e2e      : {e2e.get('root') or 'path unset'}")
 print("\n".join(out))

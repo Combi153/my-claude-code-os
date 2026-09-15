@@ -49,7 +49,7 @@ NAME_IN_PATTERN = re.compile(r"\$?([A-Za-z_]\w{2,})")
 # detour nor as dedicated and dropped out entirely - and a dropped record looks like low usage.
 OUR_TOOLS = ("phpv", "phpgrep", "phped", "phplint", "phpindex", "phpwhere",
              "phpstats", "phpmove", "htmlsnap", "dualrun-report", "ctxstats",
-             "ctxevolve", "pagecheck")
+             "ctxevolve", "pagecheck", "causestats")
 STOP = {"function", "class", "interface", "trait", "define", "scope", "all",
         "tests", "web", "php", "inc"}
 # The index moved to `.claude/.state/index/` on 2026-09-08. While only the old path was watched,

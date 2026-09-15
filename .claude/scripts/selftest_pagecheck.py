@@ -574,7 +574,7 @@ check("an unexpected mismatch is exit 1 (not 3 - the check did run)",
 
 open(LOG, "w").close()
 set_flag("nolog")
-p, _ = run([d, "--stage", "3", "--config", CONFIG])
+p, _ = run([d, "--stage", "3", "--note", "환경", "--config", CONFIG])
 set_flag("nolog", False)
 # The page is deliberately the one above, which already measured `unexpected 1`. So the
 # assertion can be exact: an unreadable log neither measures nor clears - the 1 is still a 1.
@@ -623,7 +623,7 @@ check("it states the reason as 'comes from legacy'",
       "from legacy" in p.stderr, p.stderr.strip()[-90:])
 
 if hashes:
-    p, secs = run([d, "--stage", "5", "--config", CONFIG])
+    p, secs = run([d, "--stage", "5", "--note", "이관결함", "--config", CONFIG])
     check("an identical screen under the fake value passes, with body hashes unchanged",
           p.returncode == 0 and state_of(d)["checks"]["fakevalue"] == "pass"
           and "body hashes unchanged" in p.stdout,
@@ -631,7 +631,7 @@ if hashes:
     with open(SWAP_PHP, "w", encoding="utf-8") as fh:   # edit inside the body
         fh.write("<?php\nfunction demo_body($p)\n{\n"
                  "    return array('total' => 43);\n}\n")
-    p, _ = run([d, "--stage", "5", "--config", CONFIG])
+    p, _ = run([d, "--stage", "5", "--note", "확인만", "--config", CONFIG])
     # `!= 0` admitted exit 3, which is "could not check" - the substitution this OS exists to
     # block. The stage must have run and failed, and recorded that failure.
     check("a moved body hash stops fake-value injection passing",
@@ -661,11 +661,11 @@ check("a skipped stage's check result is null, not 0",
       st["checks"]["legacy_lines"] is None, str(st["checks"]["legacy_lines"]))
 
 set_flag("xdebug")
-p, _ = run([d, "--stage", "6", "--config", NO_COVERAGE])
+p, _ = run([d, "--stage", "6", "--note", "환경", "--config", NO_COVERAGE])
 check("Xdebug present but no coveragePath key is exit 3",
       p.returncode == 3 and "coveragePath" in p.stdout, f"exit={p.returncode}")
 
-p, _ = run([d, "--stage", "6", "--config", CONFIG])
+p, _ = run([d, "--stage", "6", "--note", "환경", "--config", CONFIG])
 check("Xdebug present but no artifact produced is exit 3 (unwired coverage is never 0)",
       p.returncode == 3 and "wired up" in p.stdout, f"exit={p.returncode}")
 
@@ -681,12 +681,12 @@ if hashes:
             json.dump(payload, fh)
 
     coverage_is({recorded["file"]: {str(lo): 1, str(hi): 1}})
-    p, _ = run([d, "--stage", "6", "--config", CONFIG])
+    p, _ = run([d, "--stage", "6", "--note", "환경", "--config", CONFIG])
     check("the moved body executing under migrated is a failure (exit 1)",
           p.returncode == 1 and state_of(d)["checks"]["legacy_lines"] == 2,
           f"exit={p.returncode} · {state_of(d)['checks']['legacy_lines']}")
     coverage_is({recorded["file"]: {str(hi + 500): 3}})
-    p, _ = run([d, "--stage", "6", "--config", CONFIG])
+    p, _ = run([d, "--stage", "6", "--note", "확인만", "--config", CONFIG])
     check("lines outside the body are not counted (exit 0, check result 0)",
           p.returncode == 0 and state_of(d)["checks"]["legacy_lines"] == 0,
           f"exit={p.returncode}")
@@ -819,6 +819,157 @@ p, _ = run([d, "--show", "--json", "--config", CONFIG])
 check("--show --json emits state.json unchanged",
       p.returncode == 0 and json.loads(p.stdout)["page"] == PAGE_ID,
       f"exit={p.returncode}")
+
+# ------------------------------------------------------------ 13. the cause loop
+# The five loops, the cause each round after the first one carries, and the record a cap change
+# leaves. Before this existed, three of the five had a cap that no line of code could reach:
+# `STAGE_LOOP` covers L2 and L3 only, so L0, coverage and L1 counted nothing and their caps were
+# decoration. The cases are ordered the way the loop is used: count, explain, refuse, then raise
+# the cap in the open.
+print("\n### 13. the cause loop - five counters, a cause from the second round, a cap in the open")
+
+d = new_page("cause")
+p, _ = run([d, "--round", "L0"])
+st = state_of(d)
+check("the first round of a stage-less loop needs no cause",
+      p.returncode == 0 and st["loops"]["L0"]["n"] == 1,
+      f"exit={p.returncode} · {st['loops']['L0']}")
+check("the first round is recorded with an empty cause",
+      st["rounds"][-1]["note"] == "" and st["rounds"][-1]["loop"] == "L0",
+      str(st["rounds"][-1]))
+
+p, _ = run([d, "--round", "L0"])
+st = state_of(d)
+check("the second round without a cause is refused (exit 2)",
+      p.returncode == 2 and "second round" in p.stderr, f"exit={p.returncode}")
+check("the refused round moved neither the counter nor the record",
+      st["loops"]["L0"]["n"] == 1 and len(st["rounds"]) == 1,
+      f"{st['loops']['L0']} · {len(st['rounds'])} lines")
+
+p, _ = run([d, "--round", "L0", "--note", "대충"])
+check("a cause outside the vocabulary is refused and the vocabulary is printed",
+      p.returncode == 2 and "outside the cause vocabulary" in p.stderr
+      and "환경" in p.stderr, f"exit={p.returncode}")
+check("the refused word was not stored", state_of(d)["loops"]["L0"]["n"] == 1)
+
+p, _ = run([d, "--round", "L0", "--note", "기타"])
+check("`기타` with no sentence is refused", p.returncode == 2 and "--why" in p.stderr,
+      f"exit={p.returncode}")
+
+p, _ = run([d, "--round", "L0", "--why", "이유만 적었다"])
+check("a sentence with no cause word is refused (free text through the back door)",
+      p.returncode == 2 and "--note" in p.stderr, f"exit={p.returncode}")
+
+p, _ = run([d, "--round", "L0", "--note", "기타", "--why", "맞는 칸이 없다"])
+st = state_of(d)
+check("`기타` with a sentence passes, and both are recorded",
+      p.returncode == 0 and st["rounds"][-1]["note"] == "기타"
+      and st["rounds"][-1]["why"] == "맞는 칸이 없다", str(st["rounds"][-1]))
+
+p, _ = run([d, "--round", "L2", "--note", "환경"])
+check("--round refuses the loops the stages spend (one counter, one owner)",
+      p.returncode == 2 and "L2" in p.stderr, f"exit={p.returncode}")
+
+# --------------------------------------- all five are counted
+# This is the reason for the section. The three that no stage runs had caps and no counter, so
+# the design canon claimed five counted loops while two counted.
+d = new_page("five")
+baseline(d)
+open(LOG, "w").close()
+p, _ = run([d, "--stage", "3,6", "--config", CONFIG], timeout=300)
+for name in ("L0", "cov", "L1"):
+    run([d, "--round", name])
+st = state_of(d)
+counted = {k: v["n"] for k, v in st["loops"].items()}
+check("all five loops count a round (L0 · cov · L1 by --round, L2 · L3 by stages)",
+      all(counted.get(k) == 1 for k in ("L0", "cov", "L1", "L2", "L3")), str(counted))
+
+# --------------------------------------- a stage loop obeys the same rule
+d = new_page("stagecause")
+baseline(d)
+open(LOG, "w").close()
+p, _ = run([d, "--stage", "3", "--config", CONFIG])
+check("a stage loop's first round needs no cause either", p.returncode == 0,
+      f"exit={p.returncode}")
+
+deliver("legacy")
+before = open(ENV_FILE).read()
+p, _ = run([d, "--stage", "3", "--config", CONFIG])
+st = state_of(d)
+check("a stage loop's second round without a cause is refused (exit 2)",
+      p.returncode == 2 and "second round" in p.stderr, f"exit={p.returncode}")
+check("that refusal touched neither the toggle nor the env file nor the counter",
+      delivered().get("X_BACKEND_DEMO_PAGE") == "php"
+      and open(ENV_FILE).read() == before and st["loops"]["L2"]["n"] == 1,
+      f"toggle={delivered().get('X_BACKEND_DEMO_PAGE')} · {st['loops']['L2']}")
+
+p, _ = run([d, "--stage", "3", "--dry-run", "--config", CONFIG])
+check("a dry run is not asked for a cause - it spends no round", p.returncode == 0,
+      f"exit={p.returncode}")
+
+d = new_page("onecause")
+baseline(d)
+open(LOG, "w").close()
+run([d, "--stage", "3", "--config", CONFIG])
+p, _ = run([d, "--stage", "3,4", "--note", "확인만", "--config", CONFIG], timeout=300)
+st = state_of(d)
+carried = [r for r in st["rounds"] if r.get("note")]
+check("the second round with a cause proceeds and the cause is stored",
+      p.returncode == 0 and st["loops"]["L2"]["n"] == 2 and carried
+      and carried[-1]["note"] == "확인만",
+      f"exit={p.returncode} · {st['loops']['L2']} · {[r.get('note') for r in st['rounds']]}")
+# Two stages of one L2 round are one retry. Writing the cause on both lines would make every
+# `--stage 3,4` count twice wherever these lines are counted, and the metric would climb
+# without a single extra round having happened.
+check("one round with two stages carries the cause once, not twice",
+      len([r for r in st["rounds"] if r.get("note") == "확인만"]) == 1,
+      f"{[(r.get('stage'), r.get('note')) for r in st['rounds']]}")
+
+# --------------------------------------- a cap change is recorded, not forbidden
+d = new_page("capchange", caps="L2=2,L3=2")
+st = state_of(d)
+at_init = [c for c in st.get("cap_changes") or [] if c.get("at_init")]
+check("a starting cap that is not the default is recorded as a cap change",
+      len(at_init) == 2 and {c["loop"] for c in at_init} == {"L2", "L3"},
+      str(st.get("cap_changes")))
+
+p, _ = run([d, "--cap", "L2=7", "--why", "설계로 돌아가는 편이 비쌌다"])
+st = state_of(d)
+mid = [c for c in st["cap_changes"] if not c.get("at_init")]
+check("changing a cap on an existing page records loop, from, to and reason",
+      p.returncode == 0 and len(mid) == 1 and mid[0]["loop"] == "L2"
+      and mid[0]["from"] == 2 and mid[0]["to"] == 7
+      and mid[0]["why"] == "설계로 돌아가는 편이 비쌌다", str(mid))
+check("the cap itself moved", st["loops"]["L2"]["cap"] == 7, str(st["loops"]["L2"]))
+check("a cap change is reported apart, never folded into the rounds",
+      "cap change" in p.stdout + p.stderr
+      and not [r for r in st["rounds"] if r.get("verdict") == "cap"],
+      p.stdout.strip()[-80:])
+
+p, _ = run([d, "--show"])
+check("--show prints the cap change so it cannot pass unseen",
+      "cap change" in p.stdout and "2 → 7" in p.stdout, p.stdout.strip()[-120:])
+
+d = new_page("roundcap", caps="L0=1")
+run([d, "--round", "L0"])
+p, _ = run([d, "--round", "L0", "--note", "환경"])
+check("--round stops at the cap too (exit 4, not 0)",
+      p.returncode == 4 and "reached its cap" in p.stderr, f"exit={p.returncode}")
+check("the cap stop did not count the round", state_of(d)["loops"]["L0"]["n"] == 1,
+      str(state_of(d)["loops"]["L0"]))
+
+# The `--show` block is embedded in the orchestrator skill and read by a person every session,
+# so its round line is checked as output, not only as state. It used to print `round 1  loop L0
+# round` - the same word in the count slot and the verdict slot.
+d = new_page("roundshow")
+run([d, "--round", "cov"])
+run([d, "--round", "cov", "--note", "확인만"])
+p, _ = run([d, "--show"])
+rline = [l for l in p.stdout.splitlines() if l.strip().startswith("round 2")]
+check("--show says what a counted round was, without repeating the word",
+      len(rline) == 1 and "loop cov" in rline[0] and "counted" in rline[0]
+      and "확인만" in rline[0] and rline[0].split().count("round") == 1,
+      rline[0].strip() if rline else p.stdout.strip()[-120:])
 
 # ------------------------------------------------------------ wrap-up
 server.shutdown()

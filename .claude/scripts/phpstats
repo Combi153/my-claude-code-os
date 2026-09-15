@@ -39,7 +39,7 @@ from _phpenc import state_dir  # noqa: E402
 # While it was only written down and never checked, `phpstats` was missing from this list.
 OURS = ["phpv", "phpgrep", "phpwhere", "phped", "phplint", "phpindex",
         "phpstats", "phpmove", "htmlsnap", "dualrun-report", "ctxstats",
-        "ctxevolve", "pagecheck"]
+        "ctxevolve", "pagecheck", "causestats"]
 BYPASS = {"Read": "the Read tool", "raw-read": "cat, head, sed", "raw-grep": "rg, grep",
           "read-index": "reading the index directly"}
 PAIRS = [("read", ["phpv"], ["Read", "raw-read"]),

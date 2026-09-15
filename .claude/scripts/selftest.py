@@ -141,6 +141,8 @@ CASE_MODULES = [
      [], 120),
     (8.6, "ctxevolve - record → proposed revision", None, None, "selftest_ctxevolve.py",
      [], 180),
+    (8.7, "causestats - extra rounds → causes, repeats and metrics", None, None,
+     "selftest_causestats.py", [], 240),
 ]
 
 
@@ -486,6 +488,74 @@ check("the orchestrator points at the canonical routing table",
       "references/routing.md" in skill,
       "" if "references/routing.md" in skill
       else "legacy-migrate/SKILL.md does not mention references/routing.md")
+
+# (a2) the cause vocabulary - canonical in pagecheck's CAUSE dict ------------
+# The same shape as (a), for the other closed vocabulary this OS has. One copy decides what a
+# round may be blamed on at the moment the round is counted (`pagecheck`), and one copy is what a
+# person reads and an agent is told to choose from (the two-layer table in the design canon). A
+# drift is silent in both directions: a word the design tells an agent to use is refused at the
+# counter, or a word the counter accepts is one the metrics have no upper layer for and drop.
+# It is extracted rather than written here - a third copy inside the checker is still a copy.
+def literal_dict(rel, want):
+    """A module-level dict assigned to `want`, read **without running the file**."""
+    try:
+        tree = ast.parse(read(PROJECT, rel))
+    except (SyntaxError, ValueError):
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == want for t in node.targets):
+            try:
+                val = ast.literal_eval(node.value)
+            except (ValueError, TypeError, SyntaxError):
+                return None
+            return val if isinstance(val, dict) else None
+    return None
+
+
+def table_two_cols(text, header_needle):
+    """{second column: first column} of a table's body rows, backticks stripped.
+
+    The vocabulary table is written upper-layer first because that is the order a person reads
+    it in; the code is keyed by the lower layer because that is what arrives on the command
+    line. Flipping it here rather than in either copy keeps both readable.
+    """
+    out, seen, started = {}, False, False
+    for line in text.splitlines():
+        if not seen:
+            seen = header_needle in line
+            continue
+        if not line.startswith("|"):
+            if started and out:
+                break
+            continue
+        if set(line.replace("|", "").strip()) <= set("-: "):
+            started = True
+            continue
+        if not started:
+            continue
+        cells = [c.strip().strip("`").strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) >= 2 and cells[0] and cells[1]:
+            out[cells[1]] = cells[0]
+    return out
+
+
+code_vocab = literal_dict(".claude/scripts/pagecheck", "CAUSE")
+doc_vocab = table_two_cols(read(PROJECT, "docs/legacy-migration-os.md"),
+                           "| 위층 | 아래층 |")
+# Both empty would compare equal, and "the check went blind" would then read as "they agree" -
+# the same hole (a) has to guard. So an empty side is a failure on its own.
+_cv = code_vocab or {}
+_dv = doc_vocab or {}
+_only_code = sorted(k for k in _cv if _cv.get(k) != _dv.get(k))
+_only_doc = sorted(k for k in _dv if _dv.get(k) != _cv.get(k))
+check("the cause vocabulary matches between pagecheck and the design canon",
+      bool(_cv) and bool(_dv) and _cv == _dv,
+      ("pagecheck's CAUSE could not be extracted " if not _cv else "")
+      + ("no vocabulary table in §4 of the design canon " if not _dv else "")
+      + (f"code-only/differing {_only_code} · canon-only/differing {_only_doc}"
+         if _cv and _dv and _cv != _dv else "")
+      or f"{len(_cv)} words × 2 layers")
 
 # (b) artifacts - canonical in artifacts.json --------------------------------
 try:

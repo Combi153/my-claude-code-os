@@ -2,8 +2,10 @@
 """pagecheck - run one page's seven automatic stages and record the round in `state.json`.
 
     pagecheck <page-dir> --stage <list>   [--observations <file>] [--surface <key>]
-                                            [--note <text>] [--json] [--dry-run]
-                                            [--config <file>]
+                                            [--note <cause>] [--why <text>]
+                                            [--json] [--dry-run] [--config <file>]
+    pagecheck <page-dir> --round L0|cov|L1  [--note <cause>] [--why <text>]
+    pagecheck <page-dir> --cap L0=4         [--why <text>]
     pagecheck <page-dir> --init --page <id> [--unit <sym>] [--area <name>]
                                             [--depth shallow|normal|deep]
                                             [--cap L2=5,L3=3]
@@ -20,6 +22,22 @@
 | 5 fake value | in `migrated`, replace the legacy return value with a fake one and capture | the capture must be **identical** to pass · body hashes unchanged |
 | 6 coverage | (when Xdebug is present) executed lines of the moved legacy body | 0. Without it, skip and record that in `state.json` |
 | 7 restore | toggle `legacy` · instrumentation variables cleared · record in `state.json` | confirmed by read-back |
+
+**Five loops, and the cause every round after the first one carries.** Stages 3-6 spend L2 and
+L3. L0, coverage and L1 turn inside a Phase, no stage runs them, and until this was written
+nothing counted them - their caps were decoration. `--round` raises those three, and it is the
+same counter with the same cap stop.
+
+**From the second round on a round does not proceed without a cause** (`--note`), and the cause is
+one word of the vocabulary in `CAUSE` below. The first round carries none: nothing has been
+retried yet. Forcing a retry into a neighbouring word manufactures a false three-of-a-kind and a
+false three-of-a-kind repairs the wrong thing, so a word outside the vocabulary is refused and the
+word for "no box fits" is `기타`, which requires `--why`. `causestats` reads these back.
+
+**A cap change is recorded, not forbidden.** Raising a cap is one legitimate output of that
+reading and at the same time the cheapest way to make the metric look better, so `--cap` against an
+existing page writes which loop went from what to what into `cap_changes`, and `--show` and
+`causestats` report it apart from everything else.
 
 **Only this file and the orchestrator write `state.json`.** Subagents neither read nor write it.
 Rounds and caps are incremented here; `page`, `unit`, `area`, `depth`, `phase` and the cap values
@@ -38,7 +56,7 @@ owns is the order, the toggle, the rounds and the check results.
 Exit codes:
     0  pass
     1  fail - the check ran and it is red
-    2  wrong usage
+    2  wrong usage - including a cause that is missing, outside the vocabulary, or `기타` with no sentence
     3  **could not check** - environment, config or a missing tool. Mixing this with 0 removes the reason this tool exists
     4  cap reached - it did not proceed. Distinct from 1 (not red, but out of budget)
 """
@@ -66,7 +84,35 @@ STAGES = {1: "env", 2: "noise", 3: "dual", 4: "migrated", 5: "fakevalue",
 # The loops that count rounds. Which loop's budget a stage spends - 3 and 4 are equivalence (L2),
 # 5 and 6 are completeness (L3). 1, 2 and 7 are setup and cleanup and spend nothing.
 STAGE_LOOP = {3: "L2", 4: "L2", 5: "L3", 6: "L3"}
+# The three that no stage spends. They turn inside a Phase - extraction, coverage, implementation -
+# so the only thing that can raise them is the orchestrator saying so: `--round <name>`.
+ROUND_LOOPS = ("L0", "cov", "L1")
+DEFAULT_CAPS = {"L0": 3, "cov": 2, "L1": 5, "L2": 5, "L3": 3}
 CHECKS = ("unexpected", "baseline_diff", "fakevalue", "legacy_lines")
+
+# ------------------------------------------------------------ the cause vocabulary
+# **This dict is the canonical copy.** §4 of docs/legacy-migration-os.md holds the same table
+# for a person to read, and `selftest.py` compares the two; `causestats` imports this one rather
+# than keeping a second. Two layers: the upper is closed and the metrics are computed from it
+# alone, so the lower can grow without the metrics changing meaning.
+#
+# `기타` has no upper layer on purpose. It drops out of the first metric's denominator, so
+# writing everything as `기타` does not improve that metric - it makes it uncomputable, and
+# `causestats` says so. There is no way to buy a better number with it.
+# **Every value here is a literal on purpose**: `selftest.py` reads this dict with
+# `ast.literal_eval` and compares it against the table, so it never has to run this file, and a
+# name in place of a string would make that check quietly unable to extract anything.
+CAUSE = {
+    "환경": "이관아님",        # the stack, the settings or the build did not line up
+    "OS결함": "이관아님",      # a defect in the orchestrator, a tool or an instruction
+    "확인만": "이관아님",      # measured again with nothing fixed
+    "이관결함": "이관",        # the legacy and the backend values really differ
+    "규칙누락": "이관",        # a rule that was not in the rule list showed up later
+    "설계결함": "이관",        # it has to go back to the design
+    "기타": "정할 수 없음",    # no box fits. **A sentence is required alongside**
+}
+OTHER = "기타"
+NO_UPPER = CAUSE[OTHER]       # derived, so the two cannot drift inside this file either
 
 EXIT_OK, EXIT_RED, EXIT_USAGE, EXIT_CANNOT, EXIT_CAP = 0, 1, 2, 3, 4
 
@@ -203,19 +249,15 @@ def cmd_init(page_dir, o):
     if os.path.isfile(path):
         cannot(f"{path} already exists. --init does not overwrite - erasing the round history is "
                "the easiest way to dodge a cap.")
-    caps = {"L0": 3, "cov": 2, "L1": 5, "L2": 5, "L3": 3}
-    for item in (o.get("--cap") or "").split(","):
-        if not item.strip():
-            continue
-        if "=" not in item:
-            usage(f"--cap has the form `L2=5,L3=3` (got {item!r})")
-        name, _, val = item.partition("=")
-        if name.strip() not in caps:
-            usage(f"unknown loop {name.strip()!r}. Available: {', '.join(caps)}")
-        try:
-            caps[name.strip()] = int(val)
-        except ValueError:
-            usage(f"the value of --cap is not an integer ({val!r})")
+    caps = dict(DEFAULT_CAPS)
+    given = parse_caps(o.get("--cap"), caps)
+    caps.update(given)
+    # A starting cap that is not the default is a cap change too - it is just made before the
+    # first round rather than after the third. Left unrecorded it is the one way to raise a
+    # budget and have nothing anywhere say so, so it goes in the same list, marked as init.
+    started = [{"at": now(), "loop": k, "from": DEFAULT_CAPS[k], "to": v,
+                "why": o.get("--why") or "", "at_init": True}
+               for k, v in sorted(given.items()) if v != DEFAULT_CAPS[k]]
     doc = {"page": o["--page"], "unit": o.get("--unit") or "",
            "area": o.get("--area") or "", "depth": o.get("--depth") or "shallow",
            "phase": 0,
@@ -223,11 +265,165 @@ def cmd_init(page_dir, o):
            # Before measuring it is null, not 0. Zero means measured and clean, and recording
            # something unmeasured as 0 makes that check green forever.
            "checks": {g: None for g in CHECKS},
-           "toggle": None, "skips": {}, "rounds": []}
+           "toggle": None, "skips": {}, "rounds": [], "cap_changes": started}
     os.makedirs(page_dir, exist_ok=True)
     write_state(doc, path)
     print(f"{TOOL} --init: {path}  page {doc['page']} · caps "
           + " · ".join(f"{k} {v['cap']}" for k, v in sorted(doc["loops"].items())))
+    for c in started:
+        note(f"the starting cap for {c['loop']} is {c['to']}, not the default {c['from']}. "
+             "It is recorded in cap_changes and `causestats` reports it separately.")
+    return EXIT_OK
+
+
+def parse_caps(spec, known):
+    """`L2=5,L3=3` → {name: int}, for the names in `known`. Only what was given."""
+    out = {}
+    for item in (spec or "").split(","):
+        if not item.strip():
+            continue
+        if "=" not in item:
+            usage(f"--cap has the form `L2=5,L3=3` (got {item!r})")
+        name, _, val = item.partition("=")
+        if name.strip() not in known:
+            usage(f"unknown loop {name.strip()!r}. Available: {', '.join(known)}")
+        try:
+            out[name.strip()] = int(val)
+        except ValueError:
+            usage(f"the value of --cap is not an integer ({val!r})")
+    return out
+
+
+# --------------------------------------------------------------- the cause
+
+def read_cause(o):
+    """(cause, sentence) from the options, or stop with 2. **The shape only** - whether a cause is
+    required at all is decided by the round number, in `demand_cause`.
+
+    A word outside the vocabulary is refused rather than stored. Storing free text lets the same
+    retry be written a different way each time, and three of the same cause is what this whole
+    loop is built to notice - a synonym is a way of never reaching three.
+    """
+    word = (o.get("--note") or "").strip()
+    why = (o.get("--why") or "").strip()
+    if not word:
+        if why:
+            usage("--why was given with no --note. The sentence explains a cause word; on its own "
+                  "it is the free text this vocabulary exists to replace.")
+        return "", ""
+    if word not in CAUSE:
+        usage(f"--note {word!r} is outside the cause vocabulary. It is one of: "
+              + " · ".join(CAUSE)
+              + f". Do not force a retry into a neighbouring word - that manufactures a false "
+                f"three-of-a-kind, which repairs the wrong thing. When none of them fits, "
+                f"`{OTHER}` with --why is the answer, and a third `{OTHER}` is the signal to "
+                "grow the vocabulary.")
+    if word == OTHER and not why:
+        usage(f"`{OTHER}` requires --why <sentence>. Without it the record says only that no "
+              "word fitted, and the entry that is supposed to teach the vocabulary its next "
+              "word teaches nothing.")
+    return word, why
+
+
+def demand_cause(state, names, word):
+    """From the second round on, no cause means no round. **Checked before anything is touched.**
+
+    The first round of a loop carries none - nothing has been retried yet. The second is the
+    first that has something to explain, and an unexplained retry is exactly the round that
+    later cannot be counted.
+    """
+    if word:
+        return
+    second = [n for n in names if (state["loops"].get(n) or {}).get("n", 0) >= 1]
+    if not second:
+        return
+    usage("loop " + " · ".join(f"{n} is entering round {state['loops'][n]['n'] + 1}"
+                                   for n in second)
+          + ", and from the second round on the round needs a cause: --note <word> "
+            f"[--why <sentence>]. Words: " + " · ".join(CAUSE)
+          + ". **Nothing was touched** - neither the toggle, nor a capture, nor the counter.")
+
+
+def cap_stop(state, name):
+    """The message and exit code for a loop that has no budget left. Shared by stages and `--round`."""
+    loop = state["loops"][name]
+    sys.stderr.write(
+        f"{TOOL}: loop {name} reached its cap ({loop['n']}/{loop['cap']}). "
+        "**It did not proceed** - neither the toggle nor a capture was touched. This is a "
+        "loop that running the same way once more will not close, so a person has to "
+        f"decide which Phase to go back to. Check results: "
+        + " · ".join(f"{g}={fmt(state['checks'].get(g))}" for g in CHECKS)
+        + "\n")
+    return EXIT_CAP
+
+
+def cmd_round(page_dir, o):
+    """Raise one of the three loops no stage spends. Same counter, same cap, same cause rule.
+
+    It touches nothing outside `state.json`: these loops close on a person's or an agent's
+    verdict, not on a measurement this tool can take. What it does own is that the round is
+    counted at all - the reason L0, coverage and L1 had caps nobody could exceed on paper and
+    everybody exceeded in practice is that no line of code ever added 1 to them.
+    """
+    name = (o.get("--round") or "").strip()
+    if name not in ROUND_LOOPS:
+        usage(f"--round takes one of {', '.join(ROUND_LOOPS)} (got {name!r}). "
+              "L2 and L3 are spent by stages 3-6, and a loop with two things adding to it is a "
+              "loop whose count means nothing.")
+    state, spath = read_state(page_dir)
+    loop = state["loops"].get(name)
+    if not loop:
+        cannot(f"loops in {spath} has no {name}. A state.json made before this loop existed is "
+               "not extended here - add the key, with the cap it should have had.")
+    word, why = read_cause(o)
+    demand_cause(state, [name], word)
+    if loop["n"] >= loop["cap"]:
+        return cap_stop(state, name)
+    loop["n"] += 1
+    # The verdict slot says what happened to this line, and for these three loops nothing was
+    # measured - the round was counted and that is all this tool did. "round" here printed as
+    # `round 2  loop L0  round`, the same word twice, in a block a person reads every session.
+    state["rounds"].append({"n": loop["n"], "loop": name, "stage": None,
+                            "verdict": "counted", "at": now(), "note": word, "why": why})
+    write_state(state, spath)
+    print(f"{TOOL} {state['page']}  loop {name} {loop['n']}/{loop['cap']}"
+          + (f"  cause {word}" if word else "  (first round, no cause)")
+          + (f"  · {why}" if why else "") + f"  → {spath}")
+    return EXIT_OK
+
+
+def cmd_cap(page_dir, o):
+    """Change a cap on an existing page, and leave the change where it can be seen.
+
+    Raising a cap is one of the three things the cause loop is allowed to produce, and it is also
+    the cheapest way to make "went over its cap" stop happening without fixing anything. So it is
+    not forbidden - it is written down, with the loop, the old value, the new one and the reason,
+    and reported apart from everything else by `--show` and `causestats`.
+    """
+    state, spath = read_state(page_dir)
+    given = parse_caps(o.get("--cap"), state["loops"])
+    if not given:
+        usage("--cap has the form `L2=5,L3=3`.")
+    why = (o.get("--why") or "").strip()
+    changed = []
+    for name in sorted(given):
+        old, new = state["loops"][name]["cap"], given[name]
+        if old == new:
+            print(f"  {name} cap is already {old} - nothing recorded")
+            continue
+        state["loops"][name]["cap"] = new
+        state.setdefault("cap_changes", []).append(
+            {"at": now(), "loop": name, "from": old, "to": new, "why": why,
+             "at_init": False})
+        changed.append(f"{name} {old} → {new}")
+    if changed:
+        write_state(state, spath)
+        print(f"{TOOL} {state['page']}  cap change  " + " · ".join(changed)
+              + (f"  · {why}" if why else "") + f"  → {spath}")
+        note("a cap was changed. It is recorded in cap_changes and `causestats` reports cap "
+             "changes separately from the rounds - the number that improves after a cap moves "
+             "improved for a different reason than a number that improves on its own."
+             + ("" if why else " **No reason was given** (--why)."))
     return EXIT_OK
 
 
@@ -246,9 +442,17 @@ def cmd_show(page_dir, as_json):
         f"{g}={fmt(doc['checks'].get(g))}" for g in CHECKS))
     for name, why in sorted((doc.get("skips") or {}).items()):
         print(f"  skipped stage {name}: {why}")
+    # Reported apart from the rounds, and never folded into them. A cap that moved is the one
+    # change that makes two runs of the same numbers mean different things.
+    for c in doc.get("cap_changes") or []:
+        print(f"  cap change  {c.get('loop')} {c.get('from')} → {c.get('to')}  "
+              f"{c.get('at')}{'  (at --init)' if c.get('at_init') else ''}"
+              f"  {c.get('why') or '(no reason given)'}")
     for r in doc["rounds"][-8:]:
-        print(f"  round {r.get('n')}  stage {r.get('stage')}  {r.get('verdict')}  "
-              f"{r.get('at')}  {r.get('note') or ''}")
+        where = f"stage {r['stage']}" if r.get("stage") else f"loop {r.get('loop') or '-'}"
+        print(f"  round {r.get('n')}  {where}  {r.get('verdict')}  "
+              f"{r.get('at')}  {r.get('note') or ''}"
+              + (f" · {r['why']}" if r.get("why") else ""))
     return EXIT_OK
 
 
@@ -917,9 +1121,14 @@ def main():
         return cmd_init(page_dir, o)
     if o.get("--show"):
         return cmd_show(page_dir, bool(o.get("--json")))
+    if o.get("--round"):
+        return cmd_round(page_dir, o)
+    if o.get("--cap"):
+        return cmd_cap(page_dir, o)
     if not o.get("--stage"):
         usage("no --stage. Give it as `--stage 1,2` or `--stage 3..7`.")
     want = parse_stages(o["--stage"])
+    cause, cause_why = read_cause(o)         # the shape, before anything is opened
 
     if not os.path.isdir(page_dir):
         cannot(f"{page_dir} is not a directory.")
@@ -962,14 +1171,12 @@ def main():
                 "you are fixing right now may be the instrumentation rather than the migration. "
                 "What could not be checked is in the previous round's output.\n")
         if loop["n"] >= loop["cap"]:
-            sys.stderr.write(
-                f"{TOOL}: loop {name} reached its cap ({loop['n']}/{loop['cap']}). "
-                "**It did not proceed** - neither the toggle nor a capture was touched. This is a "
-                "loop that running the same way once more will not close, so a person has to "
-                f"decide which Phase to go back to. Check results: "
-                + " · ".join(f"{g}={fmt(state['checks'].get(g))}" for g in CHECKS)
-                + "\n")
-            return EXIT_CAP
+            return cap_stop(state, name)
+
+    # The second round of any of these loops needs a cause. A dry run spends none of them, so it
+    # is not asked for one - refusing to *describe* a plan is not a measurement this protects.
+    if not o.get("--dry-run"):
+        demand_cause(state, loops, cause)
 
     if o.get("--dry-run"):
         print(f"{TOOL} --dry-run  {page_dir}")
@@ -997,12 +1204,14 @@ def main():
                                     f"{state['loops'][n]['cap']}" for n in loops)
              if loops else ""))
 
-    exit_code, results = EXIT_OK, []
+    exit_code, results, stamped = EXIT_OK, [], set()
     for s in want:
         res = STAGE_FN[s](env, ctx)
         results.append((s, res))
         verdict = ("skipped" if res.skip else ("pass" if res.ok else "fail"))
         print(f"  stage {s} {STAGES[s]:<9} {verdict}  {res.line}")
+        first = bool(STAGE_LOOP.get(s)) and STAGE_LOOP[s] not in stamped
+        stamped.add(STAGE_LOOP.get(s, ""))
         state["checks"].update(res.checks)
         state["toggle"] = res.extra.get("toggle", state.get("toggle"))
         if s in (2, 3):
@@ -1015,8 +1224,16 @@ def main():
             state.get("skips", {}).pop(str(s), None)
         state["rounds"].append({
             "n": state["loops"].get(STAGE_LOOP.get(s, ""), {}).get("n"),
+            # Which loop this line belongs to. Without it a reader of the record cannot tell the
+            # two stages of one L2 round from two rounds, and `causestats` would count one retry
+            # twice. Stages 1, 2 and 7 spend nothing and carry "" here.
+            "loop": STAGE_LOOP.get(s, ""),
             "stage": s, "verdict": verdict, "at": now(),
-            "note": o.get("--note") or "",
+            # **The cause belongs to the round, not to the stage.** `--stage 3,4` is one L2
+            # round with two stages in it, so the cause is written on the first line of each
+            # loop and left off the rest. Writing it on both would make one retry count twice
+            # wherever these lines are counted.
+            "note": cause if first else "", "why": cause_why if first else "",
             **{k: v for k, v in res.checks.items() if v is not None}})
         write_state(state, spath)
         if not res.ok:
@@ -1056,7 +1273,7 @@ def main():
 
 FLAGS = {"--init", "--show", "--json", "--dry-run"}
 VALUED = {"--stage", "--observations", "--surface", "--note", "--config", "--page",
-          "--unit", "--area", "--depth", "--cap"}
+          "--unit", "--area", "--depth", "--cap", "--round", "--why"}
 
 
 def parse_opts(argv):

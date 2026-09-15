@@ -17,8 +17,6 @@ description: |
 
 Move one swap point's worth of a legacy PHP backend into Spring/Kotlin without changing what the screen does, and prove both halves of that claim. Why there are two separate checks, and the rule list's column contract, are in the injected context. The design rationale is `docs/legacy-migration-os.md` (section 1.6 is v3); the canonical format is `references/rules-format.md`.
 
-The static completeness checks each see one layer, so adding a layer adds a blind spot. **Fake-value injection is layer-independent** — if replacing the wrapper's legacy return value with a fake value in `migrated` mode leaves the screen unchanged, that value came from the backend.
-
 ## Current state
 
 !`bash "${CLAUDE_PROJECT_DIR:-.}/.claude/skills/legacy-migrate/status.sh"`
@@ -34,25 +32,23 @@ Every environment value comes from `.claude/config/workspace.json`. **If a key i
 | Page | `state.json` · `00-swap-point.md` · `01-rules.jsonl` · `02-design-changes.md` · `04-completeness.md` · `questions.md` · `observations.json` · `body-hashes.json` · `ignore.json` · `captures/` · `regressions/` |
 | Area (shared by several pages) | The area design · the domain document · per-role round records |
 
-The canonical list is `references/artifacts.json`. **Do not make agents memorise filenames — pass absolute paths in the prompt.** Progress is held by `state.json`'s `phase`, and the state block above prints that along with loop rounds, caps and the toggle. A session ending at an approval point is normal, so resume from that line, and say so before entering one.
+The canonical list is `references/artifacts.json`. **Do not make agents memorise filenames — pass absolute paths in the prompt.** Progress is held by `state.json`, and the state block above runs `pagecheck --show` on every page that has one — that is what puts the phase, the loop rounds, the caps and the toggle on screen each session. The `page :` line beside it lists artifacts and judges no phase: **one fact, one source.**
 
-`depth` lives in `state.json` and is passed to every subagent. **Recheck rounds default to 0**; turn one on when a later phase finds a rule missing from the list and can show the evidence.
+**Recheck rounds default to 0**; turn one on when a later phase finds a rule missing from the list and can show the evidence.
 
 ## Loops and approval points
 
-| Loop | Phase | Closes when | Cap |
+| Loop | Phase | Closes when | Counted by |
 |---|---|---|---|
-| L0 extraction | 1 | Every capture identical **and** zero lint violations | 3 |
-| Coverage | 2 | Every statement range in the body carries a rule ID | 2 |
-| L1 implementation | 4b | Build and architecture rules green **and the Phase 4a tests pass unedited** | 5 |
-| L2 equivalence | 5 | `pagecheck` stages 3–6 pass | 5 |
-| L3 completeness | 6 | Every automatic check passes **and** the verdict is PASS | 3 |
+| L0 extraction | 1 | Every capture identical **and** zero lint violations | `--round L0` |
+| Coverage | 2 | Every statement range in the body carries a rule ID | `--round cov` |
+| L1 implementation | 4b | Build and architecture rules green **and the Phase 4a tests pass unedited** | `--round L1` |
+| L2 equivalence | 5 | `pagecheck` stages 3–6 pass | stages 3–4 |
+| L3 completeness | 6 | Every automatic check passes **and** the verdict is PASS | stages 5–6 |
 
-**The caps are values in `state.json` and `pagecheck` increments them. On reaching one, stop and report to a person — this is a different device from an approval point and it is never delegated.**
+**The caps are values in `state.json`, not numbers in this table, and every round is counted there.** The stages raise L2 and L3 themselves; the other three are raised by you, at the phase that turns them, and each Phase below names the call. **From the second round on, a loop does not turn without a cause** — one word of the closed vocabulary `pagecheck` holds, `기타` only with `--why <sentence>`, and a word outside it refused. Do not force a retry into a neighbouring word: a manufactured three-of-a-kind repairs the wrong thing. On reaching a cap, stop and report to a person — this is a different device from an approval point and it is never delegated.
 
 There are three places a person stops the run, each one page long, in this order: **the plan approval** (Phase 1, before any edit) · **the asking phase** (2.5, right after the rule list) · **the design approval** (after Phase 3). Do not proceed on silence at any of them. A re-entry that does not change the plan does not pass the plan approval again; a re-entry through Phase 3 passes the design approval again.
-
-A fourth stop sits **outside** this pipeline: before the page was chosen, a person read a feature explanation of it (D-35). That is `page-picker`'s second step, and **it left no file** (D-37) — so if you need something from it, ask the person, do not go looking for it.
 
 ---
 
@@ -61,7 +57,7 @@ A fourth stop sits **outside** this pipeline: before the page was chosen, a pers
 1. Read `workspace.json`. If it is missing, say to copy the example and stop.
 2. Pick the page. If the user named one, use it; otherwise call `page-picker` — do not pick one yourself. **Its second step puts a feature explanation in front of the person before they choose** (D-35). A page named without one still starts, but say that the explanation is missing rather than starting silently.
 3. Take the **caller sweep** with `phpmove callers <symbol>`. Callers you are not moving this time go in the `Swap risk` section of `00-swap-point.md` — a caller using the same method under the exact opposite contract has actually occurred.
-4. Create the page directory and `state.json` (the format is in section 1.6 of the design document). If they exist already, **resume**.
+4. Create the page directory, then `pagecheck <page-dir> --init --page <id> [--unit <sym>] [--area <name>] [--depth ...]`. It refuses to overwrite an existing record, so if one is there, **resume** — a re-created `state.json` revives a loop past its cap at round 1.
 5. `pagecheck <page-dir> --stage 1,2` — four environment checks and the **run-to-run difference measurement**. Exit 3 means "the check could not run" and is not a pass.
 
 **`ignore.json` starts from that run-to-run difference.** A list guessed before anyone knows the real diff paths hides real defects. Entries added later **must point at an approved rule ID**.
@@ -74,17 +70,19 @@ A fourth stop sits **outside** this pipeline: before the page was chosen, a pers
 
 ```
 htmlsnap capture (before) → phped edit → phpmove lint → capture (after)
-                          → htmlsnap compare   (until identical, cap 3)
+                          → htmlsnap compare   (until identical)
                           → phpmove hash       (record the moved body's byte hash)
+  every turn after the first, before it starts:
+        pagecheck <page-dir> --round L0 --note <cause>
 ```
 
-**This phase's check is the baseline capture.** There is no backend yet and there is exactly one thing to confirm: that a refactor inside PHP did not change the screen. A capture flagged `logged_out` or `error_page` cannot be a baseline — an unauthenticated response arrives as 200, and two logged-out screens are always identical.
+**This phase's check is the baseline capture** — there is no backend yet, so the one thing to confirm is that a refactor inside PHP did not change the screen. A capture flagged `logged_out` or `error_page` cannot be a baseline — an unauthenticated response arrives as 200, and two logged-out screens are always identical.
 
 ## Phase 2 — the rule list (coverage)
 
 `Agent(subagent_type: "php-behavior-analyst")`. Pass: the absolute paths of `00-swap-point.md`, `01-rules.jsonl`, `references/rules-format.md`, `questions.md` and the round record · the page · the target methods · depth.
 
-One JSONL line is one rule and each column has one owner. The analyst writes `rule`, `class`, `src` and `range`, and leaves `obs` as `대기`. Coverage closes when **every statement range in the body carries a rule ID**.
+One JSONL line is one rule and each column has one owner. The analyst writes `rule`, `class`, `src` and `range`, and leaves `obs` as `대기`. Coverage closes when **every statement range in the body carries a rule ID**. **Each further pass over the body — a recheck round, or the analyst sent back at uncovered ranges — is `pagecheck <page-dir> --round cov --note <cause>` first.**
 
 **Classification and ID assignment are the orchestrator's job** (append-only). The rubric is the canonical format, and in particular a rule enforced only on the screen is not `경계` but `도메인` that has not moved. Fill `obs` after the observation list is settled — anything whose required input can be planted becomes `이중실행:` or `기준캡처:`, and only what cannot be planted becomes `불가:<kind>`. **Writing `불가` early stops inputs being planted that could have been.**
 
@@ -120,7 +118,7 @@ For every approved correction, prepare an `ignore.json` entry and change `obs` t
 
 **One** `Agent(subagent_type: "backend-builder")` does the backend implementation and the swap-point wiring together. Pass: the absolute paths of the approved design change set, the rule list, `00-swap-point.md`, `ignore.json`, `body-hashes.json`, the regression inputs, **the Phase 4a test files** and the round record · depth.
 
-They were merged because nobody was reading the schema's fields and the adapter's requested fields together, and that gap was unwatched. Independence of judgment is carried by the separation from the completeness checker, and that separation is enforced through tool permissions.
+**Each further dispatch to the builder is a round: `pagecheck <page-dir> --round L1 --note <cause>` before it.** A round the builder spent on the stack or on a tool is `환경` or `OS결함`, not `이관결함` — the word is what later tells a loop that was hard apart from a loop that was noisy.
 
 Five things must pass before it ends. **A failure is the agent's to fix; it does not come to a person.**
 
@@ -142,23 +140,24 @@ What you look at otherwise is **what** went green. Whether a decision got into t
 pagecheck <page-dir> --stage 3..7
 ```
 
-Dual · migrated · **fake-value injection** · legacy body execution · restore. **The orchestrator reads only the numbers.** Only this script touches the toggle, and it reads the value back from the application every time — writing a value and that value reaching PHP are different things. Exit 0 pass · 1 red · 3 **the check could not run**. Do not read 3 as a pass.
+Dual · migrated · **fake-value injection** (replace the wrapper's legacy return value with a fake one in `migrated` mode: a screen that does not change proves the value came from the backend, and it is the one check no layer can hide from) · legacy body execution · restore. **The orchestrator reads only the numbers.** Only this script touches the toggle, and it reads the value back from the application every time — writing a value and that value reaching PHP are different things. Exit 0 pass · 1 red · 3 **the check could not run**. Do not read 3 as a pass.
 
 If it is red, **read `references/routing.md`, settle on a cause, then dispatch.** That file holds the symptom–cause–owner table and the rule against weakening a check. Freeze samples of unexpected mismatches with `dualrun-report --as-regressions` and **pass that path to the next builder dispatch.**
 
 ## Phase 6 — completeness (L3)
 
-Call `Agent(subagent_type: "domain-placement-checker")` only when `pagecheck` is green. Asking a checker a question a machine can answer is expensive, and the answer comes back dressed as judgment. Pass: the full automatic-check output and the `phpmove lint --template` output (for reporting; exit 0) · the absolute paths of the rule list, the design change set, `00-swap-point.md`, `04-completeness.md` and the round record · depth.
+Call `Agent(subagent_type: "domain-placement-checker")` only when `pagecheck` is green. Pass: the full automatic-check output and the `phpmove lint --template` output (for reporting; exit 0) · the absolute paths of the rule list, the design change set, `00-swap-point.md`, `04-completeness.md` and the round record · depth.
 
 There are six verdict words and **the canonical list is the checker's file alone**. A word not in that table is not a verdict but a signal that the two files have drifted — do not route it, report that fact. Where each verdict goes back to, and the rules for re-passing an approval point, are in **`references/routing.md`**.
 
 ## Phase 7 — closing
 
-1. **Round records.** Confirm each agent left `{lesson, trigger, evidence, scope}` in its role's record. An entry without `evidence` is not an entry — there is a measurement showing that unevidenced self-reflection makes the harness worse. **Do not read the contents.** Only check that the file appeared.
+1. **Round records.** Confirm each agent left `{lesson, trigger, evidence, scope}` in its role's record. An entry without `evidence` is not an entry. **Do not read the contents** — only check that the file appeared.
 2. **Context change set.** From the evidenced entries, propose a change set against `.claude/context/*.md` as `{Add, Merge, Revise, Skip}`, and **a person approves it via `git diff`.** Do not rewrite wholesale. Prose that a mechanism replaces is deleted in the same change set.
-3. **Zero unresolved OS defects.** Do not carry a tool or hook defect found this round into the next unit. A defect the checks caught becomes a regression input; an OS defect becomes a selftest case. Carrying one forward postpones the learning that makes rounds shorter.
-4. **Call the scribe again only if the completeness pass changed the rule list.** Phase 2.5 already wrote this page into the area domain document, so a second pass with nothing to correct rewrites a document that was right. When rows did change, call `Agent(subagent_type: "domain-scribe")` with `mode: revise` and pass the rule list, the completeness report and **the absolute path of the area domain document** — it revises in place, because the moment two documents describe one area the single source of truth is dead.
-5. Report to the user: row counts by classification and by migration state · the results of both checks, equivalence and completeness, with **the commands that produced them** · the six axes in `state.json` · the regression input path · open product decisions from the domain document · **the toggle's final state and the command to revert it**.
+3. **Repeated causes.** Run `causestats`. For every cause that reached **three**, write a change set against exactly one of three things — **a cap value · an instruction · a new check** — and **a person approves that one by `git diff` too.** Three `기타` is the signal to add a word to the vocabulary instead. This is not 2 done twice: 2 reads the roles' records, which you never open, and this reads `state.json`, which only you and `pagecheck` write. Neither change set is applied by an agent.
+4. **Zero unresolved OS defects.** A defect the checks caught becomes a regression input; an OS defect becomes a selftest case. Do not carry either into the next unit.
+5. **Call the scribe again only if the completeness pass changed the rule list** — a second pass with nothing to correct rewrites a document that was right. When rows did change, call `Agent(subagent_type: "domain-scribe")` with `mode: revise` and pass the rule list, the completeness report and **the absolute path of the area domain document**; it revises in place, because the moment two documents describe one area the single source of truth is dead.
+6. Report to the user: row counts by classification and by migration state · the results of both checks, equivalence and completeness, with **the commands that produced them** · the six axes in `state.json` · the regression input path · open product decisions from the domain document · **the toggle's final state and the command to revert it**.
 
 **End with the toggle on `legacy`.** Leaving an unreviewed code path live at the end of a session is not the orchestrator's decision to make.
 
@@ -169,6 +168,6 @@ There are six verdict words and **the canonical list is the checker's file alone
 1. **Do not read legacy files yourself.** If it feels like you must, that is work for an agent. **One exception**: you may read to confirm a specific question an agent did not answer, but **leave what you read as an artifact.** The problem is not the reading, it is the evaporation.
 2. **Do not read an artifact whole.** Read only the first section's `## Summary`, 20 lines. If the summary cannot support a judgment, do not open the artifact — send it back to that agent to fix the summary.
 3. **Require every agent's final response to be under 300 words.**
-4. **A session ending at an approval point is normal.** Resume from the state block. Do not accumulate state in the conversation.
+4. **A session ending at an approval point is normal**, so say so before entering one and resume from the state block. Do not accumulate state in the conversation.
 5. **Do not ask an agent a question a machine can answer.** Hashes, lint, callers and fields are answered by `phpmove`; screen identity by `htmlsnap`; the check procedure by `pagecheck`. What is left for an agent is classification, placement and judgment.
 6. **Break a new check deliberately before trusting it.** Watch it go red, then put it back.
