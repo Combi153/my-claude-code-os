@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""dualrun-report - read the dual-run log and leave only the 'unexpected mismatches'.
+
+    dualrun-report [--log <path>] [--ignore ignore.json] [--since <ISO>]
+                   [--experiment <name>] [--as-regressions <out.json>] [--json]
+                   [--regression-limit 3] [--config <file>]
+
+    --log <path>          the JSONL log. Defaults to legacy.dualRun.logPath
+    --ignore <file>       the expected-mismatch list built from 의도수정 rows
+    --since <ISO>         only lines after this time (e.g. 2026-09-08T12:00:00+09:00)
+    --experiment <name>   one experiment only
+    --as-regressions <out>   save unexpected samples as a regression-input JSON
+    --regression-limit N     samples saved and shown per signature (default 3)
+    --json                a machine-readable summary
+    --config <file>       where workspace.json is
+
+**The one question this tool answers.** "Is there an input where legacy and the new backend
+answered differently, and was that difference approved in advance?" Approved differences are in
+`ignore.json` - built from the rule list's `의도수정` rows and carrying a row ID. So what to read
+in this tool's output is one number, **unexpected**, and the Phase 6 loop closes when it is 0.
+
+**Mismatches are grouped by their `diff_keys` signature rather than listed one by one.** One
+missing rule produces hundreds of mismatches but a single signature. What a person needs to read
+is not the count but the number of signatures, which is "how many rules diverged".
+
+**One broken line anywhere is exit 2.** Green from this tool means "zero unexpected", and with a
+line it could not read it cannot say that. Counting the unread as absent would make this tool
+commit the very failure it exists to prevent. The helper appends one line at a time under
+`LOCK_EX`, so a broken line is not a normal state - the disk filled, two processes know different
+paths as the same file, or a container mount is wrong.
+
+Exit codes: 0 zero unexpected · 1 there are some · 2 log missing, empty, broken, or no config (reason on stderr).
+"""
+import datetime
+import json
+import os
+import re
+import sys
+
+sys.dont_write_bytecode = True
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+CONFIG_REL = os.path.join(".claude", "config", "workspace.json")
+TOOL = "dualrun-report"
+
+
+def die(msg, code=2):
+    sys.stderr.write(f"{TOOL}: {msg}\n")
+    sys.exit(code)
+
+
+def note(msg):
+    sys.stderr.write(f"{TOOL}: {msg}\n")
+
+
+# --------------------------------------------------------------- config
+
+def config_path(explicit):
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+    try:
+        from _phpenc import project_dir
+        root = project_dir()
+    except Exception:
+        root = None
+    if not root:
+        d = HERE
+        while d and not os.path.isfile(os.path.join(d, CONFIG_REL)):
+            parent = os.path.dirname(d)
+            d = None if parent == d else parent
+        root = d
+    if not root:
+        die(f"could not find {CONFIG_REL}. Give its location with --config, or point at the log "
+            "directly with --log.")
+    return os.path.join(root, CONFIG_REL)
+
+
+def load_config(explicit):
+    path = config_path(explicit)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh), path
+    except (OSError, ValueError) as exc:
+        die(f"{path} could not be read: {exc}")
+
+
+def opt(cfg, dotted, default=None):
+    cur = cfg
+    for part in dotted.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return default
+        cur = cur[part]
+    return default if cur in ("", None) else cur
+
+
+# --------------------------------------------------------------- ignore
+
+def load_ignore(path):
+    """(rules, problem). Stops when even one rule has the wrong shape - a rule that quietly does
+    not match creates an 'unexpected', and that unexpected sends a person to the wrong place."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError) as exc:
+        die(f"the ignore file could not be read ({path}): {exc}")
+    rules = doc.get("rules") if isinstance(doc, dict) else None
+    if not isinstance(rules, list):
+        die(f"{path} has no rules array. "
+            '{"rules":[{"experiment":"<name>","keys":["total"],"rules":"R-17",'
+            '"reason":"의도수정: ..."}]} is the required shape.')
+    for i, r in enumerate(rules):
+        if not isinstance(r, dict):
+            die(f"{path} rules[{i}] is not an object")
+        keys = r.get("keys")
+        if not isinstance(keys, list) or not keys or any(
+                not isinstance(k, str) for k in keys):
+            die(f"keys in {path} rules[{i}] is not an array of strings")
+        if not r.get("rules"):
+            note(f"{path} rules[{i}] names no rule row - an expected mismatch has to come from an "
+                 "의도수정 row in the rule list. Ignoring without a row ID loses the evidence.")
+    return rules
+
+
+def key_covered(diff_key, rule_key):
+    """Does the rule key cover the diff key? `items[].title` covers `items[0].title`, and
+    `items` covers everything below it."""
+    rx = re.escape(rule_key).replace(r"\[\]", r"\[\d+\]").replace(r"\[\*\]", r"\[\d+\]")
+    try:
+        return re.fullmatch(rx + r"([.\[].*)?", diff_key) is not None
+    except re.error:
+        return diff_key == rule_key
+
+
+def matching_rules(rec, rules):
+    """(was everything covered, the related rules). Empty diff_keys is never treated as covered."""
+    keys = [k for k in (rec.get("diff_keys") or []) if isinstance(k, str)]
+    exp = rec.get("experiment")
+    related, covered = [], set()
+    for r in rules:
+        rexp = r.get("experiment")
+        if rexp and rexp != "*" and rexp != exp:
+            continue
+        hit = {k for k in keys for rk in r["keys"] if key_covered(k, rk)}
+        if hit:
+            related.append(r)
+            covered |= hit
+    return (bool(keys) and covered == set(keys)), related
+
+
+# --------------------------------------------------------------- the log
+
+REQUIRED = ("experiment", "equal")
+
+
+def read_log(path, since, only_exp):
+    """(records, stats). Counts the lines it could not read - it does not skip them in silence."""
+    if not os.path.isfile(path):
+        die(f"no log: {path}. Check the toggle was dual and that the log path is mounted into "
+            "the container. An empty log and 'no log' are different facts.")
+    recs, broken_json, broken_schema, skipped_mode, filtered = [], [], [], 0, 0
+    total_lines = 0
+    with open(path, "rb") as fh:
+        for n, raw in enumerate(fh, 1):
+            total_lines = n
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                broken_json.append(n)
+                continue
+            if not isinstance(rec, dict) or any(k not in rec for k in REQUIRED):
+                broken_schema.append(n)
+                continue
+            if rec.get("mode") and rec["mode"] != "dual":
+                skipped_mode += 1
+                continue
+            if only_exp and rec.get("experiment") != only_exp:
+                filtered += 1
+                continue
+            if since is not None:
+                ts = parse_ts(rec.get("ts"))
+                if ts is None or ts < since:
+                    filtered += 1
+                    continue
+            recs.append(rec)
+    return recs, {"lines": total_lines, "broken_json": broken_json,
+                  "broken_schema": broken_schema, "skipped_mode": skipped_mode,
+                  "filtered": filtered}
+
+
+def parse_ts(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.astimezone()
+    return dt
+
+
+def short(value, width=88):
+    try:
+        s = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        s = repr(value)
+    return s if len(s) <= width else s[:width - 1] + "…"
+
+
+# --------------------------------------------------------------- main
+
+def main():
+    o = parse_opts(sys.argv[1:])
+    cfg, cfg_file = (None, None)
+    log = o.get("--log")
+    if not log:
+        cfg, cfg_file = load_config(o.get("--config"))
+        log = opt(cfg, "legacy.dualRun.logPath")
+        if not log:
+            die(f"{cfg_file} has no legacy.dualRun.logPath. Fill that key in, or give the path "
+                "directly with --log.")
+    log = os.path.abspath(os.path.expanduser(log))
+
+    since = None
+    if o.get("--since"):
+        since = parse_ts(o["--since"])
+        if since is None:
+            die(f"could not read --since as an ISO time: {o['--since']!r}")
+
+    rules = load_ignore(os.path.expanduser(o["--ignore"])) if o.get("--ignore") else []
+    limit = int(o.get("--regression-limit") or 3)
+    recs, stat = read_log(log, since, o.get("--experiment"))
+
+    per = {}
+    groups = {}
+    for rec in recs:
+        exp = rec.get("experiment") or "<unnamed>"
+        s = per.setdefault(exp, {"total": 0, "equal": 0, "mismatch": 0, "expected": 0,
+                                 "unexpected": 0, "candidate_error": 0, "truncated": 0,
+                                 "control_ms": 0, "candidate_ms": 0})
+        s["total"] += 1
+        s["control_ms"] += rec.get("control_ms") or 0
+        s["candidate_ms"] += rec.get("candidate_ms") or 0
+        if rec.get("truncated"):
+            s["truncated"] += 1
+        if rec.get("candidate_error"):
+            s["candidate_error"] += 1
+        if rec.get("equal"):
+            s["equal"] += 1
+            continue
+        s["mismatch"] += 1
+        covered, related = matching_rules(rec, rules)
+        if covered:
+            s["expected"] += 1
+            continue
+        s["unexpected"] += 1
+        sig = tuple(sorted(k for k in (rec.get("diff_keys") or [])
+                           if isinstance(k, str))) or ("<no diff_keys>",)
+        g = groups.setdefault((exp, sig), {"count": 0, "samples": [], "rules": set()})
+        g["count"] += 1
+        g["rules"] |= {r["rules"] for r in related if r.get("rules")}
+        if len(g["samples"]) < limit:
+            g["samples"].append(rec)
+
+    unexpected = sum(v["unexpected"] for v in per.values())
+    broken = len(stat["broken_json"]) + len(stat["broken_schema"])
+
+    if o.get("--json"):
+        print(json.dumps({
+            "log": log, "records": len(recs), "broken": broken,
+            "broken_json_lines": stat["broken_json"][:50],
+            "broken_schema_lines": stat["broken_schema"][:50],
+            "filtered_out": stat["filtered"], "non_dual_rows": stat["skipped_mode"],
+            "experiments": per, "unexpected": unexpected,
+            "groups": [{"experiment": e, "signature": list(sig), "count": g["count"],
+                        "rules": sorted(g["rules"]),
+                        "samples": [sample_of(r) for r in g["samples"]]}
+                       for (e, sig), g in sorted(groups.items())],
+        }, ensure_ascii=False, indent=2))
+    else:
+        report(log, recs, stat, per, groups, rules, since)
+
+    if o.get("--as-regressions"):
+        write_regressions(o["--as-regressions"], groups)
+
+    if broken:
+        die(f"there are {broken} lines that could not be read "
+            f"(not JSON: {stat['broken_json'][:10]}, schema mismatch: "
+            f"{stat['broken_schema'][:10]}). Without knowing what those lines were, "
+            "'zero unexpected' cannot be stated.")
+    if not recs:
+        die(f"not one line matched the conditions ({log}, {stat['lines']} lines total, "
+            f"{stat['filtered']} filtered out). An empty log means the toggle never reached "
+            "PHP - start from the read-back.")
+    return 1 if unexpected else 0
+
+
+def sample_of(rec):
+    out = {"input": rec.get("input"), "control": rec.get("control"),
+           "candidate": rec.get("candidate")}
+    for k in ("ts", "page", "caller", "truncated", "candidate_error"):
+        if rec.get(k) is not None:
+            out[k] = rec[k]
+    return out
+
+
+def report(log, recs, stat, per, groups, rules, since):
+    span = [parse_ts(r.get("ts")) for r in recs]
+    span = sorted(t for t in span if t)
+    print(f"{TOOL}: {log}")
+    print(f"  lines {stat['lines']} · counted {len(recs)} · filtered {stat['filtered']}"
+          f" · non-dual lines {stat['skipped_mode']} · broken lines "
+          f"{len(stat['broken_json']) + len(stat['broken_schema'])}"
+          + (f" · {span[0]:%Y-%m-%d %H:%M} ~ {span[-1]:%Y-%m-%d %H:%M}" if span else "")
+          + (f" · --since {since:%Y-%m-%d %H:%M}" if since else ""))
+    print(f"  {len(rules)} ignore rules"
+          + ("" if rules else "  (none - if there are 의도수정 rows, all of them are caught as unexpected)"))
+
+    print(f"\n{'experiment':<34}{'total':>6}{'equal':>7}{'mismatch':>10}{'expected':>10}"
+          f"{'unexpected':>12}{'error':>7}{'trunc':>7}   ms(ctl/cand)")
+    for exp in sorted(per):
+        s = per[exp]
+        n = max(s["total"], 1)
+        # These widths are the header's, one for one. They were left at the Korean widths once
+        # and every number sat up to 11 columns left of the word naming it.
+        print(f"{exp:<34}{s['total']:>6}{s['equal']:>7}{s['mismatch']:>10}"
+              f"{s['expected']:>10}{s['unexpected']:>12}{s['candidate_error']:>7}"
+              f"{s['truncated']:>7}   {s['control_ms'] // n}/{s['candidate_ms'] // n}")
+
+    if not groups:
+        print("\nNo unexpected mismatches.")
+        return
+    print(f"\nUnexpected mismatches - {len(groups)} diff_keys signatures")
+    for i, ((exp, sig), g) in enumerate(sorted(groups.items()), 1):
+        hint = ", ".join(sorted(g["rules"])) if g["rules"] else "none"
+        print(f"\n [{i}] {exp}  {g['count']} hits   rule hint: {hint}")
+        print(f"     signature: {', '.join(sig)}")
+        for j, rec in enumerate(g["samples"], 1):
+            print(f"     sample {j}  input     {short(rec.get('input'))}")
+            if rec.get("truncated"):
+                print(f"              (truncated - sha only, no body: "
+                      f"{str(rec.get('control_sha'))[:12]} / "
+                      f"{str(rec.get('candidate_sha'))[:12]})")
+            else:
+                print(f"              control   {short(rec.get('control'))}")
+                print(f"              candidate {short(rec.get('candidate'))}")
+            if rec.get("candidate_error"):
+                print(f"              candidate error {short(rec['candidate_error'])}")
+            where = rec.get("caller") or rec.get("page")
+            if where:
+                print(f"              caller    {where}")
+
+
+def write_regressions(path, groups):
+    """Unexpected samples as regression inputs. Only a few per signature - saving all several
+    hundred produced by one rule tells you nothing more."""
+    fixtures = [{"experiment": exp, "input": rec.get("input"),
+                 "control": rec.get("control"), "candidate": rec.get("candidate")}
+                for (exp, _sig), g in sorted(groups.items()) for rec in g["samples"]]
+    try:
+        with open(os.path.expanduser(path), "w", encoding="utf-8") as fh:
+            json.dump(fixtures, fh, ensure_ascii=False, indent=2, sort_keys=True)
+    except OSError as exc:
+        die(f"the regression inputs could not be written ({path}): {exc}")
+    note(f"{len(fixtures)} regression inputs → {path}")
+
+
+def parse_opts(argv):
+    flags = {"--json"}
+    valued = {"--log", "--ignore", "--since", "--experiment", "--as-regressions",
+              "--regression-limit", "--config"}
+    o, i = {}, 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help", "help"):
+            print(__doc__.strip())
+            sys.exit(0)
+        if a in flags:
+            o[a] = True
+            i += 1
+            continue
+        if a in valued:
+            if i + 1 >= len(argv):
+                die(f"{a} has no value")
+            o[a] = argv[i + 1]
+            i += 2
+            continue
+        die(f"unknown argument {a!r}. Use --help to see the available options.")
+    return o
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""phpindex - sweep once for where names are defined and freeze it into an index.
+
+    phpindex                    the current service + the shared library
+    phpindex --scope <service path>  one named service
+    phpindex --all              the service being migrated + the shared library
+    phpindex --list             the state of the built indexes
+
+Why it is needed. This tree has no declaration syntax, so a "definition" does not exist
+syntactically. When the real definition is spread across lines as `$X[CONST] = value`, grepping
+`$X =` returns zero. grep cannot tell "could not find" from "there is none", so that zero leads
+to a wrong conclusion. The index normalizes definition shapes once when it is built, and when
+there is none it says so.
+
+Scope. The same as phpgrep - one service reaches exactly two trees, itself and the shared library.
+The shared library holds most of the definitions so it attaches to every service index, but it is
+built once on its own and merged at lookup time rather than copied. Which tree is shared is
+answered by `legacy.sharedLibrary` in workspace.json.
+
+The output is `.claude/.state/index/<name>.json` in the project and never enters the runtime.
+A wrong index costs a wrong lookup and nothing on screen. The reason it lives here rather than
+inside the legacy checkout is so it does not vanish when the checkout is rebuilt.
+"""
+import json
+import os
+import re
+import sys
+import time
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _phpenc import (PHPLIB, SERVICES, config, current_service,  # noqa: E402
+                     primary_service, read_text, require_config, state_dir,
+                     tree_root)
+
+# What to index. One service being migrated; the shared library is built separately and merged
+# at lookup time. The value comes from `legacy.primaryService` in workspace.json.
+def ours():
+    p = primary_service()
+    return [p[0]] if p else []
+
+# A slot for the case where a service has a tree to sweep besides itself.
+# Right now every service closes over the single shared library, so it is empty.
+SCOPE_EXTRA = {}
+
+
+def short_name(prefix):
+    """The short name recorded in the config. It becomes the index filename."""
+    return (config().get("services") or {}).get(prefix, prefix.split("/")[-1])
+
+BUNDLE_PARTS = ("/vendor/", "/node_modules/", "/bower_components/", "/phpexcel",
+                "/namo", "/codeigniter", "/adminlte", "/ckeditor", "/sheetjs/",
+                "/external/", "/smarty", "/tcpdf", "/phpmailer", "/xml_rpc",
+                "/pear/", "/third_party/", "/system/")
+CODE_EXT = (".php", ".inc")
+
+# ------------------------------------------------------------------ top-level analysis
+RE_STR1 = re.compile(r"'(?:\\.|[^'\\])*'", re.S)
+RE_STR2 = re.compile(r'"(?:\\.|[^"\\])*"', re.S)
+RE_HEREDOC = re.compile(r"<<<\s*'?(\w+)'?\n.*?\n\s*\1\s*;", re.S)
+RE_BLOCKC = re.compile(r"/\*.*?\*/", re.S)
+RE_LINEC = re.compile(r"//[^\n]*")
+RE_HASHC = re.compile(r"#[^\n]*")
+
+# Strip strings before comments. The other way round, the // inside "http://…" is cut as a
+# comment, the quote pairing breaks, and everything after it is contaminated.
+def scrub(text):
+    text = RE_HEREDOC.sub("'H'", text)
+    text = RE_STR1.sub("''", text)
+    text = RE_STR2.sub('""', text)
+    text = RE_BLOCKC.sub(" ", text)
+    text = RE_LINEC.sub(" ", text)
+    return RE_HASHC.sub(" ", text)
+
+KW_SKIP = {"declare", "namespace", "use", "abstract", "final", "static", "public",
+           "private", "protected", "readonly", "require_once", "include_once",
+           "require", "include", "else", "elseif", "endif", "endwhile",
+           "endforeach", "endfor", "endswitch", "break", "continue", "return"}
+WORD = re.compile(r"[A-Za-z_]\w*")
+
+
+def top_level(text):
+    """Classes and functions defined at brace depth 0. Without actually counting depth,
+    methods are caught as top-level functions and class names as a side effect."""
+    code = scrub(text)
+    blocks = re.findall(r"<\?(?:php|=)?(.*?)(?:\?>|\Z)", code, flags=re.S)
+    if blocks:
+        code = "\n".join(blocks)
+    classes, funcs = [], []
+    depth = pos = 0
+    n = len(code)
+    while pos < n:
+        ch = code[pos]
+        if ch == "{":
+            depth += 1
+            pos += 1
+            continue
+        if ch == "}":
+            depth = max(0, depth - 1)
+            pos += 1
+            continue
+        if depth or ch.isspace() or ch in ";,":
+            pos += 1
+            continue
+        m = WORD.match(code, pos)
+        if not m:
+            pos += 1
+            continue
+        word = m.group(0).lower()
+        pos = m.end()
+        if word in ("class", "interface", "trait", "enum"):
+            nm = WORD.search(code, pos)
+            if nm:
+                classes.append(nm.group(0))
+                pos = nm.end()
+            brace = code.find("{", pos)
+            pos = brace if brace != -1 else n
+        elif word == "function":
+            nm = WORD.match(code, pos) or WORD.search(code, pos)
+            if nm and nm.start() - pos < 4:
+                funcs.append(nm.group(0))
+                pos = nm.end()
+            brace, semi = code.find("{", pos), code.find(";", pos)
+            pos = min(brace if brace != -1 else n, semi if semi != -1 else n)
+        elif word in KW_SKIP:
+            semi = code.find(";", pos)
+            pos = semi + 1 if semi != -1 else n
+        else:
+            semi = code.find(";", pos)
+            pos = semi + 1 if semi != -1 else n
+    return classes, funcs
+
+
+# ------------------------------------------------------------------ line patterns
+RE_DEFINE = re.compile(r"""define(?:_once)?\s*\(\s*['"]([A-Za-z_]\w*)['"]""")
+RE_CONST = re.compile(r"^\s*const\s+([A-Z_]\w*)\s*=")
+# Only a column-0 assignment counts as top level. Catches $X = , $X[..] = and $X .= alike.
+RE_GLOBAL_ASSIGN = re.compile(r"^\$([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*\.?=[^=]")
+RE_LIT = re.compile(r"""['\"]([^'\"]*)['\"]""")
+# The shape of `header('Location: ...')` followed by exit = including this file can end the
+# request here. An auth gate has this shape and so does an outage page, so it does not judge
+# which and records the redirect target alongside.
+RE_HALT = re.compile(
+    r"header\s*\(\s*['\"]Location:\s*([^;]*);\s*(?://[^\n]*\n\s*)?(?:exit|die)\b",
+    re.I)
+RE_INCLUDE = re.compile(
+    r"(?<![\w$>])(require_once|include_once|require|include)\b([^;]*);", re.S)
+RE_FETCH = re.compile(r"->\s*fetch\s*\(\s*['\"]([^'\"]+)['\"]")
+RE_SET_LIT = re.compile(r"->\s*set\s*\(\s*['\"](\w+)['\"]")
+RE_SET_VAR = re.compile(r"->\s*set\s*\(\s*\$([A-Za-z_]\w*)\s*\)")
+RE_ARR_KEY = re.compile(r"\$([A-Za-z_]\w*)\s*\[\s*['\"](\w+)['\"]\s*\]\s*=")
+RE_VAR_USE = re.compile(r"\$([A-Za-z_]\w*)")
+RE_VAR_SET = re.compile(r"\$([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*(?:\.|\+|-)?=[^=]")
+RE_FOREACH = re.compile(r"foreach\s*\([^)]*?as\s*(?:\$(\w+)\s*=>\s*)?\$(\w+)")
+SUPERGLOBALS = {"_GET", "_POST", "_REQUEST", "_SERVER", "_SESSION", "_COOKIE",
+                "_FILES", "_ENV", "GLOBALS", "this"}
+
+
+def emits_output(text):
+    """Content outside a PHP block means this file emits the moment it is included."""
+    pos = 0
+    n = len(text)
+    while pos < n:
+        open_at = text.find("<?", pos)
+        if open_at == -1:
+            return text[pos:].strip() != ""
+        if text[pos:open_at].strip():
+            return True
+        close_at = text.find("?>", open_at + 2)
+        if close_at == -1:
+            return False
+        pos = close_at + 2
+    return False
+
+
+def string_spans(text):
+    """Quoted spans. Stops the 'include' inside the string of
+    define('ROOT_INCLUDE', $p . '/include') being caught as an include statement."""
+    spans = []
+    for m in RE_STR1.finditer(text):
+        spans.append(m.span())
+    for m in RE_STR2.finditer(text):
+        spans.append(m.span())
+    spans.sort()
+    return spans
+
+
+def in_span(spans, pos):
+    lo, hi = 0, len(spans)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        a, b = spans[mid]
+        if pos < a:
+            hi = mid
+        elif pos >= b:
+            lo = mid + 1
+        else:
+            return True
+    return False
+
+
+def walk(root, rel):
+    base = os.path.join(root, rel)
+    for dirpath, dirnames, filenames in os.walk(base):
+        low = dirpath.lower().replace("\\", "/") + "/"
+        if any(p in low for p in BUNDLE_PARTS):
+            dirnames[:] = []
+            continue
+        for name in filenames:
+            if not name.lower().endswith(CODE_EXT):
+                continue
+            path = os.path.join(dirpath, name)
+            if any(p in path.lower().replace("\\", "/") for p in BUNDLE_PARTS):
+                continue
+            yield path
+
+
+def build(root, scopes, label):
+    idx = {"classes": {}, "functions": {}, "globals": {}, "constants": {},
+           "templates": {}, "includes": {}, "files": [], "flags": {},
+           "included": []}
+    files = 0
+    for rel in scopes:
+        for path in walk(root, rel):
+            short = os.path.relpath(path, root)
+            try:
+                text, _enc = read_text(path)
+            except OSError:
+                continue
+            files += 1
+            idx["files"].append(short)
+            flags = {}
+            if "Location:" in text:
+                m = RE_HALT.search(text)
+                if m:
+                    tgt = " ".join(m.group(1).split())
+                    flags["halt"] = tgt.rstrip(") '\"")[:60]
+            if emits_output(text):
+                flags["out"] = True
+            if flags:
+                idx["flags"][short] = flags
+            classes, funcs = top_level(text)
+            for name in classes:
+                idx["classes"].setdefault(name, []).append(short)
+            for name in funcs:
+                idx["functions"].setdefault(name, []).append(short)
+            for lineno, line in enumerate(text.splitlines(), 1):
+                for m in RE_DEFINE.finditer(line):
+                    idx["constants"].setdefault(m.group(1), []).append(
+                        [short, lineno, line.strip()[:100]])
+                m = RE_CONST.match(line)
+                if m:
+                    idx["constants"].setdefault(m.group(1), []).append(
+                        [short, lineno, line.strip()[:100]])
+                m = RE_GLOBAL_ASSIGN.match(line)
+                if m and m.group(1) not in SUPERGLOBALS:
+                    idx["globals"].setdefault("$" + m.group(1), []).append(
+                        [short, lineno, line.strip()[:100]])
+            # include edges
+            edges = []
+            spans = string_spans(text)
+            for m in RE_INCLUDE.finditer(text):
+                if in_span(spans, m.start(1)):
+                    continue
+                expr = " ".join(m.group(2).split())
+                if expr:
+                    edges.append([m.group(1), expr[:120]])
+            if edges:
+                idx["includes"][short] = edges
+            # The rendering side: fetch('x.tpl.php') and its set() keys
+            keys = set(RE_SET_LIT.findall(text))
+            for holder in RE_SET_VAR.findall(text):
+                keys |= {k for v, k in RE_ARR_KEY.findall(text) if v == holder}
+            for tpl in RE_FETCH.findall(text):
+                e = idx["templates"].setdefault(
+                    os.path.basename(tpl), {"rendered_by": [], "keys": []})
+                e["rendered_by"].append(short)
+                e["keys"] = sorted(set(e["keys"]) | keys)
+            # The template itself: variables used with no definition
+            if short.lower().endswith((".tpl.php", ".tpl")):
+                used = set(RE_VAR_USE.findall(text)) - SUPERGLOBALS
+                bound = set(RE_VAR_SET.findall(text))
+                for a, b in RE_FOREACH.findall(text):
+                    bound |= {x for x in (a, b) if x}
+                free = sorted(used - bound)
+                e = idx["templates"].setdefault(
+                    os.path.basename(short), {"rendered_by": [], "keys": []})
+                e["path"] = short
+                e["free_vars"] = free
+    # Which files are 'included by others'. Without that distinction, an entry point's column-0
+    # assignments (that page's local variables) mix with shared global definitions and 93% is noise.
+    by_base = {}
+    for f in idx["files"]:
+        by_base.setdefault(f.rsplit("/", 1)[-1].lower(), []).append(f)
+    included = set()
+    for edges in idx["includes"].values():
+        for _kw, expr in edges:
+            lits = [t for t in RE_LIT.findall(expr)
+                    if t.lower().endswith((".php", ".inc"))]
+            if not lits:
+                continue
+            tail = "/" + lits[-1].strip().lstrip("./")
+            hit = [f for f in by_base.get(tail.rsplit("/", 1)[-1].lower(), [])
+                   if f.endswith(tail)]
+            if len(hit) == 1:
+                included.add(hit[0])
+    idx["included"] = sorted(included)
+    idx["meta"] = {"label": label, "scopes": scopes, "files": files,
+                   "built": time.strftime("%Y-%m-%d %H:%M:%S")}
+    return idx
+
+
+def index_dir(root=None):
+    """The project's gitignored state directory. `root` is accepted but unused."""
+    d = state_dir("index")
+    if not d:
+        sys.exit("phpindex: could not find the project's .claude/.state/")
+    return d
+
+
+def write(root, name, idx):
+    out = index_dir(root)
+    os.makedirs(out, exist_ok=True)
+    path = os.path.join(out, name + ".json")
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(idx, fh, ensure_ascii=False, separators=(",", ":"))
+    size = os.path.getsize(path)
+    dup = sum(1 for v in idx["classes"].values() if len(set(v)) > 1)
+    print(f"  {name+'.json':<22} {idx['meta']['files']:>6} files  "
+          f"{size/1024/1024:>5.1f}MB  "
+          f"classes {len(idx['classes']):>5}(conflicts {dup})  "
+          f"functions {len(idx['functions']):>5}  "
+          f"constants {len(idx['constants']):>5}  "
+          f"globals {len(idx['globals']):>5}  "
+          f"templates {len(idx['templates']):>4}")
+
+
+def main():
+    require_config("phpindex")
+    root = tree_root()
+    if not root:
+        sys.exit("phpindex: legacy.treeMarker is not under legacy.root")
+    args = sys.argv[1:]
+    # An unknown option does not trigger the default action (rebuilding the index, about 10s).
+    # Typing `--help` first is the natural thing on meeting a tool, and spending 10 seconds and
+    # overwriting the output there is worse than having no help at all.
+    unknown = [a for a in args
+               if a.startswith("-") and a not in ("--list", "--all", "--scope")]
+    if unknown:
+        print(__doc__.strip())
+        if unknown != ["--help"] and unknown != ["-h"]:
+            sys.exit(f"\nphpindex: unknown option {' '.join(unknown)}")
+        return
+    if "--list" in args:
+        out = index_dir(root)
+        if not os.path.isdir(out):
+            sys.exit("no index. Run phpindex first.")
+        for fn in sorted(os.listdir(out)):
+            if not fn.endswith(".json"):
+                continue
+            meta = json.load(open(os.path.join(out, fn), encoding="utf-8"))["meta"]
+            print(f"  {fn:<22} {meta['files']:>6} files  built {meta['built']}")
+        return
+    if "--all" in args:
+        wanted = ours()
+    elif "--scope" in args:
+        wanted = [args[args.index("--scope") + 1].strip("/")]
+    else:
+        cur = current_service()
+        if not cur or cur[0] == PHPLIB:
+            wanted = ours()
+            print("# outside a service, so the service being migrated is built")
+        else:
+            wanted = [cur[0]]
+    known = {p for p, _ in SERVICES}
+    for w in wanted:
+        if w not in known:
+            sys.exit(f"phpindex: unknown scope '{w}'")
+
+    t0 = time.time()
+    print(f"# tree {root}")
+    print(f"# output {index_dir(root)}\n")
+    write(root, short_name(PHPLIB), build(root, [PHPLIB],
+                                         f"{short_name(PHPLIB)} (shared)"))
+    for rel in wanted:
+        scopes = [rel] + SCOPE_EXTRA.get(rel, [])
+        name = short_name(rel)
+        label = name + ("" if len(scopes) == 1
+                        else f" + {short_name(scopes[1])}")
+        write(root, name, build(root, scopes, label))
+    print(f"\n{time.time()-t0:.1f}s. Look up with phpwhere <name>.")
+
+
+if __name__ == "__main__":
+    main()

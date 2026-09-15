@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""ctxstats - see whether context was actually injected, and how much.
+
+    ctxstats                 the last 30 days
+    ctxstats --days 7
+    ctxstats --all
+    ctxstats --probe         the probe checklist (what to ask) and its results
+    ctxstats --config <path> target a project with a different workspace.json
+    ctxstats --session <id>  one session only
+
+The record is written by `.claude/hooks/context-inject.py` on every injection
+(`.claude/.state/context-injections.jsonl`). The three axes this tool measures are the quantitative
+comparison axes of Day 2.
+
+  injections and bytes   what went in and how much. Context is a finite resource, so this value
+                         is not read as "more is better" but as **is it as much as intended**
+  trigger distribution   caught by name, by path, or by skill.
+                         An axis at 0 means that axis's wiring is cut
+  suppression rate       injections actually made against trigger matches. No suppression means
+                         the same paragraph is being injected over and over within a session
+
+**Zero injections and no wiring are never the same number.** With no records it prints the routing
+table instead, separating "nothing was injected" from "there was no target to begin with".
+"""
+import json
+import os
+import sys
+import time
+from collections import Counter, defaultdict
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TRIGGERS = ("agent", "skill", "path")
+
+
+def usage(code=0):
+    print(__doc__)
+    sys.exit(code)
+
+
+def find_project(config_opt):
+    """The target project. With `--config`, pinned to the checkout holding that config."""
+    if config_opt:
+        p = os.path.abspath(os.path.expanduser(config_opt))
+        if not os.path.isfile(p):
+            sys.exit(f"ctxstats: {p} does not exist")
+        # <project>/.claude/config/workspace.json
+        return os.path.dirname(os.path.dirname(os.path.dirname(p)))
+    env = os.environ.get("CLAUDE_PROJECT_DIR")
+    if env:
+        d = os.path.abspath(os.path.expanduser(env))
+        if os.path.isdir(os.path.join(d, ".claude")):
+            return d
+    d = HERE
+    while True:
+        if os.path.isdir(os.path.join(d, ".claude", "context")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            sys.exit("ctxstats: could not find a project with .claude/context/")
+        d = parent
+
+
+def bar(n, total, width=22):
+    if not total:
+        return ""
+    filled = int(round(n / total * width))
+    return "█" * filled + "·" * (width - filled)
+
+
+def front(path):
+    """A context file's name, kind, token and injection targets. The parser is the hook's minimal form."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    if not text.startswith("---"):
+        return None
+    end = text.find("\n---", 3)
+    if end < 0:
+        return None
+    meta = {"agents": [], "skills": [], "paths": [], "lines": 0}
+    for line in text[:end].splitlines():
+        s = line.strip()
+        for key in ("name", "kind", "token"):
+            if s.startswith(key + ":"):
+                meta[key] = s.split(":", 1)[1].strip()
+        for key in ("agents", "skills", "paths"):
+            if s.startswith(key + ":"):
+                raw = s.split(":", 1)[1].strip()
+                if raw.startswith("[") and raw.endswith("]"):
+                    meta[key] = [x.strip().strip("'\"")
+                                 for x in raw[1:-1].split(",") if x.strip()]
+    meta["lines"] = len(text[end + 4:].strip().splitlines())
+    meta["bytes"] = len(text[end + 4:].strip().encode("utf-8"))
+    return meta if meta.get("name") else None
+
+
+def routing(project):
+    d = os.path.join(project, ".claude", "context")
+    rows = []
+    for fn in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        if not fn.endswith(".md") or fn.startswith("_"):
+            continue
+        m = front(os.path.join(d, fn))
+        if m:
+            m["file"] = fn
+            rows.append(m)
+    return rows
+
+
+def load(path, days):
+    rows = []
+    for p in (path + ".1", path):
+        if not os.path.isfile(p):
+            continue
+        with open(p, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    pass
+    if days:
+        cut = time.time() - days * 86400
+        rows = [r for r in rows if r.get("ts", 0) >= cut]
+    return rows
+
+
+def counts(project):
+    try:
+        with open(os.path.join(project, ".claude", ".state",
+                               "context-injected.json"), encoding="utf-8") as fh:
+            return (json.load(fh) or {}).get("__counts") or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def who_of(r):
+    return (r.get("agent_type") or r.get("agent_id")
+            or ("(main session)" if not r.get("agent_id") else r["agent_id"]))
+
+
+def print_routing(rows):
+    print("\nrouting table (.claude/context/)")
+    for m in rows:
+        tgt = []
+        if m["agents"]:
+            tgt.append(f"{len(m['agents'])} agents")
+        if m["skills"]:
+            tgt.append(f"{len(m['skills'])} skills")
+        if m["paths"]:
+            tgt.append(f"{len(m['paths'])} paths")
+        print(f"  {m['file']:<30} {m.get('kind',''):<10} {m['lines']:>3} lines "
+              f"{m['bytes']:>6}B  {' · '.join(tgt) or 'no injection target'}")
+
+
+def probe(project, rows, route, session):
+    """The probe: did a subagent actually see the token?
+
+    What the hook recorded as "injected" and what a subagent reports as "seen" are different facts.
+    The former is what this process wrote to stdout; the latter is whether that reached the model's
+    context. The output form of `SubagentStart` is undocumented, so the two are always read apart -
+    saying "it works" from the injection log alone is the very failure shape this repository has
+    recorded again and again.
+    """
+    want = {m["token"]: m["file"] for m in route}
+    if not rows:
+        print("no injection records - the probe runs in a new session after the hook is registered.")
+        print_routing(route)
+        return 0
+    if session:
+        rows = [r for r in rows if r.get("session_id") == session]
+    else:
+        last = max(rows, key=lambda r: r.get("ts", 0)).get("session_id")
+        rows = [r for r in rows if r.get("session_id") == last]
+        session = last
+    print(f"# probe session {str(session)[:12]} · {len(rows)} injections")
+
+    asked = defaultdict(set)
+    for r in rows:
+        asked[(who_of(r), r.get("trigger"))].add(r.get("token"))
+    print("\nwhat to ask (have it report these tokens verbatim)")
+    for (who, trig), toks in sorted(asked.items()):
+        print(f"  {str(who):<28} {str(trig):<6} " +
+              " ".join(sorted(t for t in toks if t)))
+
+    seen = defaultdict(set)
+    p = os.path.join(project, ".claude", ".state", "context-probe.jsonl")
+    if os.path.isfile(p):
+        with open(p, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if session and rec.get("session") not in (None, session):
+                    continue
+                for t in rec.get("reported") or []:
+                    seen[rec.get("agent_type") or "(main session)"].add(t)
+    if not seen:
+        print(f"\nno token reported - {p} is empty.")
+        print("  This is not 'nothing was injected' but 'not verified yet'.")
+        print("  The procedure is the probe section of docs/context-system.md.")
+        return 0
+
+    print("\ncomparison")
+    bad = 0
+    for (who, _trig), toks in sorted(asked.items()):
+        got = seen.get(who, set())
+        for t in sorted(x for x in toks if x):
+            mark = "confirmed" if t in got else "unconfirmed"
+            bad += t not in got
+            print(f"  {str(who):<28} {want.get(t, t):<30} {mark}")
+    stray = {t for s in seen.values() for t in s} - set(want)
+    for t in sorted(stray):
+        print(f"  {'(source unknown)':<28} {t:<30} mismatch")
+        bad += 1
+    return 1 if bad else 0
+
+
+def main():
+    argv = sys.argv[1:]
+    if "-h" in argv or "--help" in argv:
+        usage()
+    days = None if "--all" in argv else 30
+    if "--days" in argv:
+        try:
+            days = int(argv[argv.index("--days") + 1])
+        except (IndexError, ValueError):
+            usage(2)
+    cfg = argv[argv.index("--config") + 1] if "--config" in argv else None
+    session = argv[argv.index("--session") + 1] if "--session" in argv else None
+    for a in argv:
+        if a.startswith("-") and a not in ("--all", "--days", "--probe",
+                                           "--config", "--session"):
+            sys.exit(f"ctxstats: unknown option {a}")
+
+    project = find_project(cfg)
+    log = os.path.join(project, ".claude", ".state", "context-injections.jsonl")
+    route = routing(project)
+    if not route:
+        sys.exit("ctxstats: no context file in .claude/context/")
+    rows = load(log, days)
+
+    if "--probe" in argv:
+        return probe(project, rows, route, session)
+
+    if session:
+        rows = [r for r in rows if r.get("session_id") == session]
+    span = "all time" if days is None else f"last {days} days"
+    if not rows:
+        print(f"# {span} · no injection records")
+        print("  Check the hook is registered (.claude/settings.json → SubagentStart, "
+              "PreToolUse matcher Skill, PreToolUse matcher Read|Edit|Write|Bash).")
+        print("  Hooks are snapshotted at session start, so if you just registered it, measure in a new session.")
+        print_routing(route)
+        return 0
+
+    total_bytes = sum(r.get("bytes", 0) for r in rows)
+    sess = {r.get("session_id") for r in rows if r.get("session_id")}
+    first = min(r.get("ts", 0) for r in rows)
+    print(f"# {span} · {len(rows):,} injections · {total_bytes:,}B · {len(sess)} sessions · "
+          f"first record {time.strftime('%Y-%m-%d', time.localtime(first))}")
+
+    by_trigger = Counter(r.get("trigger") for r in rows)
+    print("\nby trigger")
+    for t in TRIGGERS:
+        c = by_trigger.get(t, 0)
+        tail = "  ← this axis's wiring is cut" if not c else ""
+        print(f"  {t:<8} {c:>5}  {bar(c, len(rows))}{tail}")
+    other = sum(c for t, c in by_trigger.items() if t not in TRIGGERS)
+    if other:
+        print(f"  {'(other)':<8} {other:>5}")
+
+    print("\nby file (count · bytes)")
+    per = defaultdict(lambda: [0, 0])
+    for r in rows:
+        e = per[r.get("file") or "(unnamed)"]
+        e[0] += 1
+        e[1] += r.get("bytes", 0)
+    for f, (c, b) in sorted(per.items(), key=lambda kv: -kv[1][0]):
+        print(f"  {f:<30} {c:>5}  {b:>8,}B  {bar(c, len(rows), 16)}")
+    silent = [m["file"] for m in route if m["file"] not in per]
+    if silent:
+        print("  never injected: " + " · ".join(silent))
+
+    print("\nwho received it")
+    for who, c in Counter(who_of(r) for r in rows).most_common():
+        print(f"  {str(who):<30} {c:>5}  {bar(c, len(rows), 16)}")
+
+    cnt = counts(project)
+    if session:
+        cnt = {k: v for k, v in cnt.items() if k == session}
+    matched = sum(v.get("matched", 0) for v in cnt.values())
+    injected = sum(v.get("injected", 0) for v in cnt.values())
+    print("\nduplicate suppression (last one-day window)")
+    if matched:
+        sup = matched - injected
+        print(f"  trigger matches {matched:>5} · injected {injected:>5} · suppressed {sup:>5}"
+              f"   suppression {sup / matched * 100:>5.1f}%")
+        if not sup:
+            print("  suppression is 0 - check whether the same paragraph is being re-injected.")
+    else:
+        print("  no record inside the aggregation window (one day). The rate is 'unknown', not '0%'.")
+
+    byday = defaultdict(int)
+    for r in rows:
+        byday[time.strftime("%m/%d", time.localtime(r.get("ts", 0)))] += 1
+    if len(byday) > 1:
+        recent = sorted(byday.items())[-10:]
+        peak = max(c for _, c in recent)
+        print("\nby day")
+        for d, c in recent:
+            print(f"  {d}  {c:>4}  {bar(c, peak, 18)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

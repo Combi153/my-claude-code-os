@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""phpstats - see how much the legacy tools were actually used, and used properly.
+
+    phpstats              the last 30 days
+    phpstats --days 7
+    phpstats --all
+    phpstats --names      only the names looked up often
+
+The record is written by `.claude/hooks/php-tooling-hook.py` on every Bash and Read call
+(`.claude/.state/tooling.jsonl`). What matters is not the call count but **whether the dedicated
+tool was used or a general one routed around it**, so the pair is shown side by side.
+
+  read        phpv     vs  the Read tool / cat, head, sed
+  search      phpgrep  vs  rg, grep
+  definition  phpwhere vs  a definition-shaped phpgrep (the search that returns zero and is misread as 'there is none')
+
+The steer count is how many times a call was about to take the wrong path. Converging to 0 means
+the rule has stuck; if it does not fall, the CLAUDE.md wording or the tool needs fixing.
+
+**Attribution by role.** It also shows which subagent each call came from. This is the only way
+to actually verify the per-phase tool assignment in `docs/php-legacy-tooling.md` §5 - every phase
+is a subagent, and `session_id` is the same value for the parent and the subagent.
+An unattributed row carries its reason: whether it was called directly in the parent session, or
+whether several agents were open at once so it cannot be told apart. **An ambiguity is never resolved by picking one.**
+"""
+import json
+import os
+import sys
+import time
+from collections import Counter, defaultdict
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _phpenc import state_dir  # noqa: E402
+
+# Includes the four v2 tools. It has to be the same list as the hook's `OUR_TOOLS` - a name
+# present on one side only is recorded but not counted as a dedicated call, tipping the ratio
+# downward. That "has to be the same" is actually compared across three lists by `selftest.py`.
+# While it was only written down and never checked, `phpstats` was missing from this list.
+OURS = ["phpv", "phpgrep", "phpwhere", "phped", "phplint", "phpindex",
+        "phpstats", "phpmove", "htmlsnap", "dualrun-report", "ctxstats",
+        "ctxevolve", "pagecheck", "causestats"]
+BYPASS = {"Read": "the Read tool", "raw-read": "cat, head, sed", "raw-grep": "rg, grep",
+          "read-index": "reading the index directly"}
+PAIRS = [("read", ["phpv"], ["Read", "raw-read"]),
+         ("search", ["phpgrep"], ["raw-grep"])]
+
+
+def bar(n, total, width=22):
+    if not total:
+        return ""
+    filled = int(round(n / total * width))
+    return "█" * filled + "·" * (width - filled)
+
+
+def log_path():
+    """The instrumentation log. It lives in the project's state directory, not the legacy checkout.
+
+    Put inside the checkout it would vanish when the checkout is rebuilt. Instrumentation only
+    means something measured over time, so it has to be on the side that survives.
+    """
+    d = state_dir()
+    if not d:
+        sys.exit("phpstats: could not find the project's .claude/.state/")
+    return os.path.join(d, "tooling.jsonl")
+
+
+def load(root, days):
+    p = root
+    rows = []
+    for path in (p + ".1", p):
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    pass
+    if days:
+        cut = time.time() - days * 86400
+        rows = [r for r in rows if r.get("ts", 0) >= cut]
+    return rows
+
+
+def main():
+    args = sys.argv[1:]
+    days = None if "--all" in args else 30
+    if "--days" in args:
+        days = int(args[args.index("--days") + 1])
+    rows = load(log_path(), days)
+    if not rows:
+        print("no records. Check the hook is registered "
+              "(.claude/settings.json at the OS root → hooks.PreToolUse, matcher Bash|Read).")
+        return 0
+
+    span = "all time" if days is None else f"last {days} days"
+    first = min(r.get("ts", 0) for r in rows)
+    sess = len({r.get("sess") for r in rows if r.get("sess")})
+    print(f"# {span} · {len(rows):,} calls · {sess} sessions · "
+          f"first record {time.strftime('%Y-%m-%d', time.localtime(first))}")
+
+    if "--names" in args:
+        names = Counter(r["arg"].strip("'\"") for r in rows
+                        if r.get("tool") == "phpwhere" and r.get("arg")
+                        and not r["arg"].startswith("--"))
+        print(f"\nnames looked up often (phpwhere {sum(names.values())} calls)")
+        for n, c in names.most_common(15):
+            print(f"  {c:>4}  {n[:60]}")
+        return 0
+
+    tools = Counter(r.get("tool") for r in rows)
+    total = sum(tools.values())
+    print("\nby tool")
+    for t, c in tools.most_common():
+        tag = "  ← routed around" if t in BYPASS else ""
+        label = BYPASS.get(t, t)
+        print(f"  {label:<18} {c:>5}  {bar(c, total)}{tag}")
+
+    print("\ndedicated tool vs routed around")
+    for label, good, bad in PAIRS:
+        g = sum(tools[t] for t in good)
+        b = sum(tools[t] for t in bad)
+        if not (g + b):
+            continue
+        pct = g / (g + b) * 100
+        print(f"  {label:<11} dedicated {g:>4} / around {b:>4}   dedicated {pct:>5.1f}%")
+    defshaped = sum(1 for r in rows if r.get("mode") == "def-shaped")
+    pw = tools.get("phpwhere", 0)
+    if pw + defshaped:
+        print(f"  {'definition':<11} dedicated {pw:>4} / around {defshaped:>4}   "
+              f"dedicated {pw/(pw+defshaped)*100:>5.1f}%")
+
+    nudged = sum(1 for r in rows if r.get("nudge"))
+    dedicated = sum(tools.get(t, 0) for t in OURS)
+    print(f"\nsteered {nudged} times" + ("  (calls about to take the wrong path)"
+                                     if nudged else "  - none"))
+    if not dedicated:
+        # A steer count of 0 reads both as "the rule has stuck" and as "the tool was never used".
+        # If it is the latter, say so. A metric must not emit two states as the same number.
+        print("  not one dedicated tool call - every record in this period routed around them.")
+    if nudged:
+        why = Counter(r.get("tool") for r in rows if r.get("nudge"))
+        for t, c in why.most_common(4):
+            print(f"  {c:>4}  {BYPASS.get(t, t)}")
+
+    modes = Counter(r.get("mode") for r in rows
+                    if r.get("tool") == "phpwhere" and r.get("mode", "").startswith("--"))
+    if modes:
+        plain = pw - sum(modes.values())
+        print("\nphpwhere by mode")
+        if plain:
+            print(f"  {'name lookup':<16} {plain:>4}")
+        for m, c in modes.most_common():
+            print(f"  {m:<12} {c:>4}")
+
+    # ---- attribution by role ---------------------------------------------
+    # Count three states separately. Merging them makes "unattributed" cover two different facts
+    # with one number - called directly by the parent, and indistinguishable because of parallelism.
+    by_agent = Counter(r["agent"] for r in rows if r.get("agent"))
+    parent = sum(1 for r in rows if not r.get("agent") and r.get("agents") == 0)
+    ambiguous = sum(1 for r in rows
+                    if not r.get("agent") and (r.get("agents") or 0) > 1)
+    unknown = len(rows) - sum(by_agent.values()) - parent - ambiguous
+    if by_agent or parent or ambiguous:
+        print("\nby role (which subagent called it)")
+        for a, c in by_agent.most_common():
+            print(f"  {a:<26} {c:>5}  {bar(c, len(rows))}")
+        if parent:
+            print(f"  {'(directly in the parent session)':<34} {parent:>5}")
+        if ambiguous:
+            print(f"  {'(parallel run - cannot be told apart)':<34} {ambiguous:>5}")
+        if unknown:
+            print(f"  {'(rows from before attribution)':<34} {unknown:>5}")
+        # It also watches whether the transcript axis actually separates them. That is why both
+        # signals are recorded - which one works is answered by the collected log.
+        tps = {r.get("tp") for r in rows if r.get("tp")}
+        if len(tps) > 1:
+            print(f"  {len(tps)} transcript fingerprints - this axis separates them too")
+        elif tps:
+            print("  1 transcript fingerprint - this axis does not separate them "
+                  "(a subagent uses the same transcript as its parent)")
+    elif rows:
+        print("\nno attribution records - check the hook's Task registration "
+              "(.claude/settings.json → Task in the PreToolUse matcher, "
+              "matcher Task in PostToolUse).")
+
+    svcs = Counter(r.get("svc") for r in rows if r.get("svc"))
+    unattributed = sum(1 for r in rows if not r.get("svc"))
+    if svcs or unattributed:
+        print("\nby service")
+        # Unattributed counts are not discarded. Discarding them makes the few that remain read
+        # as the whole distribution, and the fact that this table quietly narrowed disappears.
+        line = " · ".join(f"{s} {c}" for s, c in svcs.most_common())
+        if unattributed:
+            line = (line + " · " if line else "") + f"unattributed {unattributed}"
+        print("  " + line)
+
+    byday = defaultdict(int)
+    for r in rows:
+        byday[time.strftime("%m/%d", time.localtime(r.get("ts", 0)))] += 1
+    if len(byday) > 1:
+        recent = sorted(byday.items())[-10:]
+        peak = max(c for _, c in recent)
+        print("\nby day")
+        for d, c in recent:
+            print(f"  {d}  {c:>4}  {bar(c, peak, 18)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

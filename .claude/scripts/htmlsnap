@@ -1,0 +1,743 @@
+#!/usr/bin/env python3
+"""htmlsnap - the HTML baseline capture: record a page response as bytes, record it again after an edit, compare.
+
+    htmlsnap capture --observations observations.json --out <dir> [options]
+    htmlsnap compare <dirA> <dirB> [--report out.md] [--context 3]
+    htmlsnap observations validate observations.json
+    htmlsnap toggle --surface <key> [--expect legacy|dual|migrated]
+    htmlsnap --help
+
+  capture options
+    --observations <file>      the list of URLs to capture (required)
+    --out <dir>          the directory to write captures to (required). Created when absent
+    --session <file>     a Playwright storageState JSON. Falls back to e2e.storageState.<surface>
+    --cookie-host <host> pick cookie domains against this host (default: the base URL's host)
+    --toggle-expect <m>  legacy|dual|migrated. Confirm the current mode via the read-back page before capturing
+    --timeout <sec>      per-request cap (default legacy.snapshot.timeoutSeconds, else 20)
+    --config <file>      where workspace.json is (default: the project's .claude/config/workspace.json)
+
+  toggle options
+    --surface <key>      the surface to read back (a key of legacy.surfaces, required)
+    --expect <mode>      exit 2 when the read-back differs from this. Without it, just read and print
+    --timeout <sec>      request cap
+    --config <file>      where workspace.json is
+
+  compare options
+    --report <out.md>    write the result as a markdown table
+    --context N          context lines in the unified diff (default 3)
+    --max-diff-lines N   cap on diff lines shown per `different` entry (default 40)
+    --config <file>      read charset from it
+
+**Why bytes.** On this surface `default_charset` is empty so the response header does not state a
+charset, and CP949 pages and UTF-8 pages sit inside one surface. A capture that decodes fixes the
+encoding at that moment, and then a difference the tool itself created cannot be told from one the
+code created. Store as bytes, compare as bytes. Decoding happens only at the last moment, when a
+person reads a diff, using `legacy.surfaces.<surface>.charset`.
+
+**Why an auth failure is not judged by status code.** The dominant shape of an auth failure on this
+surface is not a 302 but **200 with `<script>confirm(...); location.href=...</script>`**. A capture
+tool that looks only at the status code freezes the login-notice script as the baseline, and every
+comparison after that passes green. So the body is matched against `loggedOutMarker`, a match marks
+that capture **invalid**, and `compare` exits **2** when either side is invalid.
+A logged-out page never becomes a baseline.
+
+**It never issues a session.** Issuing one entangles an https round trip with a 2FA wait, and another
+repository has already solved that. Here the cookies from its output (a Playwright storageState JSON)
+are simply carried into a Cookie header. A cookie's `secure` attribute is deliberately ignored - the
+premise of this environment is that the session is obtained over https while the capture runs over http.
+
+Exit codes: 0 clean · 1 check failure (invalid capture, difference, missing) · 2 the tool cannot answer
+(no config, toggle read-back mismatch, surface unreachable, invalid baseline). 2 always writes the reason to stderr.
+"""
+import datetime
+import difflib
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+sys.dont_write_bytecode = True
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+
+CONFIG_REL = os.path.join(".claude", "config", "workspace.json")
+TOOL = "htmlsnap"
+MODES = ("legacy", "dual", "migrated")
+UA = "htmlsnap/1 (+page-baseline capture)"
+ID_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def die(msg, code=2):
+    """A state where it cannot answer. Instead of quietly giving a narrowed answer, leave the reason and stop."""
+    sys.stderr.write(f"{TOOL}: {msg}\n")
+    sys.exit(code)
+
+
+def note(msg):
+    sys.stderr.write(f"{TOOL}: {msg}\n")
+
+
+# --------------------------------------------------------------- config
+
+def config_path(explicit):
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+    try:
+        from _phpenc import project_dir  # find the project the same way the other tools do
+        root = project_dir()
+    except Exception:
+        root = None
+    if not root:
+        d = HERE
+        while d and not os.path.isfile(os.path.join(d, CONFIG_REL)):
+            parent = os.path.dirname(d)
+            d = None if parent == d else parent
+        root = d
+    if not root:
+        die(f"could not find {CONFIG_REL}. Give its location with --config, or put this tool "
+            "inside the project's .claude/scripts/.")
+    return os.path.join(root, CONFIG_REL)
+
+
+def load_config(explicit):
+    path = config_path(explicit)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh), path
+    except (OSError, ValueError) as exc:
+        die(f"{path} could not be read: {exc}")
+
+
+def need(cfg, dotted, path, why):
+    cur = cfg
+    for part in dotted.split("."):
+        if not isinstance(cur, dict) or part not in cur or cur[part] in ("", None):
+            die(f"{path} has no {dotted}. {why}")
+        cur = cur[part]
+    return cur
+
+
+def opt(cfg, dotted, default=None):
+    cur = cfg
+    for part in dotted.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return default
+        cur = cur[part]
+    return default if cur in ("", None) else cur
+
+
+# --------------------------------------------------------------- observation list
+
+def read_observations(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError) as exc:
+        die(f"the observation list could not be read ({path}): {exc}")
+
+
+def observation_problems(doc, cfg=None):
+    """A list of schema problems. An empty list means it is clean."""
+    bad = []
+    if not isinstance(doc, dict):
+        return ["the top level is not an object"]
+    surface = doc.get("surface")
+    if not surface or not isinstance(surface, str):
+        bad.append("no surface (a string, a key of legacy.surfaces)")
+    elif cfg is not None:
+        known = list((opt(cfg, "legacy.surfaces", {}) or {}).keys())
+        if surface not in known:
+            bad.append(f"surface {surface!r} is not in legacy.surfaces (available: "
+                       + (", ".join(known) if known else "none") + ")")
+    entries = doc.get("entries")
+    if not isinstance(entries, list) or not entries:
+        bad.append("entries is empty (an array, at least one)")
+        return bad
+    seen = set()
+    for i, e in enumerate(entries):
+        tag = f"entries[{i}]"
+        if not isinstance(e, dict):
+            bad.append(f"{tag}: not an object")
+            continue
+        eid = e.get("id")
+        if not eid or not isinstance(eid, str) or not ID_RE.fullmatch(eid):
+            bad.append(f"{tag}: no id, or an id unusable as a filename ([A-Za-z0-9._-]+)")
+        elif eid in seen:
+            bad.append(f"{tag}: id {eid!r} is duplicated")
+        else:
+            seen.add(eid)
+        p = e.get("path")
+        if not p or not isinstance(p, str) or not p.startswith("/"):
+            bad.append(f"{tag}: no path, or one not starting with '/'")
+        m = (e.get("method") or "GET").upper()
+        if m not in ("GET", "POST"):
+            bad.append(f"{tag}: method must be GET or POST (got {m!r})")
+        params = e.get("params", {})
+        if not isinstance(params, dict) or any(
+                not isinstance(k, str) for k in params):
+            bad.append(f"{tag}: params must be an object with string keys")
+        mode = e.get("mode") or "full"
+        if mode not in ("full", "structure"):
+            bad.append(f"{tag}: mode must be full or structure (got {mode!r})")
+        rules = e.get("rules", [])
+        if not isinstance(rules, list) or any(not isinstance(r, str) for r in rules):
+            bad.append(f"{tag}: rules must be an array of rule-row ID strings")
+        hdrs = e.get("headers", {})
+        if not isinstance(hdrs, dict) or any(
+                not isinstance(k, str) or not isinstance(v, (str, int)) for k, v in hdrs.items()):
+            bad.append(f"{tag}: headers must be an object with string keys and string values")
+    return bad
+
+
+# --------------------------------------------------------------- byte handling
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def normalize(data, rules):
+    """Apply the config's (regex → replacement) list to the bytes as they are."""
+    for i, r in enumerate(rules or []):
+        if not isinstance(r, dict) or "pattern" not in r:
+            die(f"legacy.snapshot.normalize[{i}] has no pattern")
+        try:
+            rx = re.compile(r["pattern"].encode("utf-8"), re.S)
+        except (re.error, AttributeError, UnicodeError) as exc:
+            die(f"the pattern in legacy.snapshot.normalize[{i}] is not a regex: {exc}")
+        data = rx.sub(str(r.get("replace", "")).encode("utf-8"), data)
+    return data
+
+
+_TAG = re.compile(rb"<(/?)([A-Za-z][\w:.-]*)((?:[^<>\"']|\"[^\"]*\"|'[^']*')*)/?>")
+_ATTR = re.compile(rb"([A-Za-z_:][-\w:.]*)\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s\"'=<>`]+)")
+_WORD = re.compile(rb"[A-Za-z_:][-\w:.]*")
+_KEEP_ATTRS = (b"id", b"class")
+
+
+def skeleton(data):
+    """A skeleton keeping only tag names, attribute names, id and class. For list pages whose data moves.
+
+    Text and most attribute values are dropped. What remains is the screen's **shape**, so even on a
+    page whose list content changes daily, "is the structure unchanged" can still be asked. This mode
+    is a loose check and is used knowing that - a rule whose value changes is not observed by it.
+    """
+    d = re.sub(rb"<!--.*?-->", b"", data, flags=re.S)
+    d = re.sub(rb"(?is)<script\b[^>]*>.*?</script\s*>", b"<script></script>", d)
+    d = re.sub(rb"(?is)<style\b[^>]*>.*?</style\s*>", b"<style></style>", d)
+    out = []
+    for m in _TAG.finditer(d):
+        close, name, attrs = m.group(1), m.group(2).lower(), m.group(3) or b""
+        keep = []
+        for am in _ATTR.finditer(attrs):
+            an = am.group(1).lower()
+            av = am.group(2).strip(b"\"'")
+            keep.append(an + b"=" + av if an in _KEEP_ATTRS else an)
+        rest = _ATTR.sub(b" ", attrs)
+        for wm in _WORD.finditer(rest):          # valueless attributes (disabled, checked)
+            keep.append(wm.group(0).lower())
+        tail = (b" " + b" ".join(sorted(set(keep)))) if keep else b""
+        out.append(b"<" + close + name + tail + b">")
+    return b"\n".join(out) + b"\n"
+
+
+# --------------------------------------------------------------- cookies
+
+def read_storage_state(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError) as exc:
+        die(f"the session file could not be read ({path}): {exc}")
+    if not isinstance(doc, dict) or not isinstance(doc.get("cookies"), list):
+        die(f"the session file is not in Playwright storageState form ({path}): "
+            "it must have a cookies array at the top level")
+    return doc
+
+
+def pick_cookies(storage, host):
+    """Keep only the cookies for this host. (selected, number dropped for a domain mismatch)"""
+    host = (host or "").lower()
+    sel, skipped = [], 0
+    for c in storage.get("cookies") or []:
+        dom = str(c.get("domain") or "").lstrip(".").lower()
+        if dom and not (host == dom or host.endswith("." + dom)):
+            skipped += 1
+            continue
+        sel.append((str(c.get("name") or ""), str(c.get("value") or ""),
+                    str(c.get("path") or "/")))
+    return sel, skipped
+
+
+def cookie_header(sel, path):
+    use = [(n, v) for n, v, p in sel if path.startswith(p or "/")]
+    return "; ".join(f"{n}={v}" for n, v in use if n)
+
+
+# --------------------------------------------------------------- HTTP
+
+def fetch(url, method, body, cookie, timeout, extra_headers=None):
+    """(status, headers, body_bytes, elapsed_ms, error). Lets no exception out.
+
+    `extra_headers` are request headers the observation entry declared, overriding the defaults.
+    Without them everything is captured under one User-Agent, and on a surface like this tree where
+    the path forks by device, **one branch of the guard is never observed.**
+    An unobserved branch is indistinguishable from "no difference", so a comparison that goes green
+    in that state proves nothing.
+    """
+    data = body.encode("utf-8") if body else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("User-Agent", UA)
+    req.add_header("Accept", "text/html,application/xhtml+xml,*/*")
+    if cookie:
+        req.add_header("Cookie", cookie)
+    if data is not None:
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    for k, v in (extra_headers or {}).items():
+        req.add_header(str(k), str(v))       # urllib overwrites a repeated name
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return (resp.status, dict(resp.headers.items()), resp.read(),
+                    int((time.time() - t0) * 1000), None)
+    except urllib.error.HTTPError as exc:                     # a 4xx or 5xx still has a body
+        try:
+            payload = exc.read()
+        except OSError:
+            payload = b""
+        return (exc.code, dict(exc.headers.items() if exc.headers else {}),
+                payload, int((time.time() - t0) * 1000), None)
+    except Exception as exc:                                  # transport failure
+        return (None, {}, b"", int((time.time() - t0) * 1000), str(exc) or type(exc).__name__)
+
+
+def is_timeout(err):
+    e = (err or "").lower()
+    return "timed out" in e or "timeout" in e
+
+
+# --------------------------------------------------------------- capture
+
+def readback_mode(base, cfg, cfg_file, timeout, cookie_sel, switch_values):
+    """The current mode as stated by the read-back page. Stops when unreadable or ambiguous."""
+    rel = need(cfg, "legacy.dualRun.readbackPath", cfg_file,
+               "--toggle-expect only works by reading back what the application is actually "
+               "looking at. Give the path of the page that prints the current mode.")
+    url = base.rstrip("/") + "/" + str(rel).lstrip("/")
+    parsed = urllib.parse.urlsplit(url)
+    status, _, body, ms, err = fetch(
+        url, "GET", None, cookie_header(cookie_sel, parsed.path or "/"), timeout)
+    if err:
+        die(f"toggle read-back failed ({url}): {err}. Check the stack is up first.")
+    if status != 200:
+        die(f"the toggle read-back returned {status} ({url}). Check the read-back path is right.")
+    def scan(pairs):
+        # The `.` must not be dropped at the boundary. The read-back page has links such as
+        # `index.php`, and if legacy's value were 'php' that link would read as 'the toggle is legacy'.
+        hit = set()
+        for mode, token in pairs:
+            if not token:
+                continue
+            rx = (rb"(?<![A-Za-z0-9_.-])" + re.escape(token.encode("utf-8"))
+                  + rb"(?![A-Za-z0-9_.-])")
+            if re.search(rx, body, re.I):
+                hit.add(mode)
+        return hit
+
+    found = scan([(m, str(switch_values.get(m) or "")) for m in MODES])
+    if not found:
+        found = scan([(m, m) for m in MODES])
+    if not found:
+        die(f"could not read a mode from the read-back page body ({url}, {len(body)} bytes). "
+            "Check that page prints the current value verbatim.")
+    if len(found) > 1:
+        die(f"the read-back page states several modes at once: {sorted(found)}. "
+            "Fix it to print one value - an ambiguity is never resolved by picking one.")
+    return found.pop()
+
+
+def cmd_capture(argv):
+    o = parse_opts(argv, want={"--observations", "--out", "--session", "--cookie-host",
+                               "--toggle-expect", "--timeout", "--config"})
+    if not o.get("--observations") or not o.get("--out"):
+        die("capture needs both --observations and --out. See --help")
+    cfg, cfg_file = load_config(o.get("--config"))
+    doc = read_observations(o["--observations"])
+    bad = observation_problems(doc, cfg)
+    if bad:
+        for b in bad:
+            note(f"observation list: {b}")
+        die("the observation list breaks its schema. Check with `htmlsnap observations validate`.")
+
+    surface = doc["surface"]
+    need(cfg, f"legacy.surfaces.{surface}", cfg_file,
+         "the surface the observation list names has to exist in the config.")
+    base = need(cfg, f"legacy.surfaces.{surface}.localBaseUrl", cfg_file,
+                "a capture can hit nothing without the local surface's base URL.")
+    logged_out = need(
+        cfg, f"legacy.surfaces.{surface}.loggedOutMarker", cfg_file,
+        "an auth failure on this surface is 200 plus a script, not a 302, so without this regex "
+        "the login-notice page freezes as the baseline. That is exactly the failure this tool "
+        "exists to prevent, so it does not proceed without it.")
+    try:
+        logged_out_rx = re.compile(logged_out.encode("utf-8"), re.S | re.I)
+    except (re.error, UnicodeError) as exc:
+        die(f"loggedOutMarker is not a regex: {exc}")
+    err_marker = opt(cfg, "legacy.snapshot.errorMarker")
+    err_rx = re.compile(err_marker.encode("utf-8"), re.S | re.I) if err_marker else None
+    if opt(cfg, "legacy.snapshot") is None:
+        die(f"{cfg_file} has no legacy.snapshot. That section holds normalize, errorMarker and "
+            "timeoutSeconds, and capturing without it makes every per-request value such as a "
+            "session token show up as a difference.")
+    norm_rules = opt(cfg, "legacy.snapshot.normalize", []) or []
+    if not norm_rules:
+        note("legacy.snapshot.normalize is empty - capturing without normalization. "
+             "If there is a token that changes per request, every comparison comes back different.")
+    timeout = float(o.get("--timeout") or opt(cfg, "legacy.snapshot.timeoutSeconds", 20))
+
+    # The session. Without it, proceed cookieless but say so loudly.
+    sess_path = o.get("--session") or opt(cfg, f"e2e.storageState.{surface}")
+    cookie_sel, host = [], urllib.parse.urlsplit(base).hostname or ""
+    cookie_host = o.get("--cookie-host") or host
+    if sess_path:
+        storage = read_storage_state(os.path.expanduser(sess_path))
+        cookie_sel, skipped = pick_cookies(storage, cookie_host)
+        note(f"session {sess_path}: using {len(cookie_sel)} cookies, {skipped} dropped "
+             f"because their domain did not match {cookie_host}")
+        if not cookie_sel:
+            note("not one cookie matched. Match the domain with --cookie-host. "
+                 "Left as is, any page needing auth is captured as logged_out.")
+    else:
+        note(f"no session file (neither --session nor e2e.storageState.{surface}). "
+             "Capturing without cookies - only public pages are valid.")
+
+    expect = o.get("--toggle-expect")
+    readback = None
+    if expect:
+        if expect not in MODES:
+            die(f"--toggle-expect must be one of {'|'.join(MODES)} (got {expect!r})")
+        values = opt(cfg, "legacy.switch.values", {}) or {}
+        readback = readback_mode(base, cfg, cfg_file, timeout, cookie_sel, values)
+        if readback != expect:
+            die(f"the application reports mode {readback!r} but {expect!r} was expected. "
+                "The toggle did not reach PHP. Capturing without a read-back leaves a baseline "
+                "taken in the wrong mode.")
+        note(f"toggle read-back: {readback} (matches what was expected)")
+
+    out = os.path.abspath(os.path.expanduser(o["--out"]))
+    os.makedirs(out, exist_ok=True)
+    entries, n = [], len(doc["entries"])
+    for i, e in enumerate(doc["entries"], 1):
+        eid = e["id"]
+        method = (e.get("method") or "GET").upper()
+        params = e.get("params") or {}
+        mode = e.get("mode") or "full"
+        qs = urllib.parse.urlencode({k: str(v) for k, v in params.items()})
+        path = e["path"]
+        url = base.rstrip("/") + path + (("?" + qs) if qs and method == "GET" else "")
+        body = qs if method == "POST" else None
+        cookie = cookie_header(cookie_sel, urllib.parse.urlsplit(url).path or "/")
+        req_headers = e.get("headers") or {}
+        status, headers, raw, ms, err = fetch(
+            url, method, body, cookie, timeout, req_headers)
+
+        flags = []
+        if err:
+            flags.append("timeout" if is_timeout(err) else "unreachable")
+        else:
+            if status is not None and status >= 500:
+                flags.append("error_page")
+            elif err_rx and err_rx.search(raw):
+                flags.append("error_page")
+            if logged_out_rx.search(raw):
+                flags.append("logged_out")
+            if not raw:
+                flags.append("empty")
+        norm = normalize(raw, norm_rules) if raw else b""
+        if mode == "structure" and norm:
+            norm = skeleton(norm)
+        with open(os.path.join(out, f"{eid}.raw.html"), "wb") as fh:
+            fh.write(raw)
+        with open(os.path.join(out, f"{eid}.norm.html"), "wb") as fh:
+            fh.write(norm)
+        meta = {"id": eid, "url": url, "path": path, "method": method,
+                "params": params, "mode": mode, "rules": e.get("rules") or [],
+                "headers": req_headers,
+                "note": e.get("note", ""), "status": status,
+                "content_type": headers.get("Content-Type", ""),
+                "bytes": len(raw), "elapsed_ms": ms, "flags": flags,
+                "valid": not flags, "error": err,
+                "sha256_raw": sha(raw), "sha256_norm": sha(norm),
+                "captured_at": datetime.datetime.now().astimezone().isoformat()}
+        with open(os.path.join(out, f"{eid}.json"), "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, ensure_ascii=False, indent=2, sort_keys=True)
+        entries.append(meta)
+        note(f"[{i}/{n}] {eid:<28} {method} {path} "
+             f"{status if status is not None else '---'} "
+             f"{len(raw) / 1024:6.1f}KB {ms:5d}ms {mode:<9} "
+             + ("ok" if not flags else "INVALID: " + ",".join(flags)
+                + (f" ({err})" if err else "")))
+
+    manifest = {"tool": TOOL, "schema": 1, "surface": surface, "base_url": base,
+                "observations": os.path.abspath(o["--observations"]),
+                "toggle_expect": expect, "toggle_readback": readback,
+                "cookies_sent": len(cookie_sel),
+                "captured_at": datetime.datetime.now().astimezone().isoformat(),
+                "entries": entries}
+    with open(os.path.join(out, "manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, ensure_ascii=False, indent=2, sort_keys=True)
+
+    invalid = [m for m in entries if not m["valid"]]
+    dead = [m for m in entries if m["error"]]
+    print(f"{TOOL} capture: {len(entries)} entries · valid {len(entries) - len(invalid)} · "
+          f"invalid {len(invalid)} → {out}")
+    for m in invalid:
+        print(f"  invalid  {m['id']:<28} {','.join(m['flags'])}")
+    if dead and len(dead) == len(entries):
+        die(f"every request failed ({dead[0]['error']}). Check the surface is up - "
+            "this is not a check failure but a state where the tool cannot answer.")
+    return 1 if invalid else 0
+
+
+# --------------------------------------------------------------- compare
+
+def load_capture_dir(d):
+    d = os.path.abspath(os.path.expanduser(d))
+    if not os.path.isdir(d):
+        die(f"no capture directory: {d}")
+    man = os.path.join(d, "manifest.json")
+    metas = {}
+    if os.path.isfile(man):
+        try:
+            with open(man, encoding="utf-8") as fh:
+                for m in json.load(fh).get("entries") or []:
+                    metas[m["id"]] = m
+        except (OSError, ValueError, KeyError) as exc:
+            die(f"{man} could not be read: {exc}")
+    else:
+        for name in sorted(os.listdir(d)):
+            if not name.endswith(".json") or name == "manifest.json":
+                continue
+            try:
+                with open(os.path.join(d, name), encoding="utf-8") as fh:
+                    m = json.load(fh)
+                metas[m["id"]] = m
+            except (OSError, ValueError, KeyError):
+                continue
+    if not metas:
+        die(f"{d} has no capture (neither manifest.json nor <id>.json could be read)")
+    return d, metas
+
+
+def decode(data, charset):
+    for enc in (charset, "utf-8", "cp949"):
+        if not enc:
+            continue
+        try:
+            return data.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("latin-1")
+
+
+def cmd_compare(argv):
+    pos = []
+    o = parse_opts(argv, want={"--report", "--context", "--max-diff-lines", "--config"},
+                   positional=pos)
+    if len(pos) != 2:
+        die("compare needs two capture directories: htmlsnap compare <A> <B>")
+    cfg, cfg_file = load_config(o.get("--config"))
+    dir_a, a = load_capture_dir(pos[0])
+    dir_b, b = load_capture_dir(pos[1])
+    ctx = int(o.get("--context") or 3)
+    cap = int(o.get("--max-diff-lines") or 40)
+
+    surface = None
+    for src in (os.path.join(dir_a, "manifest.json"), os.path.join(dir_b, "manifest.json")):
+        if os.path.isfile(src):
+            try:
+                with open(src, encoding="utf-8") as fh:
+                    surface = json.load(fh).get("surface") or surface
+            except (OSError, ValueError):
+                pass
+    charset = opt(cfg, f"legacy.surfaces.{surface}.charset", "cp949") if surface else "cp949"
+
+    rows, diffs = [], {}
+    for eid in sorted(set(a) | set(b)):
+        ma, mb = a.get(eid), b.get(eid)
+        if ma is None or mb is None:
+            rows.append((eid, "missing", f"present only in {'B' if ma else 'A'}"))
+            continue
+        bad = [f"A:{f}" for f in ma.get("flags") or []] + \
+              [f"B:{f}" for f in mb.get("flags") or []]
+        if bad:
+            rows.append((eid, "invalid", ",".join(bad)))
+            continue
+        if ma.get("sha256_norm") == mb.get("sha256_norm"):
+            rows.append((eid, "identical", ma.get("mode", "full")))
+            continue
+        try:
+            with open(os.path.join(dir_a, f"{eid}.norm.html"), "rb") as fh:
+                ta = decode(fh.read(), charset).splitlines()
+            with open(os.path.join(dir_b, f"{eid}.norm.html"), "rb") as fh:
+                tb = decode(fh.read(), charset).splitlines()
+        except OSError as exc:
+            rows.append((eid, "invalid", f"the normalized copy could not be read: {exc}"))
+            continue
+        lines = list(difflib.unified_diff(ta, tb, f"A/{eid}", f"B/{eid}", n=ctx,
+                                          lineterm=""))
+        diffs[eid] = lines[:cap] + ([f"... (+{len(lines) - cap} lines)"] if len(lines) > cap else [])
+        rows.append((eid, "different", f"{len(lines)} diff lines · {ma.get('mode','full')}"))
+
+    counts = {k: sum(1 for _, s, _ in rows if s == k)
+              for k in ("identical", "different", "missing", "invalid")}
+    print(f"{TOOL} compare: A={dir_a}")
+    print(f"{'':17}B={dir_b}")
+    for eid, state, detail in rows:
+        print(f"  {state:<10} {eid:<30} {detail}")
+    print(f"  ── identical {counts['identical']} · different {counts['different']}"
+          f" · missing {counts['missing']} · invalid {counts['invalid']}")
+    for eid in sorted(diffs):
+        print(f"\n--- diff: {eid}")
+        for line in diffs[eid]:
+            print("  " + line)
+
+    if o.get("--report"):
+        write_report(o["--report"], dir_a, dir_b, rows, counts, diffs)
+        note(f"report: {o['--report']}")
+    if counts["invalid"]:
+        die(f"there are {counts['invalid']} invalid captures. A logged-out, error or timed-out "
+            "capture cannot be a baseline, so no comparison result is produced. Fix the cause and re-capture.")
+    return 1 if (counts["different"] or counts["missing"]) else 0
+
+
+def write_report(path, dir_a, dir_b, rows, counts, diffs):
+    out = ["# htmlsnap compare", "",
+           f"- A: `{dir_a}`", f"- B: `{dir_b}`",
+           f"- identical {counts['identical']} · different {counts['different']}"
+           f" · missing {counts['missing']} · invalid {counts['invalid']}", "",
+           "| id | result | note |", "|---|---|---|"]
+    for eid, state, detail in rows:
+        out.append(f"| `{eid}` | {state} | {detail} |")
+    for eid in sorted(diffs):
+        out += ["", f"## diff — `{eid}`", "", "```diff"] + diffs[eid] + ["```"]
+    try:
+        with open(os.path.expanduser(path), "w", encoding="utf-8") as fh:
+            fh.write("\n".join(out) + "\n")
+    except OSError as exc:
+        die(f"the report could not be written ({path}): {exc}")
+
+
+# --------------------------------------------------------------- observations
+
+def cmd_observations(argv):
+    if not argv or argv[0] != "validate":
+        die("usage: htmlsnap observations validate <observations.json>")
+    pos = []
+    o = parse_opts(argv[1:], want={"--config"}, positional=pos)
+    if len(pos) != 1:
+        die("usage: htmlsnap observations validate <observations.json>")
+    doc = read_observations(pos[0])
+    cfg, cfg_file, cfg_err = None, None, None
+    try:
+        cfg, cfg_file = load_config(o.get("--config"))
+    except SystemExit as exc:
+        cfg_err = "the config could not be read, so the surface name was not compared"
+        if not isinstance(exc.code, int):
+            cfg_err += f" ({exc.code})"
+    bad = observation_problems(doc, cfg)
+    for b in bad:
+        print(f"  problem  {b}")
+    n = len(doc.get("entries") or []) if isinstance(doc, dict) else 0
+    print(f"{TOOL} observations validate: {n} entries · {len(bad)} problems"
+          + ("" if cfg is not None else "  [surface not compared]"))
+    if cfg is None:
+        die(cfg_err or "the config could not be read")
+    return 1 if bad else 0
+
+
+# --------------------------------------------------------------- toggle
+
+def cmd_toggle(argv):
+    """Read back the mode the application is looking at now and print it on one line.
+
+    This is the read `capture --toggle-expect` performs before capturing, pulled out so it can be
+    called without a capture. A read-back is needed where there is no capture too - after putting
+    the toggle back (`pagecheck` stage 7), and where a placeholder config is being checked (stage 1).
+    The same function is called, so the two places cannot disagree.
+    """
+    o = parse_opts(argv, want={"--surface", "--expect", "--timeout", "--config"})
+    surface = o.get("--surface")
+    if not surface:
+        die("toggle needs --surface (a key of legacy.surfaces)")
+    cfg, cfg_file = load_config(o.get("--config"))
+    need(cfg, f"legacy.surfaces.{surface}", cfg_file,
+         "a read-back can hit nothing without that surface's base URL.")
+    base = need(cfg, f"legacy.surfaces.{surface}.localBaseUrl", cfg_file,
+                "a base URL is needed to call the read-back page.")
+    timeout = float(o.get("--timeout") or opt(cfg, "legacy.snapshot.timeoutSeconds", 20))
+    sess_path = opt(cfg, f"e2e.storageState.{surface}")
+    cookie_sel = []
+    if sess_path and os.path.isfile(os.path.expanduser(sess_path)):
+        host = urllib.parse.urlsplit(base).hostname or ""
+        cookie_sel, _ = pick_cookies(read_storage_state(os.path.expanduser(sess_path)),
+                                     host)
+    values = opt(cfg, "legacy.switch.values", {}) or {}
+    mode = readback_mode(base, cfg, cfg_file, timeout, cookie_sel, values)
+    print(mode)
+    expect = o.get("--expect")
+    if expect:
+        if expect not in MODES:
+            die(f"--expect must be one of {'|'.join(MODES)} (got {expect!r})")
+        if mode != expect:
+            die(f"the application reports mode {mode!r} but {expect!r} was expected. "
+                "The toggle did not reach PHP - writing a value to the env file and that value "
+                "reaching PHP are different things.")
+    return 0
+
+
+# --------------------------------------------------------------- entry
+
+def parse_opts(argv, want, positional=None):
+    """Takes `--key value` only. An unknown option is not silently ignored - it stops the tool."""
+    o, i = {}, 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith("--"):
+            if a not in want:
+                die(f"unknown option {a}. Use --help to see the available options.")
+            if i + 1 >= len(argv):
+                die(f"{a} has no value")
+            o[a] = argv[i + 1]
+            i += 2
+            continue
+        if positional is None:
+            die(f"positional arguments are not accepted: {a!r}")
+        positional.append(a)
+        i += 1
+    return o
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "capture":
+        return cmd_capture(rest)
+    if cmd == "compare":
+        return cmd_compare(rest)
+    if cmd == "observations":
+        return cmd_observations(rest)
+    if cmd == "toggle":
+        return cmd_toggle(rest)
+    die(f"unknown command {cmd!r}. It is one of capture | compare | observations validate | toggle.")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

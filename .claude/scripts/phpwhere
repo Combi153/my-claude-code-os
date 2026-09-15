@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+"""phpwhere - answer instantly from the index where a name is defined.
+
+    phpwhere <name>                             class, function, constant, global
+    phpwhere '$<globalVar>'
+    phpwhere --tpl <file.tpl.php>               template variables and who supplies them
+    phpwhere --entry <file.php>                 a summary of what this page pulls in
+    phpwhere --entry <file.php> --full          the whole include tree
+    phpwhere --conflicts [classes|functions|constants|globals]
+
+How this differs from grep. grep cannot tell 'could not find' from 'there is none'. Searching
+`$X =` returns zero while the real definition is `$X[CONST] = value`. Here the definition shapes
+were normalized when the index was built, so zero really means none, and several means it says so.
+
+It separates shared from local. Measured, most column-0 assignments are page-local variables in
+entry points. Listing those next to shared global definitions buries the answer in noise. So only
+definitions in files that others include are shown first, and the rest are folded into a count.
+
+Keeping the output short is the purpose of this tool. If one answer costs more than reading a few
+files there is no reason to use it. Measured, a definition lookup is 10-100x cheaper, and the
+include tree fully expanded is 3x more expensive, so the default is the summary.
+"""
+import json
+import os
+import re
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _phpenc import (PHPLIB, config, current_service,  # noqa: E402
+                     require_config, state_dir, tree_root)
+
+RE_LIT = re.compile(r"""['"]([^'"]*)['"]""")
+KINDS = [("classes", "class"), ("functions", "function"),
+         ("constants", "constant"), ("globals", "global")]
+MAX_FILES = 10          # cap on files shown per name
+MAX_ROWS = 5            # cap on lines shown per file
+
+
+def index_dir(root=None):
+    """The project's gitignored state directory. The same place phpindex writes."""
+    d = state_dir("index")
+    if not d:
+        sys.exit("phpwhere: could not find the project's .claude/.state/")
+    return d
+
+
+def short_name(prefix):
+    return (config().get("services") or {}).get(prefix, prefix.split("/")[-1])
+
+
+def load(root):
+    d = index_dir(root)
+    cur = current_service()
+    names = [short_name(PHPLIB)]
+    if cur and cur[0] != PHPLIB:
+        names.insert(0, short_name(cur[0]))
+    label = " + ".join(names)
+    merged = {k: {} for k, _ in KINDS}
+    merged.update(templates={}, includes={}, flags={},
+                  files=set(), included=set())
+    metas = []
+    for n in names:
+        p = os.path.join(d, n + ".json")
+        if not os.path.isfile(p):
+            sys.exit(f"phpwhere: no {n}.json. First run →  phpindex --all")
+        part = json.load(open(p, encoding="utf-8"))
+        metas.append(part["meta"])
+        for k, _ in KINDS:
+            for name, hits in part.get(k, {}).items():
+                merged[k].setdefault(name, []).extend(hits)
+        for name, e in part.get("templates", {}).items():
+            tgt = merged["templates"].setdefault(
+                name, {"rendered_by": [], "keys": []})
+            tgt["rendered_by"] += e.get("rendered_by", [])
+            tgt["keys"] = sorted(set(tgt["keys"]) | set(e.get("keys", [])))
+            if "free_vars" in e:
+                tgt["free_vars"] = e["free_vars"]
+                tgt["path"] = e.get("path", "")
+        merged["includes"].update(part.get("includes", {}))
+        merged["flags"].update(part.get("flags", {}))
+        merged["files"] |= set(part.get("files", []))
+        merged["included"] |= set(part.get("included", []))
+    return merged, label, metas
+
+
+def rows_of(hits):
+    """Normalize [path] or [path, line, text] into (path, line, text)."""
+    return [(h, None, None) if isinstance(h, str) else tuple(h) for h in hits]
+
+
+def resolve(idx, expr, frm):
+    lits = [t for t in RE_LIT.findall(expr)
+            if t.lower().endswith((".php", ".inc"))]
+    if not lits:
+        return None
+    tail = "/" + lits[-1].strip().lstrip("./")
+    hit = [f for f in idx["files"] if f.endswith(tail)]
+    if len(hit) == 1:
+        return hit[0]
+    if len(hit) > 1:
+        same = [f for f in hit if f.split("/")[:2] == frm.split("/")[:2]]
+        if len(same) == 1:
+            return same[0]
+    return None
+
+
+# ----------------------------------------------------------------- name lookup
+def tpl_hint(idx, bare):
+    free = sorted(n for n, e in idx["templates"].items()
+                  if bare in e.get("free_vars", []))
+    keys = sorted(n for n, e in idx["templates"].items()
+                  if bare in e.get("keys", []))
+    if not (free or keys):
+        return False
+    print("  → it is also a template variable (injected by extract(), so it has no definition statement)")
+    if free:
+        print(f"     used by {len(free)} templates: " + ", ".join(free[:4]))
+    if keys:
+        print(f"     {len(keys)} templates have a set() side: "
+              + ", ".join(keys[:4]))
+    print(f"     detail →  phpwhere --tpl {(free or keys)[0]}")
+    return True
+
+
+def print_hits(idx, name, kor, hits):
+    rows = rows_of(hits)
+    files = sorted({r[0] for r in rows})
+    shared = [f for f in files if f in idx["included"]]
+    local = [f for f in files if f not in idx["included"]]
+    print(f"\n{name}  [{kor}]  {len(rows)} definitions / {len(files)} files")
+    if len(shared) > 1:
+        print("  ⚠ defined in several shared files - which one loads depends on "
+              "that page's include order")
+    for path in shared[:MAX_FILES]:
+        sub = [r for r in rows if r[0] == path]
+        print(f"  {path}")
+        for r in sub[:MAX_ROWS]:
+            if r[1] is not None:
+                print(f"      {r[1]:>5}: {r[2]}")
+        if len(sub) > MAX_ROWS:
+            print(f"      {'':>5}  … {len(sub)-MAX_ROWS} more lines in the same file")
+    if len(shared) > MAX_FILES:
+        print(f"  … {len(shared)-MAX_FILES} more shared files")
+    if local:
+        # A column-0 assignment in an entry point is a variable living only inside that page.
+        print(f"  (plus page-local assignments in {len(local)} files - "
+              "each page's own variable, so not a source)")
+        if not shared:
+            print("      " + ", ".join(local[:4])
+                  + (f" and {len(local)-4} more" if len(local) > 4 else ""))
+
+
+def show_name(idx, query):
+    q = query.strip()
+    bare = q.lstrip("$")
+    hit = False
+    for key, kor in KINDS:
+        cands = ["$" + bare] if key == "globals" else [bare]
+        for c in cands:
+            if c not in idx[key]:
+                continue
+            print_hits(idx, c, kor, idx[key][c])
+            hit = True
+            break
+    if hit:
+        tpl_hint(idx, bare)
+        return 0
+    print(f"\n'{q}' has no definition.")
+    if tpl_hint(idx, bare):
+        return 0
+    near = sorted({n for k, _ in KINDS for n in idx[k]
+                   if bare.lower() in n.lstrip("$").lower()})[:8]
+    print("  similar names: " + ", ".join(near) if near
+          else "  which means it is not in this scope. Widen with phpgrep --all.")
+    return 1
+
+
+# ----------------------------------------------------------------- templates
+def show_tpl(idx, name):
+    base = os.path.basename(name)
+    e = idx["templates"].get(base)
+    if not e:
+        near = [n for n in idx["templates"] if base.lower() in n.lower()][:6]
+        print(f"\nno template '{base}'."
+              + ("  similar names: " + ", ".join(near) if near else ""))
+        return 1
+    print(f"\n{base}")
+    if e.get("path"):
+        print(f"  path        {e['path']}")
+    rb = sorted(set(e.get("rendered_by", [])))
+    print(f"  rendered by  {len(rb)}" + ("" if rb else "  ⚠ not found"))
+    for p in rb[:6]:
+        print(f"      {p}")
+    if len(rb) > 6:
+        print(f"      … {len(rb)-6} more")
+    free, keys = e.get("free_vars", []), e.get("keys", [])
+    if free:
+        print(f"  {len(free)} variables used with no definition")
+        print("      " + ", ".join("$" + v for v in free[:20])
+              + (f" and {len(free)-20} more" if len(free) > 20 else ""))
+    if keys:
+        matched = sorted(set(free) & set(keys))
+        missing = sorted(set(free) - set(keys))
+        print(f"  {len(keys)} set keys on the render side · {len(matched)} of them "
+              f"used by this template")
+        if missing:
+            print(f"  ⚠ {len(missing)} variables not found in set - they come from an enclosing "
+                  "scope or another path")
+            print("      " + ", ".join("$" + v for v in missing[:12])
+                  + (f" and {len(missing)-12} more" if len(missing) > 12 else ""))
+    return 0
+
+
+# ----------------------------------------------------------------- entry points
+def chain(idx, root):
+    """Reachable files and unresolved expressions. (with the path taken)"""
+    seen = {root: []}
+    order = [root]
+    unresolved = []
+    queue = [(root, [])]
+    while queue:
+        path, via = queue.pop(0)
+        for _kw, expr in idx["includes"].get(path, []):
+            tgt = resolve(idx, expr, path)
+            if tgt is None:
+                unresolved.append((path, expr))
+            elif tgt not in seen:
+                seen[tgt] = via + [path]
+                order.append(tgt)
+                queue.append((tgt, via + [path]))
+    return order, seen, unresolved
+
+
+def show_entry(idx, start, full=False):
+    cands = [f for f in idx["files"] if f.endswith("/" + start.lstrip("/"))]
+    if not cands:
+        cands = [f for f in idx["files"] if f.endswith(start.lstrip("/"))]
+    if not cands:
+        print(f"\n'{start}' was not found in the index")
+        return 1
+    root = sorted(cands, key=len)[0]
+    order, seen, unresolved = chain(idx, root)
+    print(f"\n{root}")
+
+    if full:
+        def rec(path, pad, depth):
+            if depth > 8:
+                return
+            for _kw, expr in idx["includes"].get(path, []):
+                tgt = resolve(idx, expr, path)
+                if tgt and seen.get(tgt) == [] and tgt != root:
+                    pass
+                if tgt:
+                    fl = idx["flags"].get(tgt, {})
+                    mark = (" [emits]" if fl.get("out") else "") + \
+                           (" [can end the request]" if fl.get("halt") else "")
+                    print(f"{pad}├─ {tgt}{mark}")
+                    if seen.get(tgt) is not None and tgt not in rec.done:
+                        rec.done.add(tgt)
+                        rec(tgt, pad + "│  ", depth + 1)
+                else:
+                    print(f"{pad}├─ ? {expr[:64]}")
+        rec.done = {root}
+        rec(root, "", 1)
+        return 0
+
+    direct = idx["includes"].get(root, [])
+    print(f"  {len(direct)} direct includes")
+    for _kw, expr in direct[:8]:
+        tgt = resolve(idx, expr, root)
+        if tgt:
+            fl = idx["flags"].get(tgt, {})
+            mark = ("  [emits]" if fl.get("out") else "") + \
+                   ("  [can end the request]" if fl.get("halt") else "")
+            print(f"      {tgt}{mark}")
+        else:
+            print(f"      ? {expr[:60]}  (dynamic)")
+    print(f"  {len(order)} files in the whole chain"
+          + (f" · {len(unresolved)} unresolved" if unresolved else ""))
+
+    gates = [f for f in order if idx["flags"].get(f, {}).get("halt")]
+    if gates:
+        # An auth gate and an outage notice have the same shape, so it shows the target without judging.
+        print(f"  ⚠ {len(gates)} includes that can end the request "
+              "(a redirect followed by exit)")
+        for g in gates[:4]:
+            via = seen.get(g) or []
+            trail = " ← ".join(reversed([v.split("/")[-1] for v in via[1:]]))
+            print(f"      {g}" + (f"   via {trail}" if trail else ""))
+            print(f"          → {idx['flags'][g]['halt']}")
+    else:
+        print("  no include can end the request")
+
+    outs = [f for f in order
+            if idx["flags"].get(f, {}).get("out") and f != root]
+    if outs:
+        print(f"  {len(outs)} files that emit from the include alone")
+        print("      " + ", ".join(o.split("/")[-1] for o in outs[:6])
+              + (f" and {len(outs)-6} more" if len(outs) > 6 else ""))
+    print("  whole tree →  --full")
+    return 0
+
+
+# ----------------------------------------------------------------- conflicts
+def show_conflicts(idx, only=None):
+    for key, kor in KINDS:
+        if only and key != only:
+            continue
+        rows = []
+        for name, hits in idx[key].items():
+            files = {r[0] for r in rows_of(hits)}
+            shared = files & idx["included"]
+            if len(shared) > 1:
+                rows.append((len(shared), name, sorted(shared)))
+        rows.sort(reverse=True)
+        cap = 20 if only else 6
+        print(f"\n[{kor}] {len(rows)} names defined in several shared files")
+        for n, name, files in rows[:cap]:
+            print(f"  {name}  ({n} places)")
+            for f in files[:3]:
+                print(f"      {f}")
+            if len(files) > 3:
+                print(f"      … {len(files)-3} more")
+        if len(rows) > cap:
+            print(f"  … {len(rows)-cap} more"
+                  + ("" if only else f"  (--conflicts {key} to see them all)"))
+    return 0
+
+
+def main():
+    require_config("phpwhere")
+    root = tree_root()
+    if not root:
+        sys.exit("phpwhere: legacy.treeMarker is not under legacy.root")
+    args = sys.argv[1:]
+    if not args:
+        sys.exit("usage: phpwhere <name> | --tpl <file> | --entry <file> [--full]"
+                 " | --conflicts [kind]")
+    idx, label, metas = load(root)
+    print(f"# scope: {label} · index {min(m['built'] for m in metas)}")
+    if args[0] == "--conflicts":
+        kinds = {k for k, _ in KINDS}
+        return show_conflicts(idx, args[1] if len(args) > 1
+                              and args[1] in kinds else None)
+    if args[0] == "--tpl":
+        return show_tpl(idx, args[1])
+    if args[0] == "--entry":
+        return show_entry(idx, args[1], full="--full" in args)
+    return show_name(idx, args[0])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

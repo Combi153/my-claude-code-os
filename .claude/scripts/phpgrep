@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""phpgrep - search a legacy tree in both encodings, scoped to what you actually use.
+
+    phpgrep <word>                  current service + shared library
+    phpgrep <Identifier>            ASCII identifiers too
+    phpgrep --all X                 whole tree, counts per directory
+    phpgrep --scope <service path> X    one named directory
+    phpgrep -l X                    files only
+    phpgrep -i X                    case-insensitive
+
+Scope. A service reaches exactly two trees: itself and the shared library named
+by `legacy.sharedLibrary` in workspace.json. That is measured, not assumed -
+across the tree there is one cross-service include and it is a leftover. So by
+default this searches the service you are standing in plus that library, and
+opens nothing else. Standing at the tree root there is no service to infer, so
+it falls back to counts for the whole tree.
+
+The scope actually used is always printed. A zero result means "not in this
+scope", never "not anywhere" - widen with --all before concluding anything.
+
+Encoding. A UTF-8 pattern misses every CP949 file; a raw CP949 pattern makes rg
+refuse and BSD grep return 0 in silence. Both are searched, the CP949 one as hex
+escapes, and hits are decoded before printing.
+"""
+import os
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _phpenc import (BUNDLE_GLOBS, PHPLIB, SERVICES, SIDE_GLOBS,  # noqa: E402
+                     current_service, tree_root)
+
+EXT = ["*.php", "*.inc", "*.tpl", "*.html", "*.htm", "*.js", "*.css"]
+EXPAND_UNDER = 60
+
+
+def hex_pattern(data):
+    return "(?-u)" + "".join(f"\\x{b:02x}" for b in data)
+
+
+def run_rg(args, paths, side=False):
+    cmd = ["rg", "-a", "--no-heading", "--line-number", "--color", "never",
+           "--no-messages"] + args
+    for e in EXT:
+        cmd += ["-g", e]
+    for g in BUNDLE_GLOBS + ([] if side else SIDE_GLOBS):
+        cmd += ["-g", g]
+    p = subprocess.run(cmd + paths, capture_output=True)
+    if p.returncode not in (0, 1):
+        sys.stderr.write(p.stderr.decode("utf-8", "replace"))
+    return p.stdout
+
+
+def parse(out, codec, root, into):
+    for raw in out.split(b"\n"):
+        if not raw:
+            continue
+        path, _, rest = raw.partition(b":")
+        num, _, text = rest.partition(b":")
+        if not num.isdigit():
+            continue
+        rel = os.path.relpath(os.path.abspath(path.decode("utf-8", "replace")), root)
+        into.append((rel, int(num), text.decode(codec, "replace").strip()))
+
+
+def group_of(rel):
+    for prefix, name in SERVICES:
+        if rel == prefix or rel.startswith(prefix + "/"):
+            return name
+    return "(other)"
+
+
+def main(argv):
+    files_only = ignore_case = want_all = side = False
+    scope = None
+    rest = []
+    while argv:
+        a = argv.pop(0)
+        if a in ("-l", "--files"):
+            files_only = True
+        elif a in ("-i", "--ignore-case"):
+            ignore_case = True
+        elif a == "--all":
+            want_all = True
+        elif a == "--tests":
+            side = True
+        elif a == "--scope":
+            scope = argv.pop(0) if argv else None
+        elif a in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
+        elif a == "--":
+            rest.extend(argv)
+            del argv[:]
+        elif a.startswith("-") and a != "-":
+            # Do not treat an unknown option as the search term. Doing so silently
+            # drops the real pattern that follows, and a search for the option name
+            # itself comes back as a plausible count. Zero at least invites suspicion.
+            print(f"phpgrep: unknown option {a}", file=sys.stderr)
+            print("If the search term starts with -, put it after --.  e.g.  phpgrep -- -->",
+                  file=sys.stderr)
+            print(__doc__.strip(), file=sys.stderr)
+            return 2
+        else:
+            rest.append(a)
+    if not rest:
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    if len(rest) > 1:
+        # Silently dropping the remaining arguments makes an unsearched thing read as searched.
+        print("phpgrep: the search term must be exactly one. "
+              + f"got {len(rest)} — " + " ".join(repr(r) for r in rest),
+              file=sys.stderr)
+        print("To find several words as one phrase, quote them.", file=sys.stderr)
+        return 2
+
+    term = rest[0]
+    root = tree_root()
+    if not root:
+        print("phpgrep: not inside a php_legacy tree", file=sys.stderr)
+        return 2
+
+    here = current_service()
+    if scope:
+        paths, desc = [os.path.join(root, scope)], scope
+        counts_only = False
+    elif want_all or not here:
+        paths, desc = [root], "whole tree"
+        counts_only = True
+        if not here and not want_all:
+            desc += " (outside a service, cannot narrow)"
+    else:
+        prefix, name = here
+        dirs = [prefix] if prefix == PHPLIB else [prefix, PHPLIB]
+        paths = [os.path.join(root, d) for d in dirs]
+        desc = " + ".join(dirs)
+        counts_only = False
+
+    flags = ["-i"] if ignore_case else []
+    hits = []
+    utf8 = term.encode("utf-8")
+    parse(run_rg(flags + ["-F", "-e", term], paths, side), "utf-8", root, hits)
+    seen = {(h[0], h[1]) for h in hits}
+    try:
+        legacy = term.encode("cp949")
+    except UnicodeEncodeError:
+        legacy = utf8
+    if legacy != utf8:
+        extra = []
+        parse(run_rg(flags + ["-e", hex_pattern(legacy)], paths, side),
+              "cp949", root, extra)
+        hits += [h for h in extra if (h[0], h[1]) not in seen]
+
+    print(f"# scope: {desc}{'' if side else ' · vendor and tests excluded (--tests)'}",
+          file=sys.stderr)
+    if here and here[0] == PHPLIB and not (scope or want_all):
+        print(f"# the shared library is used by {len(SERVICES)} services. "
+              "If you change a signature, check the impact with --all.", file=sys.stderr)
+    if not hits:
+        print(f"# no hits for {term!r} — it may be absent only from this scope. Re-check with --all.",
+              file=sys.stderr)
+        return 1
+
+    groups = {}
+    for rel, num, text in hits:
+        groups.setdefault(group_of(rel), []).append((rel, num, text))
+
+    order = [n for _, n in SERVICES] + ["(other)"]
+    if here:
+        order.remove(here[1])
+        order.insert(0, here[1])
+
+    if counts_only and len(hits) > EXPAND_UNDER:
+        for name in order:
+            rows = groups.get(name)
+            if rows:
+                print(f"{name:20} {len(rows):>5} hits {len({r[0] for r in rows}):>5} files"
+                      f"   [--scope {dict((n, p) for p, n in SERVICES)[name]}]"
+                      if name != "(other)" else f"{name:20} {len(rows):>5} hits")
+        print(f"\n# {len(hits)} hits total / {len({h[0] for h in hits})} files. "
+              f"Expand one with --scope.", file=sys.stderr)
+        return 0
+
+    for name in order:
+        rows = groups.get(name)
+        if not rows:
+            continue
+        rows.sort()
+        print(f"## {name}: {len(rows)} hits / {len({r[0] for r in rows})} files")
+        if files_only:
+            for f in sorted({r[0] for r in rows}):
+                print(f"   {f}")
+        else:
+            for rel, num, text in rows:
+                print(f"   {rel}:{num}: {text}")
+        print()
+    print(f"# {len(hits)} hits total / {len({h[0] for h in hits})} files", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

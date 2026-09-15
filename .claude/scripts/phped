@@ -1,0 +1,266 @@
+#!/usr/bin/env python3
+"""phped - encoding-safe editing for the php_legacy tree.
+
+Round trip (default; use this):
+    phped open <file>      decode to a UTF-8 working copy, print its path
+    ...edit the working copy with normal tools, Korean is safe...
+    phped save <file>      re-encode to the original encoding and write back
+    phped discard <file>   throw the working copy away
+
+Surgical (for very large files, when the exact string is already known):
+    phped replace <file> <old> <new>
+
+Other:
+    phped status           working copies still open
+
+Before writing back, the new content is syntax-checked against the runtime the
+file actually ships on - `phplint` picks that version from `legacy.runtimes` in
+workspace.json. A file that was clean and would stop being clean is not written;
+pass --no-lint to skip.
+
+The Edit/Write tools rewrite files as UTF-8. On a CP949 file that destroys every
+Korean character in it, not just the edited line. Never point them at a source
+file here - point them at the working copy that `open` gives you.
+"""
+import difflib
+import hashlib
+import json
+import os
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _phpenc import detect, checkout_root, sibling_encoding  # noqa: E402
+
+LINT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "phplint")
+
+
+def edit_dir():
+    # It must not fall back to cwd. What this tool creates is a decoded copy of
+    # company source, and this tree is checked out inside a public repository that
+    # gitignores itself. Writing that copy to cwd puts it somewhere tracked. Failing is better.
+    root = checkout_root()
+    if not root:
+        sys.exit("phped: could not find the php_legacy tree. A working copy is never created outside it.")
+    d = os.path.join(root, ".claude", ".edit")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def slot(path):
+    ap = os.path.abspath(path)
+    key = hashlib.sha1(ap.encode()).hexdigest()[:10]
+    return os.path.join(edit_dir(), f"{os.path.basename(ap)}.{key}")
+
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def die(msg):
+    print(f"phped: {msg}", file=sys.stderr)
+    return 1
+
+
+def lint_ok(data, path):
+    """True if `data` parses on this file's runtime. None when unknown."""
+    p = subprocess.run([sys.executable, LINT, "--as", path, "-"],
+                       input=data, capture_output=True)
+    if p.returncode == 2:
+        return None, p.stderr.decode("utf-8", "replace").strip()
+    return p.returncode == 0, p.stderr.decode("utf-8", "replace").strip()
+
+
+def lint_gate(old, new, path):
+    """Refuse only what this edit broke. Pre-existing errors are not our fight."""
+    ok_new, msg = lint_ok(new, path)
+    if ok_new is None:
+        print(f"phped: syntax not checked - {msg}", file=sys.stderr)
+        return True
+    if ok_new:
+        return True
+    ok_old, _ = lint_ok(old, path)
+    if ok_old is False:
+        print(f"phped: note - {path} already failed its runtime before this "
+              f"edit; writing anyway", file=sys.stderr)
+        return True
+    print(msg, file=sys.stderr)
+    return False
+
+
+def cmd_open(path):
+    if not os.path.isfile(path):
+        return die(f"not a file: {path}")
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    enc = detect(raw)
+    if enc is None:
+        return die(f"{path} decodes as neither UTF-8 nor CP949; edit it by hand")
+
+    work = slot(path) + ".txt"
+    meta = slot(path) + ".json"
+    if os.path.exists(work):
+        print(f"phped: already open, reusing {work}", file=sys.stderr)
+        print(work)
+        return 0
+
+    text = raw.decode("ascii" if enc == "ascii" else enc)
+    with open(work, "w", encoding="utf-8", newline="") as fh:
+        fh.write(text)
+    with open(meta, "w", encoding="utf-8") as fh:
+        json.dump({"source": os.path.abspath(path), "encoding": enc,
+                   "sha256": sha(raw), "bytes": len(raw)}, fh)
+
+    print(f"# {path}  [{enc}, {len(raw)} bytes]", file=sys.stderr)
+    print(f"# edit the copy, then: phped save {path}", file=sys.stderr)
+    print(work)
+    return 0
+
+
+def cmd_save(path, lint=True):
+    work, meta = slot(path) + ".txt", slot(path) + ".json"
+    if not os.path.exists(work) or not os.path.exists(meta):
+        return die(f"no working copy for {path} (run: phped open {path})")
+    info = json.load(open(meta, encoding="utf-8"))
+
+    with open(info["source"], "rb") as fh:
+        current = fh.read()
+    if sha(current) != info["sha256"]:
+        return die(f"{path} changed on disk since open; discard and redo\n"
+                   f"        phped discard {path}")
+
+    with open(work, encoding="utf-8", newline="") as fh:
+        text = fh.read()
+
+    target = info["encoding"]
+    if target == "ascii" and not text.isascii():
+        target = sibling_encoding(info["source"]) or "utf-8"
+        print(f"phped: file was pure ASCII, now has non-ASCII; "
+              f"writing as {target} to match neighbours", file=sys.stderr)
+    if target == "ascii":
+        target = "utf-8"
+
+    # 1. every character must survive the target encoding
+    try:
+        data = text.encode(target)
+    except UnicodeEncodeError as e:
+        bad = text[e.start:e.end]
+        line = text[:e.start].count("\n") + 1
+        return die(f"{bad!r} (line {line}) cannot be written as {target}. "
+                   f"Use an ASCII equivalent - e.g. '-' instead of an em dash.")
+
+    # 2. the round trip must be exact
+    if data.decode(target) != text:
+        return die("round trip is not lossless; refusing to write")
+
+    if lint and not lint_gate(current, data, info["source"]):
+        print(f"phped: NOT written - fix the working copy and save again\n"
+              f"        {work}", file=sys.stderr)
+        return 1
+
+    old_lines = current.decode("ascii" if info["encoding"] == "ascii"
+                               else info["encoding"]).split("\n")
+    new_lines = text.split("\n")
+    # a real diff: naive zip() counts every line after an insertion as changed
+    changed = sum(
+        max(i2 - i1, j2 - j1)
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
+            None, old_lines, new_lines, autojunk=False).get_opcodes()
+        if tag != "equal"
+    )
+
+    with open(info["source"], "wb") as fh:
+        fh.write(data)
+    os.remove(work)
+    os.remove(meta)
+
+    print(f"phped: wrote {path} as {target}, "
+          f"{len(current)} -> {len(data)} bytes, {changed} line(s) changed",
+          file=sys.stderr)
+    if changed > 50:
+        print("phped: that is a lot of lines - confirm it was intended "
+              "(git diff)", file=sys.stderr)
+    return 0
+
+
+def cmd_discard(path):
+    n = 0
+    for suffix in (".txt", ".json"):
+        p = slot(path) + suffix
+        if os.path.exists(p):
+            os.remove(p)
+            n += 1
+    print(f"phped: discarded {n} file(s) for {path}", file=sys.stderr)
+    return 0
+
+
+def cmd_replace(path, old, new, lint=True):
+    if not os.path.isfile(path):
+        return die(f"not a file: {path}")
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    enc = detect(raw)
+    if enc is None:
+        return die(f"{path} decodes as neither UTF-8 nor CP949")
+    codec = "utf-8" if enc == "ascii" else enc
+    try:
+        old_b, new_b = old.encode(codec), new.encode(codec)
+    except UnicodeEncodeError as e:
+        return die(f"cannot encode {e.object[e.start:e.end]!r} as {codec}")
+
+    count = raw.count(old_b)
+    if count == 0:
+        return die(f"pattern not found in {path} (file is {enc})")
+    if count > 1:
+        return die(f"pattern occurs {count} times in {path}; make it unique")
+
+    new_raw = raw.replace(old_b, new_b)
+    if lint and not lint_gate(raw, new_raw, path):
+        print(f"phped: NOT written - {path} unchanged", file=sys.stderr)
+        return 1
+
+    with open(path, "wb") as fh:
+        fh.write(new_raw)
+    print(f"phped: replaced 1 occurrence in {path} [{enc}]", file=sys.stderr)
+    return 0
+
+
+def cmd_status():
+    d = edit_dir()
+    metas = [f for f in os.listdir(d) if f.endswith(".json")]
+    if not metas:
+        print("phped: no working copies open", file=sys.stderr)
+        return 0
+    for m in metas:
+        info = json.load(open(os.path.join(d, m), encoding="utf-8"))
+        print(f"{info['encoding']:>6}  {info['source']}")
+    print(f"\n# {len(metas)} open - run `phped save <file>` for each",
+          file=sys.stderr)
+    return 0
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+    lint = "--no-lint" not in argv
+    argv = [a for a in argv if a != "--no-lint"]
+    cmd, rest = argv[0], argv[1:]
+    if cmd == "status":
+        return cmd_status()
+    if cmd in ("open", "save", "discard"):
+        if len(rest) != 1:
+            return die(f"usage: phped {cmd} <file>")
+        if cmd == "save":
+            return cmd_save(rest[0], lint)
+        return {"open": cmd_open, "discard": cmd_discard}[cmd](rest[0])
+    if cmd == "replace":
+        if len(rest) != 3:
+            return die("usage: phped replace <file> <old> <new>")
+        return cmd_replace(rest[0], rest[1], rest[2], lint)
+    return die(f"unknown command: {cmd}")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
