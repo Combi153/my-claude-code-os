@@ -31,11 +31,11 @@ Those need two different checks. An equivalence check answers the first. It cann
 
 Both checks point at the same **behavior rules**: 페이지가 지키는 규칙의 목록이고, v3 부터 **JSONL 한 줄이 규칙 하나**다. 행마다 분류(도메인 / 화면 / 경계)·출처·줄 범위·필요 입력·관찰·이관 상태·승인이 있고 **열마다 주인이 하나**다. 계약은 `.claude/context/rules-contract.md`, 포맷 정본은 `.claude/skills/legacy-migrate/references/rules-format.md`. 도메인 문서도 이 규칙 목록에서 나온다 — 그래서 그 문서가 계속 참인 것이고, 그것이 별도 프로젝트가 아니라 작업의 부산물인 이유다.
 
-**v3 는 축소다(2026-09-11).** 축소된 것은 저장소가 아니라 **모델이 매 턴 읽는 지시문의 중심**이다 — 오케스트레이터 스킬이 323줄에서 159줄로 줄고, 그 자리를 결정적 코드와 그 코드의 자기검사가 받았다(실측은 설계 문서 1.6장). 회차 길이의 원인이 페이지 크기가 아니라 Phase 일정에 박힌 고정 비용임을 확인하고, 작업 단위를 **교체 지점 함수 하나(페이지 하나)** 로 내렸다. 비싼 산출물(설계·도메인 문서)은 **영역 단위 살아있는 문서**가 되어 여러 페이지가 나눠 쓰고, 기계 절차는 `pagecheck` 와 `state.json` 이 진다. 그리고 회차가 회차를 가르치는 장치가 들어왔다 — **근거를 인용한 역할별 학습 기록**과 **사람이 diff 로 승인하는 컨텍스트 변경분**. 근거 없는 자기 반성은 작업 환경을 나쁘게 만든다는 측정이 그 규칙의 이유다. 검토 근거는 `docs/reviews/2026-09-11-os-shape-review.md`, 설계는 `docs/legacy-migration-os.md` 1.6장.
+**v3 는 축소다(2026-09-11).** 축소된 것은 저장소가 아니라 **모델이 매 턴 읽는 지시문의 중심**이다 — 오케스트레이터 스킬이 323줄에서 159줄로 줄고, 그 자리를 결정적 코드와 그 코드의 자기검사가 받았다(실측은 설계 문서 1.6장). 회차 길이의 원인이 페이지 크기가 아니라 Phase 일정에 박힌 고정 비용임을 확인하고, 작업 단위를 **교체 지점 함수 하나(페이지 하나)** 로 내렸다. 비싼 산출물(설계·도메인 문서)은 **영역 단위 살아있는 문서**가 되어 여러 페이지가 나눠 쓰고, 기계 절차는 `pagecheck` 와 `state.json` 이 진다. 그리고 회차가 회차를 가르치는 장치가 들어왔다 — **근거를 인용한 역할별 학습 기록**과 **사람이 diff 로 승인하는 컨텍스트 변경분**. 근거 없는 자기 반성은 작업 환경을 나쁘게 만든다는 측정이 그 규칙의 이유다. **그 장치의 단위를 페이지 완주에서 추가 회차 하나로 내린 것이 원인 루프다(D-38, 2026-09-15)** — 다섯 루프 중 하나가 한 바퀴 더 돌 때마다 닫힌 어휘에서 이유를 하나 받고(`pagecheck --round`), `causestats` 가 같은 이유 3회를 찾으면 상한·지시문·검사 중 하나의 변경분이 나온다. 회차 하나가 12시간이라, 페이지 완주에 묶인 장치는 설계 나흘째까지 한 번도 돌지 않았다. 검토 근거는 `docs/reviews/2026-09-11-os-shape-review.md`, 설계는 `docs/legacy-migration-os.md` 1.6장.
 
 | 스킬 | |
 |---|---|
-| `legacy-migrate` | 오케스트레이터. Phase 0–7, 루프 5개, 사람이 멈추는 곳 3개(추출 계획 승인 · **묻는 단계 2.5** · 설계 승인), 자동 검사 2개 |
+| `legacy-migrate` | 오케스트레이터. Phase 0–7, 루프 5개와 그 위의 원인 루프, 사람이 멈추는 곳 3개(추출 계획 승인 · **묻는 단계 2.5** · 설계 승인), 자동 검사 2개 |
 | `page-picker` | 다음에 옮길 페이지 선정. **두 걸음** — 아홉 기준으로 순위를 내고 멈춘 뒤, 사람이 지목한 한둘에만 기능 설명서 (호출자 전수는 영역 API 설계의 입력이다) |
 | `page-baseline` | 화면 HTML 기준 캡처·비교 |
 | `dual-run` | 교체 지점 이중 실행 배선과 불일치 보고 |
@@ -78,9 +78,9 @@ The design and the reasoning behind it — decisions, loops, gates, open questio
 
 ## 도구 · 훅 · 컨텍스트
 
-`.claude/scripts/` 에 도구 열셋. 여섯은 레거시 트리를 답할 수 있게 만들고(읽기·검색·정의 조회·인덱스·왕복 편집·문법 검사), `phpstats` 는 그것들이 실제로 쓰였는지 보고하며, 넷은 v2 의 것이다 — `phpmove`(모양·본문 해시·호출자·**필드 대조**), `htmlsnap`(캡처·비교), `dualrun-report`(불일치 집계), `ctxstats`(주입 계측). 둘은 v3 의 것이다 — `pagecheck`(기계 절차 일곱 단계와 `state.json`), `ctxevolve`(학습 기록 → 컨텍스트 개정 제안. **적용하지 않는다**). 전부 같은 실패를 막으려고 있다: **답을 찾지 못한 도구가 "답이 없다"고 보고하는 것.** 무엇이고 왜인지는 `docs/php-legacy-tooling.md`, 어떻게 부르는지는 `php-legacy-io`·`php-legacy-trace`.
+`.claude/scripts/` 에 도구 열넷. 여섯은 레거시 트리를 답할 수 있게 만들고(읽기·검색·정의 조회·인덱스·왕복 편집·문법 검사), `phpstats` 는 그것들이 실제로 쓰였는지 보고하며, 넷은 v2 의 것이다 — `phpmove`(모양·본문 해시·호출자·**필드 대조**), `htmlsnap`(캡처·비교), `dualrun-report`(불일치 집계), `ctxstats`(주입 계측). 셋은 v3 의 것이다 — `pagecheck`(기계 절차 일곱 단계와 `state.json`·루프 회차·회차의 이유), `ctxevolve`(학습 기록 → 컨텍스트 개정), `causestats`(회차의 이유 → 반복 원인과 지표 셋). **뒤의 둘은 제안만 하고 적용하지 않는다.** 전부 같은 실패를 막으려고 있다: **답을 찾지 못한 도구가 "답이 없다"고 보고하는 것.** 무엇이고 왜인지는 `docs/php-legacy-tooling.md`, 어떻게 부르는지는 `php-legacy-io`·`php-legacy-trace`.
 
-`.claude/scripts/selftest.py` 는 도구·훅·계측과 교차 검사(완전성 판정 어휘 ↔ 라우팅표, 산출물 표 ↔ `artifacts.json`, 실험 헬퍼 상수 ↔ 설정 키, 컨텍스트 주입 대상, 옛 이름 부재)를 한 번에 돌린다. 그중 하나라도 건드렸으면 돌린다. 인자가 없고 검사마다 걸린 시간을 찍는다 — 정확하지만 느린 도구는 우회되고, 그 우회는 로그에 설계 문제처럼 보인다.
+`.claude/scripts/selftest.py` 는 도구·훅·계측과 교차 검사(완전성 판정 어휘 ↔ 라우팅표, 산출물 표 ↔ `artifacts.json`, 실험 헬퍼 상수 ↔ 설정 키, 컨텍스트 주입 대상, 옛 이름 부재)를 한 번에 돌린다. 그중 하나라도 건드렸으면 돌린다. 인자가 없고 검사마다 걸린 시간을 찍는다 — 정확하지만 느린 도구는 우회되고, 그 우회는 로그에 설계 문제처럼 보인다. **설정 없이도 시작한다**: `workspace.json` 이 없으면 환경이 필요한 검사를 없는 키 이름과 함께 건너뛰고, `.github/workflows/selftest.yml` 이 push·PR 마다 그 상태로 돌리며 **돌아간 검사 수의 바닥**을 지킨다 — 건너뜀은 통과가 아니고, 조용히 사라진 검사에는 자기 빨간불이 없다(설계 정본 6장).
 
 Skills and scripts contain no paths, hostnames, ports, table names, or service directory names: they read `.claude/config/workspace.json` (gitignored; `workspace.example.json` is the tracked skeleton), and every path in it points inside this directory, so the OS needs no `--add-dir`. 그 설정을 읽지 못하는 도구는 **좁은 답을 조용히 내지 않고 멈춰서 어느 키가 없는지 말한다.**
 
